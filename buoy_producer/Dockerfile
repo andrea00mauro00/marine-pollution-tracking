@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia codice sorgente
 COPY main.py .
+COPY locations.yml .
 
 # Imposta variabili d'ambiente
 ENV KAFKA_BROKER=kafka:29092

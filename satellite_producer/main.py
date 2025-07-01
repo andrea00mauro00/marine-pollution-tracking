@@ -1,176 +1,182 @@
-import time
-import json
-import sys
 import os
-import uuid
-import random
-from datetime import datetime
+import sys
+import json
+import time
+import datetime as dt
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
+import boto3
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from loguru import logger
-import boto3
-from botocore.client import Config
+from sentinelhub import (
+    SHConfig, BBox, CRS,
+    DataCollection, SentinelHubCatalog,
+    SentinelHubRequest, MimeType
+)
 
-# Carica variabili d'ambiente
+# Load environment variables
 load_dotenv()
 
-# Configurazione
-KAFKA_BROKER = os.getenv('KAFKA_BROKER', 'kafka:29092')
-KAFKA_TOPIC = 'satellite_imagery_raw'
-POLL_INTERVAL_SECONDS = int(os.getenv('POLL_INTERVAL', 600))  # 10 minuti di default
+# Kafka configuration
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:29092")
+KAFKA_TOPIC  = os.getenv("KAFKA_TOPIC", "satellite_raw")
 
-# Configurazione MinIO
-MINIO_ENDPOINT = f"http://{os.getenv('MINIO_HOST', 'minio')}:{os.getenv('MINIO_PORT', '9000')}"
-MINIO_ACCESS_KEY = os.getenv('MINIO_ROOT_USER', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_ROOT_PASSWORD', 'minioadmin')
-MINIO_BUCKET = 'marine-bronze'
+# MinIO configuration
+target_minio = {
+    "endpoint": os.getenv("MINIO_ENDPOINT", "marinepollution-minio:9000"),
+    "access_key": os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
+    "secret_key": os.getenv("MINIO_SECRET_KEY", "minioadmin"),
+    "bucket": os.getenv("MINIO_BUCKET", "satellite")
+}
 
-# Configurazione logger
+# Sentinel-Hub and bounding box
+try:
+    bbox_values = list(map(float, os.getenv("BBOX").split(",")))
+    BBOX = BBox((bbox_values[0], bbox_values[1], bbox_values[2], bbox_values[3]), crs=CRS.WGS84)
+except Exception as e:
+    sys.exit(f"BBOX environment variable missing or malformed: {e}")
+
+# Poll interval
+POLL_INTERVAL = int(os.getenv("SAT_POLL_INTERVAL", "86400"))  # seconds
+
+# Local data folder for Sentinel-Hub
+data_folder = os.getenv("SAT_DATA_FOLDER", "/tmp")
+
+# Configure logging
 logger.remove()
-logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
-logger.add("satellite_producer.log", rotation="10 MB", level="DEBUG")
+logger.add(sys.stderr, format="{time:YYYY-MM-DD HH:mm:ss} {level} {message}", level="INFO")
 
+# Kafka producer factory
 def create_kafka_producer():
-    """Crea e restituisce un producer Kafka."""
-    retries = 5
-    for i in range(retries):
+    for _ in range(6):
         try:
-            producer = KafkaProducer(
+            prod = KafkaProducer(
                 bootstrap_servers=KAFKA_BROKER,
                 value_serializer=lambda v: json.dumps(v).encode('utf-8')
             )
-            logger.success("Connessione a Kafka stabilita con successo!")
-            return producer
+            logger.info(f"Kafka producer connected to {KAFKA_BROKER}")
+            return prod
         except NoBrokersAvailable:
-            logger.error(f"Impossibile connettersi a Kafka. Tentativo {i+1} di {retries}...")
+            logger.warning("Kafka not ready, retrying in 5s...")
             time.sleep(5)
-    logger.critical("Connessione a Kafka fallita dopo diversi tentativi.")
+    logger.critical("Cannot connect to Kafka broker after retries")
     sys.exit(1)
 
-def get_minio_client():
-    """Crea e restituisce un client MinIO."""
+# Sentinel-Hub configuration
+def get_sh_config():
+    cfg = SHConfig()
+    cfg.sh_client_id     = os.getenv("SH_CLIENT_ID")
+    cfg.sh_client_secret = os.getenv("SH_CLIENT_SECRET")
+    if not cfg.sh_client_id or not cfg.sh_client_secret:
+        sys.exit("SH_CLIENT_ID/SH_CLIENT_SECRET missing in .env")
+    logger.info("Authenticated with Sentinel-Hub")
+    return cfg
+
+# MinIO client factory and bucket setup
+def get_minio_client_and_bucket():
+    client = boto3.client(
+        's3',
+        endpoint_url=f"http://{target_minio['endpoint']}",
+        aws_access_key_id=target_minio['access_key'],
+        aws_secret_access_key=target_minio['secret_key']
+    )
+    bucket = target_minio['bucket']
+    # Ensure bucket exists
     try:
-        client = boto3.client(
-            's3',
-            endpoint_url=MINIO_ENDPOINT,
-            aws_access_key_id=MINIO_ACCESS_KEY,
-            aws_secret_access_key=MINIO_SECRET_KEY,
-            config=Config(signature_version='s3v4'),
-            region_name='us-east-1'  # Fake region
-        )
-        # Verifica se il bucket esiste, se no lo crea
+        client.head_bucket(Bucket=bucket)
+        logger.info(f"MinIO bucket '{bucket}' exists")
+    except ClientError:
+        logger.warning(f"Bucket '{bucket}' not found. Creating...")
         try:
-            client.head_bucket(Bucket=MINIO_BUCKET)
-        except:
-            client.create_bucket(Bucket=MINIO_BUCKET)
-            logger.info(f"Bucket {MINIO_BUCKET} creato.")
-        
-        return client
-    except Exception as e:
-        logger.error(f"Errore nella connessione a MinIO: {e}")
-        return None
+            client.create_bucket(Bucket=bucket)
+            logger.success(f"Created MinIO bucket '{bucket}'")
+        except Exception as err:
+            logger.critical(f"Failed to create bucket '{bucket}': {err}")
+            sys.exit(1)
+    return client
 
-def generate_satellite_data():
-    """
-    In un ambiente reale, questa funzione scaricherebbe immagini 
-    dalla Sentinel Hub API. Per semplicità, generiamo dati simulati.
-    """
-    # Definisci alcune aree marine di interesse
-    areas = [
-        {"name": "North Atlantic", "lat_range": (30, 45), "lon_range": (-75, -50)},
-        {"name": "Mediterranean", "lat_range": (35, 45), "lon_range": (5, 25)},
-        {"name": "Gulf of Mexico", "lat_range": (20, 30), "lon_range": (-98, -80)},
-        {"name": "South Pacific", "lat_range": (-30, -10), "lon_range": (150, 180)}
-    ]
-    
-    area = random.choice(areas)
-    lat = random.uniform(*area["lat_range"])
-    lon = random.uniform(*area["lon_range"])
-    
-    # Genera un ID univoco per l'immagine
-    image_id = str(uuid.uuid4())
-    
-    # Prepara i metadati
-    metadata = {
-        'image_id': image_id,
-        'timestamp': datetime.now().isoformat(),
-        'lat': lat,
-        'lon': lon,
-        'area_name': area["name"],
-        'cloud_coverage': round(random.uniform(0, 100), 2),
-        'resolution': "10m",
-        'source': 'satellite_simulation',
-        'bands': {
-            'B2': round(random.uniform(0.05, 0.2), 3),  # Blue
-            'B3': round(random.uniform(0.05, 0.2), 3),  # Green
-            'B4': round(random.uniform(0.05, 0.3), 3),  # Red
-            'B8': round(random.uniform(0.1, 0.5), 3),   # NIR
-            'B11': round(random.uniform(0.1, 0.5), 3),  # SWIR
-            'B12': round(random.uniform(0.1, 0.5), 3),  # SWIR2
-        },
-        'indices': {
-            'NDVI': round(random.uniform(-0.1, 0.8), 3),  # Indice di vegetazione
-            'NDWI': round(random.uniform(-0.3, 0.5), 3),  # Indice di acqua
-            'NDTI': round(random.uniform(0, 0.5), 3),     # Indice di torbidità
-        },
-        'storage_path': f"satellite/{image_id}.json"
-    }
-    
-    return metadata
+# Search and download latest Sentinel-2 scene
+def fetch_latest_scene(cfg):
+    catalog = SentinelHubCatalog(cfg)
+    now = dt.datetime.utcnow()
+    start = (now - dt.timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end   = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    logger.info(f"Querying catalog from {start} to {end} with <30% cloud")
+    search_iter = catalog.search(
+        DataCollection.SENTINEL2_L2A,
+        bbox=BBOX,
+        time=(start, end),
+        filter="eo:cloud_cover < 30",
+        limit=1
+    )
+    scene = next(search_iter, None)
+    if scene:
+        cc = scene['properties']['eo:cloud_cover']
+        logger.info(f"Found scene {scene['id']} with cloud coverage {cc}%")
+    else:
+        logger.warning("No scene found in catalog window")
+    return scene
 
+# Download image as JPEG
+def download_scene_image(cfg, scene):
+    evalscript = """//VERSION=3
+    function setup() {return {input:["B04","B03","B02"],output:{bands:3}}}
+    function evaluatePixel(s) {return [s.B04, s.B03, s.B02]}"""
+    request = SentinelHubRequest(
+        evalscript=evalscript,
+        input_data=[
+            SentinelHubRequest.input_data(
+                data_collection=DataCollection.SENTINEL2_L2A,
+                time_interval=scene['properties']['datetime']
+            )
+        ],
+        responses=[SentinelHubRequest.output_response('default', MimeType.JPG)],
+        bbox=BBOX,
+        size=(512, 512),
+        data_folder=data_folder,
+        config=cfg
+    )
+    request.get_data(save_data=True)
+    filenames = request.get_filename_list()
+    return os.path.join(data_folder, filenames[0])
+
+# Main loop
 def main():
-    """Ciclo principale del producer."""
-    producer = create_kafka_producer()
-    minio_client = get_minio_client()
-    
-    if not minio_client:
-        logger.critical("Impossibile connettersi a MinIO. Uscita.")
-        sys.exit(1)
-    
-    logger.info(f"Producer satellitare avviato. Invio dati al topic '{KAFKA_TOPIC}'.")
-    
+    producer     = create_kafka_producer()
+    cfg          = get_sh_config()
+    minio_client = get_minio_client_and_bucket()
+    logger.info("Satellite producer (Chesapeake) started loop")
+
     while True:
         try:
-            # Genera metadati satellitari
-            satellite_data = generate_satellite_data()
-            
-            # Salva i metadati completi su MinIO
-            try:
-                minio_client.put_object(
-                    Bucket=MINIO_BUCKET,
-                    Key=satellite_data['storage_path'],
-                    Body=json.dumps(satellite_data).encode('utf-8'),
-                    ContentType='application/json'
-                )
-                logger.info(f"Metadati salvati su MinIO: {satellite_data['storage_path']}")
-            except Exception as e:
-                logger.error(f"Errore nel salvataggio su MinIO: {e}")
-            
-            # Invia riferimento ai metadati su Kafka
-            kafka_payload = {
-                'image_id': satellite_data['image_id'],
-                'timestamp': satellite_data['timestamp'],
-                'lat': satellite_data['lat'],
-                'lon': satellite_data['lon'],
-                'area_name': satellite_data['area_name'],
-                'storage_path': satellite_data['storage_path']
-            }
-            
-            logger.info(f"Invio dati satellitari: {satellite_data['image_id']} - Area: {satellite_data['area_name']}")
-            producer.send(KAFKA_TOPIC, value=kafka_payload)
-            producer.flush()
-            logger.success(f"Metadati dell'immagine inviati con successo a Kafka.")
-            
-            logger.info(f"Prossimo controllo tra {POLL_INTERVAL_SECONDS // 60} minuti...")
-            time.sleep(POLL_INTERVAL_SECONDS)
-            
-        except KeyboardInterrupt:
-            logger.info("Rilevato arresto manuale. Arrivederci!")
-            break
-        except Exception as e:
-            logger.error(f"Errore inaspettato nel ciclo principale: {e}")
+            scene = fetch_latest_scene(cfg)
+            if scene:
+                local_path = download_scene_image(cfg, scene)
+                key = f"sentinel/{scene['id']}.jpg"  
+                minio_client.upload_file(local_path, target_minio['bucket'], key)
+                logger.success(f"Uploaded {key} to MinIO")
+
+                message = {
+                    'image_id': scene['id'],
+                    'timestamp': scene['properties']['datetime'],
+                    'cloud_coverage': scene['properties']['eo:cloud_cover'],
+                    'storage_path': key,
+                    'lat': (BBOX.lower_left[1] + BBOX.upper_right[1]) / 2,
+                    'lon': (BBOX.lower_left[0] + BBOX.upper_right[0]) / 2,
+                    'source': 'sentinel-2'
+                }
+                producer.send(KAFKA_TOPIC, message)
+                producer.flush()
+                logger.success("Sent message to Kafka")
+
+            logger.info(f"Sleeping for {POLL_INTERVAL/3600:.1f} hours...")
+            time.sleep(POLL_INTERVAL)
+
+        except Exception as err:
+            logger.error(f"Error in loop: {err}")
             time.sleep(60)
 
 if __name__ == '__main__':
     main()
+

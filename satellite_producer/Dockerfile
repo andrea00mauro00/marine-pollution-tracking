@@ -5,11 +5,14 @@ WORKDIR /app
 # Installa dipendenze di sistema
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    netcat-traditional \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+        build-essential \
+        curl \
+        netcat-traditional \
+        gdal-bin \
+        libgdal-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV GDAL_VERSION=3.6
 
 # Copia requirements e installa dipendenze
 COPY requirements.txt .

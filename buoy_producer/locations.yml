@@ -1,0 +1,19 @@
+- buoy_id: 44042          # Potomac
+  usgs_site_id: 01491000  # pH ✔  (turbidity assente -> null)
+  lat: 38.033
+  lon: -76.335
+
+- buoy_id: 44062          # Susquehanna mouth
+  usgs_site_id: 01578310  # pH ✔
+  lat: 39.539
+  lon: -76.051
+
+- buoy_id: 44063          # Upper Potomac / DC
+  usgs_site_id: 01646500  # pH ✔
+  lat: 38.788
+  lon: -77.036
+
+- buoy_id: 44072          # York Spit
+  usgs_site_id: 02035000  # pH ✔
+  lat: 37.245
+  lon: -76.232
