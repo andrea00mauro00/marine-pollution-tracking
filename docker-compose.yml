@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    restart: always
+    networks:
+      - marine_net
+    
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    restart: always
+    networks:
+      - marine_net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    restart: always
+    networks:
+      - marine_net
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Web UI
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+    networks:
+      - marine_net
+
+  create_buckets:
+    image: python:3.9
+    container_name: create_buckets
+    depends_on:
+      - minio
+    volumes:
+      - ./setup_minio:/scripts
+    working_dir: /scripts
+    command: ["sh", "-c", "pip install boto3 && python create_minio_buckets.py"]
+    restart: "no"
+    networks:
+      - marine_net
+
+  satellite_producer:
+    build:
+      context: ./satellite_producer
+    container_name: satellite_producer
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=satellite_imagery
+      - FETCH_INTERVAL_SECONDS=300  # 5 minuti per limitare le chiamate API
+      - SH_CLIENT_ID=8e075490-01f7-4d47-aa93-b0e2e4995410
+      - SH_CLIENT_SECRET=PddO5gfte2HTXvghTU1dnSSxcohRyiVR
+      - BBOX=36.5,-76.5,37.5,-75.5  # Bounding box per Chesapeake Bay
+    restart: always
+    networks:
+      - marine_net
+
+  buoy_producer:
+    build:
+      context: ./buoy_producer
+    container_name: buoy_producer
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=buoy_data
+      - GENERATE_INTERVAL_SECONDS=30
+    restart: always
+    networks:
+      - marine_net
+
+  pollution_detection_job:
+    build:
+      context: ./pollution_detection_job
+    container_name: pollution_detection_job
+    depends_on:
+      - kafka
+      - minio
+      - redis
+      - create_buckets
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_SERVERS=kafka:9092
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - MINIO_ENDPOINT=minio:9000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - BUOY_TOPIC=buoy_data
+      - SATELLITE_TOPIC=satellite_imagery
+      - OUTPUT_TOPIC=pollution_hotspots
+      - ALERTS_TOPIC=sensor_alerts
+    restart: on-failure
+    networks:
+      - marine_net
+
+networks:
+  marine_net:
+    driver: bridge
+
+volumes:
+  minio_data:
