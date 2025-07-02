@@ -568,9 +568,10 @@ def main():
         .name("Detect_Anomalies")
     
     # Predict pollution spread for areas with high risk or anomalies
+    # Predict pollution spread for areas with high risk or anomalies
     prediction_stream = anomaly_stream \
         .key_by(lambda x: "default_key") \
-        .process(PollutionSpreadPredictor()) \
+        .process(PollutionSpreadPredictor(), output_type=Types.STRING()) \
         .name("Predict_Pollution_Spread")
     
     # Send predictions to Kafka

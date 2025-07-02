@@ -663,9 +663,10 @@ def main():
     # Detect hotspots by key (approximate location grouping)
     # For simplicity, we're just using a hardcoded key here
     # In a real system, you'd use a geohash or grid cell as the key
+    # Detect hotspots by key (approximate location grouping)
     hotspots_stream = analyzed_stream \
         .key_by(lambda x: "default_key") \
-        .process(HotspotDetector()).name("Detect_Hotspots")
+        .process(HotspotDetector(), output_type=Types.STRING()).name("Detect_Hotspots")
     
     # Send hotspots to Kafka
     hotspots_stream.add_sink(hotspots_producer).name("Publish_Hotspots")
