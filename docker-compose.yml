@@ -101,17 +101,39 @@ services:
     networks:
       - marine_net
 
-  pollution_detection_job:
+  data_processor_job:
     build:
-      context: ./pollution_detection_job
-    container_name: pollution_detection_job
+      context: ./data_processor
+    container_name: data_processor_job
     ports:
-      - "8081:8081"
+      - "8082:8081"
+    depends_on:
+      - kafka
+      - minio
+      - create_buckets
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_SERVERS=kafka:9092
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - MINIO_ENDPOINT=minio:9000
+      - BUOY_TOPIC=buoy_data
+      - SATELLITE_TOPIC=satellite_imagery
+      - PROCESSED_DATA_TOPIC=processed_data
+    restart: on-failure
+    networks:
+      - marine_net
+
+  pollution_analyzer_job:
+    build:
+      context: ./pollution_analyzer
+    container_name: pollution_analyzer_job
+    ports:
+      - "8083:8081"
     depends_on:
       - kafka
       - minio
       - redis
-      - create_buckets
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_SERVERS=kafka:9092
@@ -122,8 +144,31 @@ services:
       - REDIS_PORT=6379
       - BUOY_TOPIC=buoy_data
       - SATELLITE_TOPIC=satellite_imagery
-      - OUTPUT_TOPIC=pollution_hotspots
+      - ANALYZED_DATA_TOPIC=analyzed_data
+      - HOTSPOTS_TOPIC=pollution_hotspots
       - ALERTS_TOPIC=sensor_alerts
+    restart: on-failure
+    networks:
+      - marine_net
+
+  ml_prediction_job:
+    build:
+      context: ./ml_prediction
+    container_name: ml_prediction_job
+    ports:
+      - "8084:8081"
+    depends_on:
+      - kafka
+      - minio
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_SERVERS=kafka:9092
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - MINIO_ENDPOINT=minio:9000
+      - BUOY_TOPIC=buoy_data
+      - SATELLITE_TOPIC=satellite_imagery
+      - PREDICTIONS_TOPIC=pollution_predictions
     restart: on-failure
     networks:
       - marine_net
