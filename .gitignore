@@ -1,0 +1,63 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# VSCode and other IDEs
+.vscode/
+.idea/
+*.swp
+
+# PyInstaller
+*.log
+
+# macOS system files
+.DS_Store
+__MACOSX/
+
+# Docker files and volumes
+*.pid
+*.bak
+*.tmp
+docker-compose.override.yml
+docker-compose.*.yml
+*.db
+*.sqlite3
+
+# Kafka or Flink temporary data
+kafka-logs/
+logs/
+tmp/
+*.log
+
+# Git-specific
+*.orig
+*.rej
+
+# Secret files
+.env
+.env.*
+
+
+
