@@ -168,7 +168,10 @@ def process_predictions(redis_dal, data):
             # Salva in Redis
             redis_dal.redis.hset(key, mapping=prediction_data)
         
-        # Aggiungi alla lista di previsioni attive
+        # Assicura che active_prediction_sets sia un set
+        redis_dal.ensure_set_type(redis_dal.NAMESPACES['active_prediction_sets'])
+        
+        # Aggiungi alla collezione di previsioni attive
         active_key = redis_dal.NAMESPACES['active_prediction_sets']
         redis_dal.redis.sadd(active_key, prediction_set_id)
         

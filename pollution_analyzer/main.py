@@ -533,12 +533,20 @@ class AlertGenerator(MapFunction):
             alert_id = alert_data.get("alert_id")
             key = f"alert:{alert_id}"
             
-            # Save to Redis with 24-hour expiry
-            r.setex(key, 86400, json.dumps(alert_data))
+            # Prepara i dati per il formato HASH
+            alert_hash = alert_data.copy()
+            for field in ['recommendations', 'location']:
+                if field in alert_hash and isinstance(alert_hash[field], (dict, list)):
+                    alert_hash[field] = json.dumps(alert_hash[field])
+            
+            # Salva come HASH invece di STRING
+            r.hset(key, mapping=alert_hash)
+            
+            # Imposta TTL (opzionale, per mantenere la scadenza di 24 ore)
+            r.expire(key, 86400)  # 24 ore
             
             # Add to active alerts SET
             r.sadd("active_alerts", alert_id)
-            # Non serve più ltrim perché i set mantengono automaticamente l'unicità
             
             logger.info(f"Saved alert to Redis: {alert_id}")
         except Exception as e:

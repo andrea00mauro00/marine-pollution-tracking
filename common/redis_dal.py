@@ -14,6 +14,8 @@ class RedisDAL:
             cls._instance = super(RedisDAL, cls).__new__(cls)
             cls._instance.redis = redis.Redis(host=host, port=port, db=db, decode_responses=True)
             cls._instance._initialize_schemas()
+            # Verifica le strutture dati all'inizializzazione
+            cls._instance._ensure_data_structures()
         return cls._instance
     
     def _initialize_schemas(self):
@@ -32,6 +34,33 @@ class RedisDAL:
             'active_prediction_sets': 'active_prediction_sets'  # Set (SADD)
         }
     
+    def _ensure_data_structures(self):
+        """Verifica e corregge le strutture dati di Redis"""
+        for key in [
+            self.NAMESPACES['active_sensors'],
+            self.NAMESPACES['active_hotspots'],
+            self.NAMESPACES['active_alerts'],
+            self.NAMESPACES['active_prediction_sets']
+        ]:
+            self.ensure_set_type(key)
+    
+    def ensure_set_type(self, key):
+        """Assicura che una chiave sia di tipo SET, convertendola se necessario"""
+        if self.redis.exists(key) and self.redis.type(key).decode('utf-8') != 'set':
+            if self.redis.type(key).decode('utf-8') == 'list':
+                # Converti da lista a set
+                members = self.redis.lrange(key, 0, -1)
+                # Salva i membri attuali
+                if members:
+                    # Elimina la lista
+                    self.redis.delete(key)
+                    # Ricrea come set
+                    for member in members:
+                        self.redis.sadd(key, member)
+                logger.warning(f"Convertita chiave {key} da lista a set")
+            else:
+                logger.error(f"Chiave {key} è di tipo non supportato: {self.redis.type(key)}")
+    
     def save_alert(self, alert_id, alert_data):
         """Salva un avviso in Redis usando Set per gli elementi attivi"""
         key = f"{self.NAMESPACES['alerts']}{alert_id}"
@@ -45,6 +74,9 @@ class RedisDAL:
         # Salva i dati
         try:
             self.redis.hset(key, mapping=prepared_data)
+            
+            # Assicura che active_alerts sia un set
+            self.ensure_set_type(self.NAMESPACES['active_alerts'])
             
             # Aggiungi al set degli avvisi attivi (SADD garantisce unicità)
             self.redis.sadd(self.NAMESPACES['active_alerts'], alert_id)
@@ -80,6 +112,10 @@ class RedisDAL:
         # Salva i dati
         try:
             self.redis.hset(key, mapping=prepared_data)
+            
+            # Assicura che active_sensors sia un set
+            self.ensure_set_type(self.NAMESPACES['active_sensors'])
+            
             # Aggiungi all'insieme dei sensori attivi
             self.redis.sadd(self.NAMESPACES['active_sensors'], sensor_id)
             return True
@@ -116,6 +152,9 @@ class RedisDAL:
         try:
             self.redis.hset(key, mapping=prepared_data)
             
+            # Assicura che active_hotspots sia un set
+            self.ensure_set_type(self.NAMESPACES['active_hotspots'])
+            
             # Aggiungi al set degli hotspot attivi (SADD garantisce unicità)
             self.redis.sadd(self.NAMESPACES['active_hotspots'], hotspot_id)
             logger.info(f"Aggiunto hotspot {hotspot_id} al set degli hotspot attivi")
@@ -128,6 +167,11 @@ class RedisDAL:
     def update_dashboard_metrics(self):
         """Aggiorna le metriche della dashboard usando set invece di liste"""
         try:
+            # Assicura che le collezioni siano set
+            self.ensure_set_type(self.NAMESPACES['active_sensors'])
+            self.ensure_set_type(self.NAMESPACES['active_hotspots'])
+            self.ensure_set_type(self.NAMESPACES['active_alerts'])
+            
             # Conteggio sensori attivi
             active_sensors_count = self.redis.scard(self.NAMESPACES['active_sensors']) or 0
             
