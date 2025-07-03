@@ -26,31 +26,15 @@ class RedisDAL:
             'alerts': 'alert:',
             'predictions': 'prediction:',
             'dashboard': 'dashboard:',
-            'active_sensors': 'active_sensors',
-            'active_hotspots': 'active_hotspots',
-            'active_alerts': 'active_alerts',
-            'active_prediction_sets': 'active_prediction_sets'
-        }
-        
-        # Definizione dei tipi di dato per ciascun namespace
-        self.DATA_TYPES = {
-            'metrics:raw:': 'hash',
-            'sensors:data:': 'hash',
-            'hotspot:': 'hash',
-            'alert:': 'hash',
-            'prediction:': 'hash',
-            'dashboard:': 'hash'
+            'active_sensors': 'active_sensors',  # Set (SADD)
+            'active_hotspots': 'active_hotspots',  # Set (SADD)
+            'active_alerts': 'active_alerts',  # Set (SADD)
+            'active_prediction_sets': 'active_prediction_sets'  # Set (SADD)
         }
     
     def save_alert(self, alert_id, alert_data):
-        """Salva un avviso in Redis in modo sicuro"""
+        """Salva un avviso in Redis usando Set per gli elementi attivi"""
         key = f"{self.NAMESPACES['alerts']}{alert_id}"
-        
-        # Verifica il tipo esistente prima di sovrascrivere
-        if self.redis.exists(key) and not self.redis.type(key).decode('utf-8') == 'hash':
-            logger.warning(f"Chiave {key} esiste già con tipo diverso da hash")
-            # Rinomina la chiave esistente per preservare i dati
-            self.redis.rename(key, f"{key}:conflicted:{int(time.time())}")
         
         # Serializza i campi complessi
         prepared_data = alert_data.copy()
@@ -62,12 +46,9 @@ class RedisDAL:
         try:
             self.redis.hset(key, mapping=prepared_data)
             
-            # Aggiungi alla lista degli avvisi attivi solo se non è già presente
-            active_key = self.NAMESPACES['active_alerts']
-            if not self.redis.lpos(active_key, alert_id):
-                self.redis.lpush(active_key, alert_id)
-                self.redis.ltrim(active_key, 0, 99)
-                logger.info(f"Aggiunto avviso {alert_id} alla lista degli avvisi attivi")
+            # Aggiungi al set degli avvisi attivi (SADD garantisce unicità)
+            self.redis.sadd(self.NAMESPACES['active_alerts'], alert_id)
+            logger.info(f"Aggiunto avviso {alert_id} al set degli avvisi attivi")
             
             return True
         except Exception as e:
@@ -92,11 +73,6 @@ class RedisDAL:
     def save_sensor_data(self, sensor_id, data):
         """Salva i dati di un sensore"""
         key = f"{self.NAMESPACES['sensor_data']}{sensor_id}"
-        
-        # Verifica il tipo esistente prima di sovrascrivere
-        if self.redis.exists(key) and not self.redis.type(key).decode('utf-8') == 'hash':
-            logger.warning(f"Chiave {key} esiste già con tipo diverso da hash")
-            self.redis.rename(key, f"{key}:conflicted:{int(time.time())}")
         
         # Prepara i dati
         prepared_data = data.copy()
@@ -131,11 +107,6 @@ class RedisDAL:
         """Salva un hotspot di inquinamento"""
         key = f"{self.NAMESPACES['hotspots']}{hotspot_id}"
         
-        # Verifica il tipo esistente
-        if self.redis.exists(key) and not self.redis.type(key).decode('utf-8') == 'hash':
-            logger.warning(f"Chiave {key} esiste già con tipo diverso da hash")
-            self.redis.rename(key, f"{key}:conflicted:{int(time.time())}")
-        
         # Prepara i dati
         prepared_data = hotspot_data.copy()
         if 'json' in prepared_data and isinstance(prepared_data['json'], dict):
@@ -145,14 +116,9 @@ class RedisDAL:
         try:
             self.redis.hset(key, mapping=prepared_data)
             
-            # Aggiungi alla lista di hotspot attivi SOLO se non è già presente
-            active_key = self.NAMESPACES['active_hotspots']
-            if not self.redis.lpos(active_key, hotspot_id):
-                self.redis.lpush(active_key, hotspot_id)
-                self.redis.ltrim(active_key, 0, 19)
-                logger.info(f"Aggiunto hotspot {hotspot_id} alla lista degli hotspot attivi")
-            else:
-                logger.info(f"Hotspot {hotspot_id} già presente nella lista degli hotspot attivi")
+            # Aggiungi al set degli hotspot attivi (SADD garantisce unicità)
+            self.redis.sadd(self.NAMESPACES['active_hotspots'], hotspot_id)
+            logger.info(f"Aggiunto hotspot {hotspot_id} al set degli hotspot attivi")
             
             return True
         except Exception as e:
@@ -160,15 +126,13 @@ class RedisDAL:
             return False
     
     def update_dashboard_metrics(self):
-        """Aggiorna le metriche della dashboard"""
+        """Aggiorna le metriche della dashboard usando set invece di liste"""
         try:
             # Conteggio sensori attivi
             active_sensors_count = self.redis.scard(self.NAMESPACES['active_sensors']) or 0
             
             # Conteggio hotspot per livello
-            hotspot_ids = self.redis.lrange(self.NAMESPACES['active_hotspots'], 0, -1)
-            # Elimina duplicati (non dovrebbero più esserci ma per sicurezza)
-            hotspot_ids = list(set(hotspot_ids))
+            hotspot_ids = self.redis.smembers(self.NAMESPACES['active_hotspots'])
             
             hotspot_levels = {"high": 0, "medium": 0, "low": 0, "minimal": 0}
             
@@ -178,7 +142,7 @@ class RedisDAL:
                     hotspot_levels[level] += 1
             
             # Conteggio avvisi per severità
-            alert_ids = self.redis.lrange(self.NAMESPACES['active_alerts'], 0, -1)
+            alert_ids = self.redis.smembers(self.NAMESPACES['active_alerts'])
             alert_severity = {"high": 0, "medium": 0, "low": 0}
             
             for aid in alert_ids:

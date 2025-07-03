@@ -536,9 +536,9 @@ class AlertGenerator(MapFunction):
             # Save to Redis with 24-hour expiry
             r.setex(key, 86400, json.dumps(alert_data))
             
-            # Add to active alerts list
-            r.lpush("active_alerts", alert_id)
-            r.ltrim("active_alerts", 0, 99)  # Keep only 100 most recent alerts
+            # Add to active alerts SET
+            r.sadd("active_alerts", alert_id)
+            # Non serve più ltrim perché i set mantengono automaticamente l'unicità
             
             logger.info(f"Saved alert to Redis: {alert_id}")
         except Exception as e:

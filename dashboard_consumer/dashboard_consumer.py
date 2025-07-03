@@ -170,9 +170,7 @@ def process_predictions(redis_dal, data):
         
         # Aggiungi alla lista di previsioni attive
         active_key = redis_dal.NAMESPACES['active_prediction_sets']
-        if not redis_dal.redis.lpos(active_key, prediction_set_id):
-            redis_dal.redis.lpush(active_key, prediction_set_id)
-            redis_dal.redis.ltrim(active_key, 0, 9)
+        redis_dal.redis.sadd(active_key, prediction_set_id)
         
         logger.info(f"Salvato set di previsioni {prediction_set_id} con {len(predictions)} previsioni in Redis")
     except Exception as e:
