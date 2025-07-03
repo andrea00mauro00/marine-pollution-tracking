@@ -1,5 +1,0 @@
-psycopg2-binary==2.9.9
-redis==5.0.1
-boto3==1.28.38
-geojson==3.0.1
-shapely==2.0.1

@@ -79,10 +79,10 @@ services:
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC=satellite_imagery
-      - FETCH_INTERVAL_SECONDS=300  # 5 minuti per limitare le chiamate API
+      - FETCH_INTERVAL_SECONDS=300
       - SH_CLIENT_ID=8e075490-01f7-4d47-aa93-b0e2e4995410
       - SH_CLIENT_SECRET=PddO5gfte2HTXvghTU1dnSSxcohRyiVR
-      - BBOX=36.5,-76.5,37.5,-75.5  # Bounding box per Chesapeake Bay
+      - BBOX=36.5,-76.5,37.5,-75.5
     restart: always
     networks:
       - marine_net
@@ -173,9 +173,125 @@ services:
     networks:
       - marine_net
 
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=redis-datasource,grafana-worldmap-panel,grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - marine_net
+    depends_on:
+      - redis
+    
+
+  postgres:
+    image: postgres:14-alpine
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=marine_pollution
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - marine_net
+    restart: unless-stopped
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: timescaledb
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=marine_pollution
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    networks:
+      - marine_net
+    restart: unless-stopped
+
+  alert_manager:
+    build:
+      context: ./alert_manager
+    container_name: alert_manager
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - ALERTS_TOPIC=sensor_alerts
+      - NOTIFICATIONS_TOPIC=notifications
+    volumes:
+      - ./common:/app/common
+    networks:
+      - marine_net
+    restart: on-failure
+
+  dashboard_consumer:
+    build:
+      context: ./dashboard_consumer
+    container_name: dashboard_consumer
+    depends_on:
+      - kafka
+      - redis
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./common:/app/common
+    networks:
+      - marine_net
+    restart: on-failure
+
+  storage_consumer:
+    build:
+      context: ./storage_consumer
+    container_name: storage_consumer
+    depends_on:
+      - kafka
+      - timescaledb
+      - minio
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - ANALYZED_TOPIC=analyzed_data
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - PREDICTIONS_TOPIC=pollution_predictions
+      - ALERTS_TOPIC=sensor_alerts
+    networks:
+      - marine_net
+    restart: on-failure
+
 networks:
   marine_net:
     driver: bridge
 
 volumes:
   minio_data:
+  grafana_data:
+  postgres_data:
+  timescaledb_data:

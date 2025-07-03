@@ -1,0 +1,4 @@
+kafka-python
+redis
+psycopg2-binary
+loguru

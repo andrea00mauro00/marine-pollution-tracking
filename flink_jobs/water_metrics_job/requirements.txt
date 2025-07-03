@@ -1,8 +1,0 @@
-apache-flink==1.17.1
-kafka-python==2.0.2
-boto3==1.26.135
-redis==4.5.5
-pandas==2.0.2
-numpy==1.24.3
-scipy==1.10.1
-pyarrow==12.0.0
