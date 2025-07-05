@@ -1,7 +1,14 @@
-kafka-python==2.0.2
-requests==2.31.0
-python-dotenv==1.0.0
+Shapely==2.1.1
+pyproj==3.7.1
 loguru==0.7.2
+kafka-python==2.0.3          # 2.0.2 manca kafka.vendor.six, 2.0.3 ok
 boto3==1.28.57
+python-dotenv==1.0.0
+requests==2.31.0
 sentinelhub==3.9.1
-numpy==1.26.4
+Pillow==10.3.0
+scipy==1.13.0
+numpy<2.3                    # pip installerà la 2.2.x, compatibile con SciPy
+tomli==2.0.1
+psycopg2-binary==2.9.9
+matplotlib==3.8.4

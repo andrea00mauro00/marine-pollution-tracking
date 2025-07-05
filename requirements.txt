@@ -1,0 +1,12 @@
+Shapely==2.1.1
+pyproj==3.7.1
+loguru==0.7.2
+kafka-python==2.0.2
+boto3==1.28.57
+python-dotenv==1.0.0
+requests==2.31.0
+sentinelhub==3.9.1
+Pillow==10.3.0
+scipy==1.13.0
+numpy<2.3               # <-- range esplicito, non verrà mai 2.3.x
+tomli==2.0.1

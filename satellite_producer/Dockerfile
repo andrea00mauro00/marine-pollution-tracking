@@ -1,32 +1,37 @@
+# ---------- base immagine ----------
 FROM python:3.10-slim
 
 WORKDIR /app
 
-# Installa dipendenze di sistema
+# ---------- dipendenze di sistema (solo quelle davvero utili) ----------
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    netcat-traditional \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+        build-essential \
+        curl \
+        netcat-traditional \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copia requirements e installa dipendenze
+# ---------- requisiti Python ----------
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia codice sorgente (RIMOSSA la riga che copia locations.yml)
-COPY main.py .
+# ---------- codice sorgente ----------
+#   Copiamo l’intera cartella satellite_producer con le utility
+COPY satellite_producer/ satellite_producer/
 
-# Imposta variabili d'ambiente
-# Modificato per essere compatibile con docker-compose
+#   (se ti serve wait-for-kafka.sh lo copiamo ugualmente)
+COPY wait-for-kafka.sh /usr/local/bin/wait-for-kafka
+RUN chmod +x /usr/local/bin/wait-for-kafka
+
+# ---------- variabili d’ambiente di default ----------
 ENV KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-ENV FETCH_INTERVAL_SECONDS=30
+ENV KAFKA_TOPIC=satellite_img
+ENV MINIO_ENDPOINT=minio:9000
+ENV MINIO_BUCKET=marine-data
+ENV FETCH_INTERVAL_SECONDS=900           # 15 min
 ENV PYTHONUNBUFFERED=1
 
-# Crea script di avvio che attende Kafka
-COPY wait-for-kafka.sh .
-RUN chmod +x wait-for-kafka.sh
-
-# Aggiornato il percorso Kafka per l'attesa
-CMD ["./wait-for-kafka.sh", "kafka:9092", "python", "main.py"]
+# ---------- comando di avvio ----------
+# • aspettiamo Kafka se vuoi (commenta se non serve)
+# • poi lanciamo il producer come modulo (-m) per evitare problemi di import
+CMD ["bash", "-c", "wait-for-kafka && python -m satellite_producer.prod_img"]

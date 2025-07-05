@@ -1,19 +1,35 @@
-- buoy_id: 44042          # Potomac
-  usgs_site_id: 01491000  # pH ✔  (turbidity assente -> null)
+# Chesapeake – BOE esistenti
+- id: 44042   # Potomac
   lat: 38.033
   lon: -76.335
-
-- buoy_id: 44062          # Susquehanna mouth
-  usgs_site_id: 01578310  # pH ✔
+  type: buoy
+- id: 44062   # Gooses Reef
   lat: 39.539
   lon: -76.051
-
-- buoy_id: 44063          # Upper Potomac / DC
-  usgs_site_id: 01646500  # pH ✔
+  type: buoy
+- id: 44063   # Annapolis
   lat: 38.788
   lon: -77.036
+  type: buoy
+- id: 44072   # York Spit
+  lat: 37.201
+  lon: -76.266
+  type: buoy
 
-- buoy_id: 44072          # York Spit
-  usgs_site_id: 02035000  # pH ✔
-  lat: 37.245
-  lon: -76.232
+# NUOVE
+- id: BISM2   # Bishops Head
+  lat: 38.220
+  lon: -76.039
+  type: station
+- id: 44058   # Stingray Point (CBIBS)
+  lat: 37.567
+  lon: -76.257
+  type: buoy
+- id: WAHV2   # Wachapreague
+  lat: 37.608
+  lon: -75.686
+  type: station
+- id: CHYV2   # Cape Henry
+  lat: 36.926
+  lon: -76.007
+  type: station
