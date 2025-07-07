@@ -24,7 +24,7 @@ from Utils.imgfetch_utils import (
 from satellite_producer.utils.buoy_utils import fetch_buoy_positions, bbox_around
 
 # ---- env-var ---------------------------------------------------------------
-KAFKA_TOPIC   = os.getenv("KAFKA_TOPIC", "satellite_img")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "satellite_imagery")
 KAFKA_BROKERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092").split(",")
 
 POLL_SECONDS  = int(os.getenv("FETCH_INTERVAL_SECONDS", "900"))
@@ -32,7 +32,7 @@ DAYS_LOOKBACK = int(os.getenv("SAT_DAYS_LOOKBACK", "30"))       # finestra per l
 CLOUD_LIMIT   = float(os.getenv("SAT_MAX_CLOUD", "20"))         # %
 
 # MinIO
-MINIO_BUCKET   = os.getenv("MINIO_BUCKET", "marine-data")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "bronze")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")

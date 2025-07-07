@@ -175,9 +175,10 @@ def compress_image_with_pil(img: np.ndarray, quality: int = 85) -> bytes:
 
 def save_image_in_S3(image_bytes: bytes, timestamp: str, macroarea_id: str, microarea_id: str) -> str:
     """
-        To comment!
+    Salva un'immagine in MinIO S3 secondo l'architettura medallion.
     """
-    bucket_name = "satellite-imgs"
+    # Usa bronze per i dati grezzi satellitari
+    bucket_name = "bronze"
     image_file_id = f"sat_img_{macroarea_id}_{microarea_id}_{timestamp}"
     
     # Extract date for partitioned path
@@ -189,8 +190,8 @@ def save_image_in_S3(image_bytes: bytes, timestamp: str, macroarea_id: str, micr
     # Unique uuid hex code
     unique_id = uuid.uuid4().hex[:8]
     
-    # Unique Img ID
-    object_key = f"sat_imgs/year={year}/month={month}/day={day}/{image_file_id}_{unique_id}.jpg"
+    # Percorso secondo l'architettura proposta
+    object_key = f"satellite_imagery/sentinel2/year={year}/month={month}/day={day}/{image_file_id}_{unique_id}.jpg"
     
     # Put object in bucket
     try:

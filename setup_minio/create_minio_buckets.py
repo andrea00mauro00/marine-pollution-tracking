@@ -23,30 +23,32 @@ BUCKETS = [
     "silver",       # Processed and analyzed data
     "gold",         # Business insights (hotspots, predictions, alerts)
     
-    # Additional specialized buckets
-    "satellite_images",  # Raw satellite imagery files (potentially large)
-    "reports",           # Generated reports (daily, weekly summaries)
+    # Reports bucket
+    "reports",      # Generated reports (daily, weekly summaries)
 ]
 
 # Example folder structure to create within buckets
 # These are just prefixes in MinIO but help organize data
 FOLDER_STRUCTURE = {
     "bronze": [
-        "buoy_data/",
-        "satellite_imagery/"
+        "buoy_data/year=2025/month=07/day=07/",
+        "satellite_imagery/sentinel2/year=2025/month=07/day=07/",
+        "events/year=2025/month=07/"
     ],
     "silver": [
-        "analyzed_data/"
+        "analyzed_data/water_quality/year=2025/month=07/",
+        "hotspots/year=2025/month=07/",
+        "satellite_processed/pollution_detection/year=2025/month=07/"
     ],
     "gold": [
-        "hotspots/",
-        "predictions/",
-        "alerts/"
+        "predictions/year=2025/month=07/",
+        "insights/year=2025/month=07/",
+        "alerts/year=2025/month=07/"
     ],
     "reports": [
-        "daily/",
-        "weekly/",
-        "monthly/"
+        "daily/year=2025/month=07/",
+        "weekly/year=2025/month=07/",
+        "monthly/year=2025/"
     ]
 }
 
