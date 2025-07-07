@@ -72,21 +72,19 @@ services:
 
   satellite_producer:
     build:
-      context: ./satellite_producer        # cartella con il tuo Dockerfile
+      context: ./satellite_producer 
     container_name: satellite_producer
     depends_on:
       - kafka
       - minio
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_TOPIC=satellite_img          # topic dove pubblicare le immagini
-      - FETCH_INTERVAL_SECONDS=900         # 15 min fra un download e l’altro
-
-      # Sentinel-Hub (metti nel file .env oppure qui in chiaro)
-      - SH_CLIENT_ID=${SH_CLIENT_ID}
-      - SH_CLIENT_SECRET=${SH_CLIENT_SECRET}
-
-      # MinIO (stesso cluster che usi già)
+      - KAFKA_TOPIC=satellite_img
+      - FETCH_INTERVAL_SECONDS=900
+      - SH_CLIENT_ID=sh-eb560cfe-5964-4ac6-a0b0-d87c8e03af4b
+      - SH_CLIENT_SECRET=qZywwuvH6Bqq0TmbDuoNkW9SxgTVO4HA
+      - SH_TOKEN_URL=https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token
+      - SH_BASE_URL=https://sh.dataspace.copernicus.eu
       - MINIO_ENDPOINT=minio:9000
       - MINIO_BUCKET=marine-data
       - AWS_ACCESS_KEY_ID=minioadmin

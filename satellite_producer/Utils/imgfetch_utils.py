@@ -8,7 +8,7 @@ import logging
 from Utils.geo_img_utils import (
     compress_image_with_pil,
     serialize_image_payload,
-    firedet_bands_metadata
+    pollution_bands_metadata
 )
 
 from sentinelhub import (
@@ -185,7 +185,7 @@ def process_image(requested_data: list, macroarea_id: str, microarea_id: str, bb
 
     try:
         # 1. Generate synthetic metadata (with fire detection)
-        metadata, n_cols, n_rows = firedet_bands_metadata(bbox, microarea_id, macroarea_id)
+        metadata, n_cols, n_rows = pollution_bands_metadata(bbox, microarea_id, macroarea_id)
     except Exception as e:
         logger.error(f"[ERROR] Failed to generate metadata: {e}")
         return None

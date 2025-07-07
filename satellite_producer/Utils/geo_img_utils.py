@@ -121,9 +121,9 @@ class PixelLocationManager():
                 center_col_end = (2 * n_cols) // 3
 
                 if center_row_start <= i < center_row_end and center_col_start <= j < center_col_end:
-                    label = "wildfire"                
+                    label = "polluted"              
                 else:
-                    label = "vegetation"                
+                    label = "clean_water"       
                 
                 cells_centroids.append((
                     label,
@@ -208,37 +208,35 @@ def save_image_in_S3(image_bytes: bytes, timestamp: str, macroarea_id: str, micr
         raise SystemError(f"[ERROR] Failed to store image with image_id={image_file_id}, Error: {e}")
 
 
-def generate_pixel_data(label: str, lat: float, lon: float, microarea_id: str, fire_probability: int = 20) -> dict:
+def generate_pixel_data(label: str, lat: float, lon: float, microarea_id: str, pollution_probability: int = 20) -> dict:
     """
-        To comment!
+    Genera dati simulati per pixel basati sulla presenza o assenza di inquinamento.
     """
-
-    if label == "wildfire":
-        # Simulated fire conditions
-        B4 = random.uniform(0.3, 0.4)
-        B8 = random.uniform(0.1, 0.2)
-        B3 = random.uniform(0.05, 0.1)
-        B11 = random.uniform(0.2, 0.3)
-        B12 = random.uniform(0.2, 0.3)
+    if label == "polluted":
+        # Simulazione di condizioni di inquinamento
+        B4 = random.uniform(0.15, 0.25)  # Rosso più basso nell'acqua inquinata
+        B8 = random.uniform(0.05, 0.15)  # NIR basso nell'acqua
+        B3 = random.uniform(0.15, 0.25)  # Verde più alto per alghe
+        B11 = random.uniform(0.1, 0.2)
+        B12 = random.uniform(0.1, 0.2)
     else:
-        # Normal vegetation
-        B4 = random.uniform(0.05, 0.2)
-        B8 = random.uniform(0.3, 0.5)
-        B3 = random.uniform(0.1, 0.3)
-        B11 = random.uniform(0.05, 0.2)
-        B12 = random.uniform(0.05, 0.2)
-
+        # Acqua normale
+        B4 = random.uniform(0.05, 0.1)  # Rosso basso in acqua pulita
+        B8 = random.uniform(0.01, 0.05)  # NIR molto basso in acqua pulita
+        B3 = random.uniform(0.1, 0.2)    # Verde moderato
+        B11 = random.uniform(0.05, 0.1)  # SWIR basso in acqua
+        B12 = random.uniform(0.05, 0.1)  # SWIR basso in acqua
 
     pixel_json = {
         "latitude": round(lat, 6),
         "longitude": round(lon, 6),
         "microarea_id": microarea_id,
         "bands": {
-            "B2": round(random.uniform(0.05, 0.2), 3),
+            "B2": round(random.uniform(0.05, 0.2), 3),  # Blu più alto in acqua
             "B3": round(B3, 3),
             "B4": round(B4, 3),
             "B8": round(B8, 3),
-            "B8A": round(random.uniform(0.05, 0.3), 3),
+            "B8A": round(random.uniform(0.01, 0.1), 3),
             "B11": round(B11, 3),
             "B12": round(B12, 3)
         }
@@ -246,12 +244,14 @@ def generate_pixel_data(label: str, lat: float, lon: float, microarea_id: str, f
 
     return pixel_json
 
-
-def firedet_bands_metadata(bbox_list: list, microarea_id: str, macroarea_id: str, fire_probability: int = 20) -> dict:
+def pollution_bands_metadata(bbox_list: list, microarea_id: str, macroarea_id: str, pollution_probability: int = 20) -> dict:
     """
-        To comment!
+    Genera metadati simulati per il rilevamento dell'inquinamento marino.
     """
-    # Validate bounding box
+    # Modifica anche la classe PixelLocationManager per etichettare i pixel come "polluted" invece di "wildfire"
+    # e "clean_water" invece di "vegetation"
+    
+    # Validare bounding box
     if not isinstance(bbox_list, (list, tuple)) or len(bbox_list) != 4:
         raise ValueError("[ERROR] bbox_list must be a list of 4 coordinates [min_long, min_lat, max_long, max_lat]")
     
@@ -272,7 +272,7 @@ def firedet_bands_metadata(bbox_list: list, microarea_id: str, macroarea_id: str
     for i in range(len(location)):
         try:
             label, lat, lon = location[i]
-            pixel_data = generate_pixel_data(label, lat, lon, microarea_id=microarea_id, fire_probability=fire_probability)
+            pixel_data = generate_pixel_data(label, lat, lon, microarea_id=microarea_id, pollution_probability=pollution_probability)
             sampled_pixels.append(pixel_data)
 
         except Exception as e:

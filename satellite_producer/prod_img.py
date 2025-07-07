@@ -50,6 +50,10 @@ def build_sh_config() -> SHConfig:
 
     cfg.sh_client_id     = os.getenv("SH_CLIENT_ID", cfg_toml.get("sh_client_id"))
     cfg.sh_client_secret = os.getenv("SH_CLIENT_SECRET", cfg_toml.get("sh_client_secret"))
+    
+    # Aggiungi queste due righe
+    cfg.sh_token_url = os.getenv("SH_TOKEN_URL", "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token")
+    cfg.sh_base_url = os.getenv("SH_BASE_URL", "https://sh.dataspace.copernicus.eu")
 
     if not cfg.sh_client_id or not cfg.sh_client_secret:
         logger.critical("❌ SH_CLIENT_ID / SH_CLIENT_SECRET mancanti.")
@@ -79,7 +83,7 @@ def pick_best_scene(cfg: SHConfig, bbox):
     end   = date.today()
     start = end - timedelta(days=DAYS_LOOKBACK)
     search = catalog.search(
-        data_collection="sentinel-2-l2a",
+        collection="sentinel-2-l2a",  # CORRETTO: parametro con nome giusto
         bbox=bbox,
         time=(start.isoformat(), end.isoformat()),
         filter=f"eo:cloud_cover < {CLOUD_LIMIT}",
@@ -116,29 +120,36 @@ def main() -> None:
                 logger.warning(f"🛰️  Download fallito per boa {buoy_id}")
                 continue
 
-            payload = process_image(
-                imgs,
-                macroarea_id="BUOY",
-                microarea_id=buoy_id,
-                bbox=list(bbox),
-                iteration=0,
-            )
+            try:
+                payload = process_image(
+                    imgs,
+                    macroarea_id="BUOY",
+                    microarea_id=buoy_id,
+                    bbox=list(bbox),
+                    iteration=0,
+                )
+                
+                # Verifica che payload non sia None
+                if payload:
+                    # --- salva JSON in MinIO --------------------------------------------------
+                    json_key = f"sentinel/{scene['id']}.json"
+                    minio_cli.put_object(
+                        Bucket=MINIO_BUCKET,
+                        Key=json_key,
+                        Body=json.dumps(payload).encode("utf-8"),
+                        ContentType="application/json",
+                    )
 
-            # --- salva JSON in MinIO --------------------------------------------------
-            json_key = f"sentinel/{scene['id']}.json"
-            minio_cli.put_object(
-                Bucket=MINIO_BUCKET,
-                Key=json_key,
-                Body=json.dumps(payload).encode("utf-8"),
-                ContentType="application/json",
-            )
+                    # --- invia su Kafka --------------------------------------------------------
+                    producer.send(KAFKA_TOPIC, value=payload) \
+                            .add_callback(on_send_success) \
+                            .add_errback(on_send_error)
 
-            # --- invia su Kafka --------------------------------------------------------
-            producer.send(KAFKA_TOPIC, value=payload) \
-                    .add_callback(on_send_success) \
-                    .add_errback(on_send_error)
-
-            logger.info(f"🛰️  Boa {buoy_id} → immagine + JSON inviati")
+                    logger.info(f"🛰️  Boa {buoy_id} → immagine + JSON inviati")
+                else:
+                    logger.warning(f"🛰️  Boa {buoy_id} → processo immagine fallito, nessun payload")
+            except Exception as e:
+                logger.error(f"🛰️  Boa {buoy_id} → errore nel processing: {e}")
 
         time.sleep(POLL_SECONDS)
 

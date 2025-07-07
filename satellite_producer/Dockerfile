@@ -1,37 +1,66 @@
-# ---------- base immagine ----------
-FROM python:3.10-slim
-
+FROM python:3.10
 WORKDIR /app
 
-# ---------- dipendenze di sistema (solo quelle davvero utili) ----------
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        build-essential \
-        curl \
-        netcat-traditional \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Installa pacchetti di sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    netcat-traditional \
+    libpq-dev \
+    gcc \
+    python3-dev \
+    libpng-dev \
+    libjpeg-dev \
+    libfreetype6-dev \
+    pkg-config \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# ---------- requisiti Python ----------
+# Copia requirements e installa le dipendenze Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---------- codice sorgente ----------
-#   Copiamo l’intera cartella satellite_producer con le utility
-COPY satellite_producer/ satellite_producer/
+# Copia i file principali (nota: siamo già nel contesto satellite_producer/)
+COPY prod_img.py .
+COPY Utils/ Utils/
+COPY Config/ Config/
+COPY wait-for-kafka.sh .
+RUN chmod +x wait-for-kafka.sh
 
-#   (se ti serve wait-for-kafka.sh lo copiamo ugualmente)
-COPY wait-for-kafka.sh /usr/local/bin/wait-for-kafka
-RUN chmod +x /usr/local/bin/wait-for-kafka
+# Crea la struttura del package satellite_producer
+RUN mkdir -p /app/satellite_producer/utils && \
+    touch /app/satellite_producer/__init__.py && \
+    touch /app/satellite_producer/utils/__init__.py
 
-# ---------- variabili d’ambiente di default ----------
+# Copia i file esistenti in Utils nella directory satellite_producer/utils
+RUN cp /app/Utils/__init__.py /app/satellite_producer/utils/ && \
+    cp /app/Utils/buoy_utils.py /app/satellite_producer/utils/ && \
+    cp /app/Utils/db_utils.py /app/satellite_producer/utils/ && \
+    cp /app/Utils/geo_img_utils.py /app/satellite_producer/utils/ && \
+    cp /app/Utils/imgfetch_utils.py /app/satellite_producer/utils/ && \
+    cp /app/Utils/imgfilter_utils.py /app/satellite_producer/utils/ && \
+    cp /app/Utils/stream_img_utils.py /app/satellite_producer/utils/
+
+# Copia ricorsivamente anche la sottodirectory config se esiste
+RUN if [ -d "/app/Utils/config" ]; then \
+        mkdir -p /app/satellite_producer/utils/config && \
+        cp -r /app/Utils/config/* /app/satellite_producer/utils/config/; \
+    fi
+
+# Imposta variabili d'ambiente
 ENV KAFKA_BOOTSTRAP_SERVERS=kafka:9092
 ENV KAFKA_TOPIC=satellite_img
 ENV MINIO_ENDPOINT=minio:9000
 ENV MINIO_BUCKET=marine-data
-ENV FETCH_INTERVAL_SECONDS=900           # 15 min
+ENV FETCH_INTERVAL_SECONDS=900
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH="/app:${PYTHONPATH}"
 
-# ---------- comando di avvio ----------
-# • aspettiamo Kafka se vuoi (commenta se non serve)
-# • poi lanciamo il producer come modulo (-m) per evitare problemi di import
-CMD ["bash", "-c", "wait-for-kafka && python -m satellite_producer.prod_img"]
+# Verifica la struttura delle directory
+RUN echo "Directory structure:" && ls -la /app && \
+    echo "satellite_producer structure:" && ls -la /app/satellite_producer && \
+    echo "Utils content:" && ls -la /app/Utils && \
+    echo "utils content:" && ls -la /app/satellite_producer/utils
+
+# Esegui lo script Python direttamente
+CMD ["bash", "-c", "./wait-for-kafka.sh kafka:9092 python prod_img.py"]
