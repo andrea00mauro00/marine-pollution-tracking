@@ -1,4 +1,3 @@
-
 # Utilities
 from botocore.client import Config
 import matplotlib.pyplot as plt
@@ -15,7 +14,7 @@ import uuid
 import time
 import json
 import io
-
+import os
 
 # Logs Configuration
 logging.basicConfig(
@@ -25,13 +24,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Ottieni configurazione da variabili d'ambiente per coerenza
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "bronze")
+AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
 # --- MinIO S3-compatible client setup ---
 s3 = boto3.client(
     's3',
-    endpoint_url='http://minio:9000',
-    aws_access_key_id='minioadmin',
-    aws_secret_access_key='minioadmin',
+    endpoint_url=f'http://{MINIO_ENDPOINT}',
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
     config=Config(signature_version='s3v4'),
     region_name='us-east-1'
 )
@@ -177,10 +181,6 @@ def save_image_in_S3(image_bytes: bytes, timestamp: str, macroarea_id: str, micr
     """
     Salva un'immagine in MinIO S3 secondo l'architettura medallion.
     """
-    # Usa bronze per i dati grezzi satellitari
-    bucket_name = "bronze"
-    image_file_id = f"sat_img_{macroarea_id}_{microarea_id}_{timestamp}"
-    
     # Extract date for partitioned path
     year_month_day = timestamp.split("T")[0]  # YYYY-MM-DD
     year = year_month_day.split("-")[0]
@@ -190,23 +190,26 @@ def save_image_in_S3(image_bytes: bytes, timestamp: str, macroarea_id: str, micr
     # Unique uuid hex code
     unique_id = uuid.uuid4().hex[:8]
     
-    # Percorso secondo l'architettura proposta
-    object_key = f"satellite_imagery/sentinel2/year={year}/month={month}/day={day}/{image_file_id}_{unique_id}.jpg"
+    # Costruisci il nome del file senza duplicare il prefisso "sat_img_"
+    file_id = f"{macroarea_id}_{microarea_id}_{timestamp}"
+    
+    # Percorso secondo l'architettura medallion
+    object_key = f"satellite_imagery/sentinel2/year={year}/month={month}/day={day}/sat_img_{file_id}_{unique_id}.jpg"
     
     # Put object in bucket
     try:
         s3.put_object(
-            Bucket=bucket_name,
+            Bucket=MINIO_BUCKET,  # Usa la variabile globale
             Key=object_key,
             Body=image_bytes,
             ContentType='image/jpeg'
         )
-        logger.info(f"Uploaded to bucket '{bucket_name}' at key '{object_key}'")
+        logger.info(f"Uploaded to bucket '{MINIO_BUCKET}' at key '{object_key}'")
 
         return object_key
 
     except Exception as e:
-        raise SystemError(f"[ERROR] Failed to store image with image_id={image_file_id}, Error: {e}")
+        raise SystemError(f"[ERROR] Failed to store image with image_id={file_id}, Error: {e}")
 
 
 def generate_pixel_data(label: str, lat: float, lon: float, microarea_id: str, pollution_probability: int = 20) -> dict:
@@ -361,4 +364,3 @@ def plot_image(image: np.ndarray, factor: float = 3.5/255, clip_range: Tuple[flo
     plt.axis('off')
 
     plt.show()
-

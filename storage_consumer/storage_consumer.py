@@ -183,6 +183,8 @@ def main():
         conn.close()
         logger.info("Consumer chiuso")
 
+
+
 def process_analyzed_data(conn, s3_client, data):
     """Processa i dati analizzati e li salva in TimescaleDB e MinIO"""
     try:
@@ -217,8 +219,12 @@ def process_analyzed_data(conn, s3_client, data):
             conn.commit()
             logger.info(f"Dati analizzati salvati in TimescaleDB per {source_id}")
         
-        # Salva in MinIO (silver layer)
-        key = f"analyzed_data/{source_type}/{source_id}_{timestamp}.json"
+        # Salva in MinIO (silver layer) con il percorso corretto usando partitioning
+        year = dt.strftime("%Y")
+        month = dt.strftime("%m")
+        day = dt.strftime("%d")
+        
+        key = f"analyzed_data/{source_type}/year={year}/month={month}/day={day}/{source_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="silver",
             Key=key,
@@ -260,8 +266,12 @@ def process_hotspot_data(conn, s3_client, data):
             conn.commit()
             logger.info(f"Dati hotspot salvati in TimescaleDB per {hotspot_id}")
         
-        # Salva in MinIO (gold layer)
-        key = f"hotspots/{hotspot_id}_{timestamp}.json"
+        # Salva in MinIO (gold layer) con il percorso corretto usando partitioning
+        year = dt.strftime("%Y")
+        month = dt.strftime("%m")
+        day = dt.strftime("%d")
+        
+        key = f"hotspots/year={year}/month={month}/day={day}/hotspot_{hotspot_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
             Key=key,
@@ -281,9 +291,15 @@ def process_prediction_data(conn, s3_client, data):
         # Estrai i dati rilevanti
         prediction_set_id = data.get("prediction_set_id", "unknown")
         timestamp = data.get("generated_at", int(time.time() * 1000))
+        dt = datetime.fromtimestamp(timestamp / 1000)
+        
+        # Percorso corretto usando partitioning
+        year = dt.strftime("%Y")
+        month = dt.strftime("%m")
+        day = dt.strftime("%d")
         
         # Salva in MinIO (gold layer)
-        key = f"predictions/{prediction_set_id}_{timestamp}.json"
+        key = f"predictions/year={year}/month={month}/day={day}/prediction_{prediction_set_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
             Key=key,
@@ -301,9 +317,15 @@ def process_alert_data(s3_client, data):
         # Estrai i dati rilevanti
         alert_id = data.get("alert_id", "unknown")
         timestamp = data.get("timestamp", int(time.time() * 1000))
+        dt = datetime.fromtimestamp(timestamp / 1000)
+        
+        # Percorso corretto usando partitioning
+        year = dt.strftime("%Y")
+        month = dt.strftime("%m")
+        day = dt.strftime("%d")
         
         # Salva in MinIO (gold layer)
-        key = f"alerts/{alert_id}_{timestamp}.json"
+        key = f"alerts/year={year}/month={month}/day={day}/alert_{alert_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
             Key=key,
@@ -314,6 +336,3 @@ def process_alert_data(s3_client, data):
         
     except Exception as e:
         logger.error(f"Errore nell'elaborazione dei dati avviso: {e}")
-
-if __name__ == "__main__":
-    main()

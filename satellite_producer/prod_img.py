@@ -4,7 +4,7 @@ import sys
 import time
 import json
 import pathlib
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime  # Aggiunto datetime
 from loguru import logger
 from sentinelhub import SHConfig, SentinelHubCatalog
 import boto3
@@ -132,7 +132,16 @@ def main() -> None:
                 # Verifica che payload non sia None
                 if payload:
                     # --- salva JSON in MinIO --------------------------------------------------
-                    json_key = f"sentinel/{scene['id']}.json"
+                    # Ottieni la data corrente per il partizionamento
+                    current_date = datetime.now()
+                    year = current_date.strftime('%Y')
+                    month = current_date.strftime('%m')
+                    day = current_date.strftime('%d')
+                    timestamp = int(time.time() * 1000)
+                    
+                    # Percorso corretto secondo la struttura definita
+                    json_key = f"satellite_imagery/sentinel2/year={year}/month={month}/day={day}/metadata_{scene['id']}_{timestamp}.json"
+                    
                     minio_cli.put_object(
                         Bucket=MINIO_BUCKET,
                         Key=json_key,
@@ -145,7 +154,7 @@ def main() -> None:
                             .add_callback(on_send_success) \
                             .add_errback(on_send_error)
 
-                    logger.info(f"🛰️  Boa {buoy_id} → immagine + JSON inviati")
+                    logger.info(f"🛰️  Boa {buoy_id} → immagine + metadata JSON inviati")
                 else:
                     logger.warning(f"🛰️  Boa {buoy_id} → processo immagine fallito, nessun payload")
             except Exception as e:

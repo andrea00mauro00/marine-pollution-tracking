@@ -184,7 +184,7 @@ def process_image(requested_data: list, macroarea_id: str, microarea_id: str, bb
     image = requested_data[0]
 
     try:
-        # 1. Generate synthetic metadata (with fire detection)
+        # 1. Generate synthetic metadata (with pollution detection)
         metadata, n_cols, n_rows = pollution_bands_metadata(bbox, microarea_id, macroarea_id)
     except Exception as e:
         logger.error(f"[ERROR] Failed to generate metadata: {e}")
@@ -206,6 +206,7 @@ def process_image(requested_data: list, macroarea_id: str, microarea_id: str, bb
 
     try:
         # 4. Serialize image + metadata into final payload
+        # This function internally calls save_image_in_S3 which we've already fixed
         img_payload_prod = serialize_image_payload(img_bytes, metadata, macroarea_id, microarea_id)
     except Exception as e:
         logger.error(f"[ERROR] Failed to serialize payload: {e}")
