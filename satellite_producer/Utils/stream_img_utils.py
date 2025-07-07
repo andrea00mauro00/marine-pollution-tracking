@@ -1,4 +1,3 @@
-
 # Utilities
 from kafka.errors import KafkaError
 from sentinelhub import SHConfig
@@ -6,6 +5,7 @@ from kafka import KafkaProducer
 import logging
 import json
 import time
+import os
 
 from Utils.imgfetch_utils import (
     get_aoi_bbox_and_size,
@@ -13,7 +13,6 @@ from Utils.imgfetch_utils import (
     process_image,
     fetch_micro_bbox_from_db
 )
-
 
 # Logs Configuration
 logging.basicConfig(
@@ -113,6 +112,10 @@ def stream_macro_imgs(macroarea_i:int, microarea_i:int) -> None:
     bootstrap_servers = ['kafka:9092']
     producer = None
 
+    # Get Kafka topic from environment variable for maximum compatibility
+    topic = os.environ.get("KAFKA_TOPIC", "satellite_imagery")
+    logger.info(f"Using Kafka topic: '{topic}'")
+
     while producer is None:
         try:
             logger.info("Connecting to Kafka client to initialize producer...")
@@ -120,6 +123,7 @@ def stream_macro_imgs(macroarea_i:int, microarea_i:int) -> None:
             logger.info("Kafka producer initialized successfully.")
         except Exception as e:
             logger.warning(f"Kafka connection failed: {e}. Retrying...")
+            time.sleep(5)
             continue
 
     # Set up data stream parameters
@@ -133,6 +137,18 @@ def stream_macro_imgs(macroarea_i:int, microarea_i:int) -> None:
     macroarea_id = f"A{macroarea_i}"
     iteration = 0
 
+    # Verify Kafka connection and topic existence
+    try:
+        producer_metadata = producer.list_topics()
+        logger.info(f"Available Kafka topics: {list(producer_metadata.topics.keys())}")
+        
+        if topic in producer_metadata.topics:
+            logger.info(f"Topic '{topic}' found in Kafka")
+        else:
+            logger.warning(f"Topic '{topic}' NOT found in Kafka. It will be created automatically.")
+    except Exception as e:
+        logger.warning(f"Could not verify available topics: {e}")
+
     while stream:
         try:
             t_macro_start = time.perf_counter()
@@ -143,7 +159,7 @@ def stream_macro_imgs(macroarea_i:int, microarea_i:int) -> None:
                 logger.error(f"No bounding box found for macroarea {macroarea_i}, skipping.")
                 continue
             
-            if not isinstance(macroarea_id, str):
+            if not isinstance(microarea_id, str):
                 logger.error("Microarea id fetched must be a string")
                 continue
 
@@ -183,20 +199,41 @@ def stream_macro_imgs(macroarea_i:int, microarea_i:int) -> None:
                 continue  
             logger.info("Image processed in %.2f s", time.perf_counter() - t_proc)
 
-            topic = f"satellite_img"
-            logger.info("Sending payload to Kafka...")
+            logger.info(f"Sending payload to Kafka topic '{topic}'...")
             t_send = time.perf_counter()
 
-            try:
-                # Assign to value for clarity
+            # Verify payload type and size
+            if not isinstance(img_payload_str, str):
+                logger.warning(f"Expected string payload, got {type(img_payload_str)}. Converting...")
+                value = json.dumps(img_payload_str)
+            else:
                 value = img_payload_str
+            
+            payload_size = len(value.encode('utf-8'))
+            logger.info(f"Payload size: {payload_size} bytes")
+            if payload_size > 1_000_000:  # 1MB
+                logger.warning("Very large payload (>1MB), this might cause issues")
+
+            # Verify Kafka connection
+            try:
+                connected_nodes = producer.bootstrap_connected()
+                logger.info(f"Connected to {len(connected_nodes)} Kafka brokers")
+                if not connected_nodes:
+                    logger.error("No Kafka brokers connected!")
+            except Exception as e:
+                logger.warning(f"Could not check Kafka broker connections: {e}")
+
+            try:
+                # Explicitly set the topic name and send with a timeout
+                future = producer.send(topic, value=value)
                 
-                # Asynchronous sending
-                producer.send(topic, value=value).add_callback(on_send_success).add_errback(on_send_error)
-                logger.info("Message sent successfully.")
+                # Wait for the result with timeout for debugging
+                record_metadata = future.get(timeout=10)
+                logger.info(f"Message sent successfully to topic '{record_metadata.topic}', "
+                            f"partition {record_metadata.partition}, offset {record_metadata.offset}")
             
             except KafkaError as e:
-                logger.exception(f"[KAFKA ERROR] Failed to send message to Kafka after retries: {e}.")
+                logger.exception(f"[KAFKA ERROR] Failed to send message to Kafka: {e}.")
             
             except Exception as e:
                 logger.exception(f"[UNEXPECTED ERROR] An unknown error occurred while sending Kafka message: {e}")
@@ -229,4 +266,3 @@ def stream_macro_imgs(macroarea_i:int, microarea_i:int) -> None:
             logger.info("Waiting %.2f s before next image fetching...\n\n", remaining_time)
             if remaining_time > 0:
                 time.sleep(remaining_time)
-

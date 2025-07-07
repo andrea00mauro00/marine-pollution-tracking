@@ -6,14 +6,14 @@ import pyproj
 
 # ---- elenco boe / stazioni (raggio default = 2 km) -----------------
 BUOYS: List[Tuple[str, float, float, float]] = [
-    ("44042", 38.033, -76.335, 2.0),  # Potomac
-    ("44062", 39.539, -76.051, 2.0),  # Gooses Reef
-    ("44063", 38.788, -77.036, 2.0),  # Annapolis
-    ("44072", 37.201, -76.266, 2.0),  # York Spit
-    ("BISM2", 38.220, -76.039, 2.0),  # Bishops Head
-    ("44058", 37.567, -76.257, 2.0),  # Stingray Point
-    ("WAHV2", 37.608, -75.686, 2.0),  # Wachapreague
-    ("CHYV2", 36.926, -76.007, 2.0),  # Cape Henry
+    ("44042", 38.033, -76.335, 7.5),  # Potomac (era 2.0)
+    ("44062", 39.539, -76.051, 7.5),  # Gooses Reef (era 2.0)
+    ("44063", 38.788, -77.036, 7.5),  # Annapolis (era 2.0)
+    ("44072", 37.201, -76.266, 7.5),  # York Spit (era 2.0)
+    ("BISM2", 38.220, -76.039, 7.5),  # Bishops Head (era 2.0)
+    ("44058", 37.567, -76.257, 7.5),  # Stingray Point (era 2.0)
+    ("WAHV2", 37.608, -75.686, 7.5),  # Wachapreague (era 2.0)
+    ("CHYV2", 36.926, -76.007, 7.5),  # Cape Henry (era 2.0)
 ]
 
 def fetch_buoy_positions():

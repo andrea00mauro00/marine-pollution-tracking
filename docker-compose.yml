@@ -79,7 +79,7 @@ services:
       - minio
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_TOPIC=satellite_img
+      - KAFKA_TOPIC=satellite_imagery
       - FETCH_INTERVAL_SECONDS=900
       - SH_CLIENT_ID=sh-eb560cfe-5964-4ac6-a0b0-d87c8e03af4b
       - SH_CLIENT_SECRET=qZywwuvH6Bqq0TmbDuoNkW9SxgTVO4HA
