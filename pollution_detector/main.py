@@ -28,6 +28,7 @@ from pyflink.datastream.functions import KeyedProcessFunction
 from pyflink.common import WatermarkStrategy, Time, TypeInformation
 from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
 from pyflink.common.typeinfo import Types
+from pyflink.datastream.functions import ProcessFunction
 
 # Configure logging
 logging.basicConfig(
