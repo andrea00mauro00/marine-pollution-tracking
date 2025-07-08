@@ -1,14 +1,12 @@
 """
-===============================================================================
-Marine Pollution Monitoring System - ML Prediction Engine Flink Job
-===============================================================================
+==============================================================================
+Marine Pollution Monitoring System - ML Prediction Engine
+==============================================================================
 This job:
-1. Consumes raw data from Kafka (buoy_data and satellite_imagery topics)
-2. Implements pollution spread prediction models
-3. Simulates fluid dynamics for contaminant transport
-4. Forecasts pollution drift based on currents, winds and contaminant properties
-5. Produces 24/48-hour predictions of affected areas
-6. Publishes predictions to pollution_predictions topic
+1. Consumes analyzed sensor data and processed imagery from Kafka
+2. Applies fluid dynamics models to predict pollution spread
+3. Generates 6/12/24/48-hour forecasts for pollution movement
+4. Publishes predictions to pollution_predictions topic
 """
 
 import os
@@ -42,17 +40,9 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-BUOY_TOPIC = os.environ.get("BUOY_TOPIC", "buoy_data")
-SATELLITE_TOPIC = os.environ.get("SATELLITE_TOPIC", "satellite_imagery")
+ANALYZED_SENSOR_TOPIC = os.environ.get("ANALYZED_SENSOR_TOPIC", "analyzed_sensor_data")
+PROCESSED_IMAGERY_TOPIC = os.environ.get("PROCESSED_IMAGERY_TOPIC", "processed_imagery")
 PREDICTIONS_TOPIC = os.environ.get("PREDICTIONS_TOPIC", "pollution_predictions")
-
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
-MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
-MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
-
-# ===============================================================================
-# CONSTANTS AND REFERENCE VALUES
-# ===============================================================================
 
 # Pollutant physical properties for diffusion modeling
 POLLUTANT_PROPERTIES = {
@@ -236,13 +226,9 @@ SEASONAL_WIND_PATTERNS = {
     }
 }
 
-# ===============================================================================
-# POLLUTION EVENT DETECTION AND TRACKING
-# ===============================================================================
-
 class PollutionEventDetector(MapFunction):
     """
-    Detects pollution events from buoy and satellite data
+    Detects pollution events from analyzed sensor and imagery data
     """
     
     def __init__(self):
@@ -250,8 +236,6 @@ class PollutionEventDetector(MapFunction):
         self.events = {}
         # Risk threshold for pollution event declaration
         self.risk_threshold = 0.5
-        # Lookback window for event detection
-        self.detection_window = 6 * 60 * 60 * 1000  # 6 hours in milliseconds
     
     def map(self, value):
         try:
@@ -259,235 +243,90 @@ class PollutionEventDetector(MapFunction):
             data = json.loads(value)
             source_type = data.get("source_type")
             
-            # Extract location info
-            location = {}
+            # Extract location info and pollution analysis
+            location = data.get("location", {})
+            
             if source_type == "buoy":
-                location = {
-                    "lat": data.get("LAT"),
-                    "lon": data.get("LON"),
-                    "sensor_id": data.get("sensor_id", "unknown")
-                }
+                pollution_analysis = data.get("pollution_analysis", {})
             elif source_type == "satellite":
-                # For satellite, extract from metadata
-                metadata = data.get("metadata", {})
+                # For satellite, extract from spectral analysis
+                spectral_analysis = data.get("spectral_analysis", {})
+                pollution_indicators = spectral_analysis.get("pollution_indicators", {})
                 
-                # Parse location info - try different formats that might be present
-                if "macroarea_id" in metadata:
-                    location = {
-                        "macroarea_id": metadata.get("macroarea_id"),
-                        "microarea_id": metadata.get("microarea_id")
-                    }
-                    
-                    # Try to get lat/lon from satellite_data
-                    sat_data = metadata.get("satellite_data", [])
-                    if sat_data:
-                        # Average the coordinates of all pixels
-                        lats = [pixel.get("latitude") for pixel in sat_data if "latitude" in pixel]
-                        lons = [pixel.get("longitude") for pixel in sat_data if "longitude" in pixel]
-                        
-                        if lats and lons:
-                            location["lat"] = sum(lats) / len(lats)
-                            location["lon"] = sum(lons) / len(lons)
+                # Calculate risk score based on indicators
+                risk_score = 0.0
+                if pollution_indicators.get("dark_patches", False):
+                    risk_score += 0.4
+                if pollution_indicators.get("unusual_coloration", False):
+                    risk_score += 0.3
+                if pollution_indicators.get("spectral_anomalies", False):
+                    risk_score += 0.3
+                
+                # Determine pollutant type
+                pollutant_type = "unknown"
+                if pollution_indicators.get("dark_patches", False):
+                    pollutant_type = "oil_spill"
+                elif pollution_indicators.get("unusual_coloration", False):
+                    if spectral_analysis.get("rgb_averages", {}).get("g", 0) > spectral_analysis.get("rgb_averages", {}).get("b", 0):
+                        pollutant_type = "algal_bloom"
+                    else:
+                        pollutant_type = "chemical_discharge"
+                
+                # Construct pollution analysis
+                pollution_analysis = {
+                    "risk_score": risk_score,
+                    "pollutant_type": pollutant_type,
+                    "level": "high" if risk_score > 0.7 else "medium" if risk_score > 0.4 else "low"
+                }
+            else:
+                # Skip unknown source types
+                return value
             
             # Skip if location info is insufficient
-            if not location or ("lat" not in location or "lon" not in location):
+            if not location or ("lat" not in location and "center_lat" not in location):
+                return value
+            
+            # Normalize location format
+            lat = location.get("lat") or location.get("center_lat")
+            lon = location.get("lon") or location.get("center_lon")
+            
+            if lat is None or lon is None:
                 return value
             
             # Check for pollution event
-            event_data = self._detect_pollution_event(data, source_type, location)
+            risk_score = pollution_analysis.get("risk_score", 0.0)
             
-            if event_data:
+            # If risk score exceeds threshold, create event data
+            if risk_score >= self.risk_threshold:
+                event_id = str(uuid.uuid4())
+                pollutant_type = pollution_analysis.get("pollutant_type", "unknown")
+                severity = pollution_analysis.get("level", "low")
+                
+                event_data = {
+                    "event_id": event_id,
+                    "timestamp": data.get("timestamp", int(time.time() * 1000)),
+                    "location": {
+                        "lat": lat,
+                        "lon": lon
+                    },
+                    "pollutant_type": pollutant_type,
+                    "severity": severity,
+                    "risk_score": risk_score,
+                    "detection_source": source_type
+                }
+                
+                # Store in event history for tracking
+                self.events[event_id] = event_data
+                
                 # Add event info to original data
                 data["pollution_event_detection"] = event_data
-                logger.info(f"Detected pollution event at ({location.get('lat')}, {location.get('lon')}): {event_data['pollutant_type']}")
+                logger.info(f"Detected pollution event at ({lat}, {lon}): {pollutant_type}")
             
             return json.dumps(data)
             
         except Exception as e:
             logger.error(f"Error in pollution event detection: {e}")
             return value
-    
-    def _detect_pollution_event(self, data, source_type, location):
-        """Detect pollution events from sensor data"""
-        # Default risk score
-        risk_score = 0.0
-        pollutant_type = "unknown"
-        
-        if source_type == "buoy":
-            # For buoy data, extract pollutant indicators
-            
-            # Check for direct pollution event flag
-            if "pollution_event" in data:
-                return {
-                    "event_id": str(uuid.uuid4()),
-                    "timestamp": data.get("timestamp", int(time.time() * 1000)),
-                    "location": location,
-                    "pollutant_type": data["pollution_event"].get("type", "unknown"),
-                    "severity": data["pollution_event"].get("severity", "unknown"),
-                    "risk_score": 0.9 if data["pollution_event"].get("severity") == "major" else 
-                                  0.7 if data["pollution_event"].get("severity") == "moderate" else 0.5,
-                    "detection_source": "direct_flag"
-                }
-            
-            # Check water quality index
-            if "water_quality_index" in data:
-                # Higher WQI = better quality, so invert for risk score
-                wqi = data["water_quality_index"]
-                if wqi < 50:
-                    risk_score = max(risk_score, 0.9)  # Very poor quality
-                elif wqi < 70:
-                    risk_score = max(risk_score, 0.7)  # Poor quality
-                elif wqi < 80:
-                    risk_score = max(risk_score, 0.5)  # Fair quality
-            
-            # Check pollution level if directly provided
-            if "pollution_level" in data:
-                level = data["pollution_level"]
-                if level == "high":
-                    risk_score = max(risk_score, 0.8)
-                elif level == "moderate":
-                    risk_score = max(risk_score, 0.6)
-                elif level == "low":
-                    risk_score = max(risk_score, 0.4)
-            
-            # Check specific parameters
-            # Microplastics
-            if "microplastics_concentration" in data and data["microplastics_concentration"] > 8.0:
-                risk_score = max(risk_score, 0.7)
-                if pollutant_type == "unknown":
-                    pollutant_type = "plastic_pollution"
-            
-            # Heavy metals
-            for key in data:
-                if key.startswith("hm_") and data[key] > 0.02:  # e.g. hm_mercury_hg
-                    risk_score = max(risk_score, 0.8)
-                    if pollutant_type == "unknown":
-                        pollutant_type = "chemical_discharge"
-            
-            # Hydrocarbons
-            for key in data:
-                if key.startswith("hc_") and data[key] > 0.5:  # e.g. hc_total_petroleum_hydrocarbons
-                    risk_score = max(risk_score, 0.9)
-                    if pollutant_type == "unknown":
-                        pollutant_type = "oil_spill"
-            
-            # Nutrients - high levels indicate agricultural runoff or sewage
-            for key in data:
-                if key.startswith("nt_") and data[key] > 10.0:  # e.g. nt_nitrates_no3
-                    risk_score = max(risk_score, 0.6)
-                    if pollutant_type == "unknown":
-                        pollutant_type = "agricultural_runoff"
-            
-            # Biological indicators - high coliform bacteria indicates sewage
-            for key in data:
-                if key == "bi_coliform_bacteria" and data[key] > 500:
-                    risk_score = max(risk_score, 0.75)
-                    if pollutant_type == "unknown":
-                        pollutant_type = "sewage"
-                elif key == "bi_chlorophyll_a" and data[key] > 30:
-                    risk_score = max(risk_score, 0.6)
-                    if pollutant_type == "unknown":
-                        pollutant_type = "algal_bloom"
-            
-        elif source_type == "satellite":
-            # For satellite data, check for polluted pixels
-            metadata = data.get("metadata", {})
-            satellite_data = metadata.get("satellite_data", [])
-            
-            if satellite_data:
-                # Count polluted pixels
-                total_pixels = len(satellite_data)
-                polluted_pixels = sum(1 for pixel in satellite_data if pixel.get("label") == "polluted")
-                
-                if total_pixels > 0:
-                    pollution_ratio = polluted_pixels / total_pixels
-                    risk_score = min(pollution_ratio * 2, 1.0)  # Scale risk score
-                    
-                    # Determine pollutant type based on band values of polluted pixels
-                    if polluted_pixels > 0:
-                        pollutant_type = self._determine_satellite_pollutant_type(satellite_data)
-        
-        # If risk score exceeds threshold, create event data
-        if risk_score >= self.risk_threshold:
-            event_id = str(uuid.uuid4())
-            
-            # Determine severity based on risk score
-            if risk_score > 0.8:
-                severity = "major"
-            elif risk_score > 0.6:
-                severity = "moderate"
-            else:
-                severity = "minor"
-            
-            event_data = {
-                "event_id": event_id,
-                "timestamp": data.get("timestamp", int(time.time() * 1000)),
-                "location": location,
-                "pollutant_type": pollutant_type,
-                "severity": severity,
-                "risk_score": risk_score,
-                "detection_source": source_type
-            }
-            
-            # Store in event history for tracking
-            self.events[event_id] = event_data
-            
-            return event_data
-        
-        return None
-    
-    def _determine_satellite_pollutant_type(self, satellite_data):
-        """Determine pollutant type from satellite spectral data"""
-        # Get only polluted pixels
-        polluted_pixels = [pixel for pixel in satellite_data if pixel.get("label") == "polluted"]
-        
-        if not polluted_pixels:
-            return "unknown"
-        
-        # Calculate average band values for polluted pixels
-        band_averages = {}
-        for band in ["B2", "B3", "B4", "B8", "B11", "B12"]:
-            values = []
-            for pixel in polluted_pixels:
-                if "bands" in pixel and band in pixel["bands"]:
-                    values.append(pixel["bands"][band])
-            
-            if values:
-                band_averages[band] = sum(values) / len(values)
-        
-        # Calculate key band ratios for classification
-        ratios = {}
-        if "B4" in band_averages and "B3" in band_averages and band_averages["B3"] > 0:
-            ratios["B4/B3"] = band_averages["B4"] / band_averages["B3"]  # Red/Green ratio
-        
-        if "B8" in band_averages and "B4" in band_averages and band_averages["B4"] > 0:
-            ratios["B8/B4"] = band_averages["B8"] / band_averages["B4"]  # NIR/Red ratio
-        
-        # Apply classification rules based on spectral signatures
-        
-        # Oil spill: Low NIR, distinctive SWIR pattern
-        if ("B8" in band_averages and band_averages["B8"] < 0.1 and 
-            "B11" in band_averages and "B12" in band_averages and
-            band_averages["B11"] > 0.1 and band_averages["B12"] > 0.1):
-            return "oil_spill"
-        
-        # Algal bloom: High green reflectance, low blue and red
-        elif ("B3" in band_averages and "B2" in band_averages and "B4" in band_averages and
-              band_averages["B3"] > band_averages["B2"] and band_averages["B3"] > band_averages["B4"]):
-            return "algal_bloom"
-        
-        # Sediment: High red reflectance
-        elif ("B4" in band_averages and band_averages["B4"] > 0.15 and 
-              "B4/B3" in ratios and ratios["B4/B3"] > 1.0):
-            return "sediment"
-        
-        # Default to most common type
-        return "sediment"
-
-
-# ===============================================================================
-# SPREAD PREDICTION MODELS
-# ===============================================================================
 
 class PollutionSpreadPredictor(KeyedProcessFunction):
     """
@@ -578,10 +417,6 @@ class PollutionSpreadPredictor(KeyedProcessFunction):
                 # Generate spread prediction
                 prediction_data = self._predict_spread(event_data, timestamp)
                 
-                # Save prediction to gold layer
-                prediction_set_id = prediction_data["prediction_set_id"]
-                self._save_to_minio(prediction_data, "gold", f"predictions/year={datetime.now().strftime('%Y')}/month={datetime.now().strftime('%m')}/day={datetime.now().strftime('%d')}/prediction_{prediction_set_id}_{timestamp}.json")
-                
                 # Output prediction
                 yield json.dumps(prediction_data)
             else:
@@ -617,14 +452,11 @@ class PollutionSpreadPredictor(KeyedProcessFunction):
                 # Generate initial spread prediction
                 prediction_data = self._predict_spread(event_data, timestamp)
                 
-                # Save prediction to gold layer
-                prediction_set_id = prediction_data["prediction_set_id"]
-                self._save_to_minio(prediction_data, "gold", f"predictions/year={datetime.now().strftime('%Y')}/month={datetime.now().strftime('%m')}/day={datetime.now().strftime('%d')}/prediction_{prediction_set_id}_{timestamp}.json")
-                
                 # Output prediction
                 yield json.dumps(prediction_data)
         except Exception as e:
             logger.error(f"Error in pollution spread prediction: {e}")
+            logger.error(traceback.format_exc())
     
     def _is_event_active(self, event_id):
         """Check if event is in active events map"""
@@ -654,9 +486,9 @@ class PollutionSpreadPredictor(KeyedProcessFunction):
         pollutant_props = POLLUTANT_PROPERTIES.get(pollutant_type, POLLUTANT_PROPERTIES["sediment"])
         
         # Determine initial radius based on severity
-        if severity == "major":
+        if severity == "major" or severity == "high":
             initial_radius_km = 5.0
-        elif severity == "moderate":
+        elif severity == "moderate" or severity == "medium":
             initial_radius_km = 3.0
         else:
             initial_radius_km = 1.5
@@ -878,39 +710,14 @@ class PollutionSpreadPredictor(KeyedProcessFunction):
             "direction": direction,
             "speed": speed
         }
-    
-    def _save_to_minio(self, data, bucket, key):
-        """Save data to MinIO"""
-        try:
-            import boto3
-            s3 = boto3.client(
-                's3',
-                endpoint_url=f"http://{MINIO_ENDPOINT}",
-                aws_access_key_id=MINIO_ACCESS_KEY,
-                aws_secret_access_key=MINIO_SECRET_KEY
-            )
-            s3.put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=json.dumps(data).encode('utf-8'),
-                ContentType="application/json"
-            )
-            logger.info(f"Saved to MinIO: {bucket}/{key}")
-        except Exception as e:
-            logger.error(f"Error saving to MinIO: {e}")
-
-
-# ===============================================================================
-# MAIN FUNCTION
-# ===============================================================================
 
 def wait_for_services():
-    """Wait for Kafka and MinIO to be available"""
-    logger.info("Checking service availability...")
+    """Wait for Kafka to be available"""
+    logger.info("Checking Kafka availability...")
     
     # Check Kafka
     kafka_ready = False
-    for i in range(30):
+    for i in range(10):
         try:
             from kafka.admin import KafkaAdminClient
             admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_SERVERS)
@@ -919,41 +726,19 @@ def wait_for_services():
             logger.info("✅ Kafka is ready")
             break
         except Exception:
-            logger.info(f"⏳ Kafka not ready, attempt {i+1}/30")
-            time.sleep(10)
+            logger.info(f"⏳ Kafka not ready, attempt {i+1}/10")
+            time.sleep(5)
     
     if not kafka_ready:
-        logger.error("❌ Kafka not available after 30 attempts")
+        logger.error("❌ Kafka not available after multiple attempts")
     
-    # Check MinIO
-    minio_ready = False
-    for i in range(30):
-        try:
-            import boto3
-            s3 = boto3.client(
-                's3',
-                endpoint_url=f"http://{MINIO_ENDPOINT}",
-                aws_access_key_id=MINIO_ACCESS_KEY,
-                aws_secret_access_key=MINIO_SECRET_KEY
-            )
-            s3.list_buckets()
-            minio_ready = True
-            logger.info("✅ MinIO is ready")
-            break
-        except Exception:
-            logger.info(f"⏳ MinIO not ready, attempt {i+1}/30")
-            time.sleep(10)
-    
-    if not minio_ready:
-        logger.error("❌ MinIO not available after 30 attempts")
-    
-    return kafka_ready and minio_ready
+    return kafka_ready
 
 def main():
-    """Main function to set up and run the ML Prediction Flink job"""
-    logger.info("Starting ML Prediction Engine Flink Job")
+    """Main function to set up and run the Flink job"""
+    logger.info("Starting ML Prediction Engine Job")
     
-    # Wait for services to be ready
+    # Wait for Kafka to be ready
     wait_for_services()
     
     # Create Flink execution environment
@@ -971,14 +756,14 @@ def main():
     }
     
     # Create Kafka consumers for source topics
-    buoy_consumer = FlinkKafkaConsumer(
-        topics=BUOY_TOPIC,
+    sensor_consumer = FlinkKafkaConsumer(
+        topics=ANALYZED_SENSOR_TOPIC,
         deserialization_schema=SimpleStringSchema(),
         properties=properties
     )
     
-    satellite_consumer = FlinkKafkaConsumer(
-        topics=SATELLITE_TOPIC,
+    imagery_consumer = FlinkKafkaConsumer(
+        topics=PROCESSED_IMAGERY_TOPIC,
         deserialization_schema=SimpleStringSchema(),
         properties=properties
     )
@@ -990,20 +775,20 @@ def main():
         producer_config=properties
     )
     
-    # Define processing pipeline for buoy data
-    buoy_stream = env.add_source(buoy_consumer)
-    detected_buoy = buoy_stream \
+    # Define processing pipeline for sensor data
+    sensor_stream = env.add_source(sensor_consumer)
+    detected_sensor = sensor_stream \
         .map(PollutionEventDetector(), output_type=Types.STRING()) \
-        .name("Detect_Buoy_Pollution_Events")
+        .name("Detect_Sensor_Pollution_Events")
     
-    # Define processing pipeline for satellite data
-    satellite_stream = env.add_source(satellite_consumer)
-    detected_satellite = satellite_stream \
+    # Define processing pipeline for imagery data
+    imagery_stream = env.add_source(imagery_consumer)
+    detected_imagery = imagery_stream \
         .map(PollutionEventDetector(), output_type=Types.STRING()) \
-        .name("Detect_Satellite_Pollution_Events")
+        .name("Detect_Imagery_Pollution_Events")
     
     # Merge detected events
-    all_events = detected_buoy.union(detected_satellite)
+    all_events = detected_sensor.union(detected_imagery)
     
     # Predict pollution spread for detected events
     predictions = all_events \
@@ -1015,7 +800,7 @@ def main():
     predictions.add_sink(predictions_producer).name("Publish_Predictions")
     
     # Execute the Flink job
-    logger.info("Executing ML Prediction Engine Flink Job")
+    logger.info("Executing ML Prediction Engine Job")
     env.execute("Marine_Pollution_ML_Prediction")
 
 if __name__ == "__main__":

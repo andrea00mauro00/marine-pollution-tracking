@@ -1,6 +1,6 @@
-version: '3.8'
 
 services:
+  # DATABASE E MESSAGGISTICA
   redis:
     image: redis:7-alpine
     container_name: redis
@@ -70,6 +70,21 @@ services:
     networks:
       - marine_net
 
+  # PRODUCER LAYER
+  buoy_producer:
+    build:
+      context: ./buoy_producer
+    container_name: buoy_producer
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=buoy_data
+      - GENERATE_INTERVAL_SECONDS=30
+    restart: always
+    networks:
+      - marine_net
+
   satellite_producer:
     build:
       context: ./satellite_producer 
@@ -77,6 +92,7 @@ services:
     depends_on:
       - kafka
       - minio
+      - create_buckets
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC=satellite_imagery
@@ -93,69 +109,58 @@ services:
     networks:
       - marine_net
 
-  buoy_producer:
+  # PROCESSING LAYER (NUOVI JOB FLINK)
+  image_standardizer:
     build:
-      context: ./buoy_producer
-    container_name: buoy_producer
-    depends_on:
-      - kafka
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_TOPIC=buoy_data
-      - GENERATE_INTERVAL_SECONDS=30
-    restart: always
-    networks:
-      - marine_net
-
-  data_processor_job:
-    build:
-      context: ./data_processor
-    container_name: data_processor_job
+      context: ./image_standardizer  # Ex data_processor
+    container_name: image_standardizer
     ports:
       - "8082:8081"
     depends_on:
       - kafka
       - minio
-      - create_buckets
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_SERVERS=kafka:9092
-      - AWS_ACCESS_KEY_ID=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
-      - MINIO_ENDPOINT=minio:9000
-      - BUOY_TOPIC=buoy_data
       - SATELLITE_TOPIC=satellite_imagery
-      - PROCESSED_DATA_TOPIC=processed_data
-    restart: on-failure
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery  # Nuovo topic
     networks:
       - marine_net
+    restart: on-failure
 
-  pollution_analyzer_job:
+  sensor_analyzer:
     build:
-      context: ./pollution_analyzer
-    container_name: pollution_analyzer_job
+      context: ./sensor_analyzer  # Nuovo componente
+    container_name: sensor_analyzer
+    ports:
+      - "8085:8081"
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - BUOY_TOPIC=buoy_data
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data  # Nuovo topic
+    networks:
+      - marine_net
+    restart: on-failure
+
+  pollution_detector:
+    build:
+      context: ./pollution_detector  # Ex pollution_analyzer
+    container_name: pollution_detector
     ports:
       - "8083:8081"
     depends_on:
       - kafka
-      - minio
-      - redis
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_SERVERS=kafka:9092
-      - AWS_ACCESS_KEY_ID=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
-      - MINIO_ENDPOINT=minio:9000
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - BUOY_TOPIC=buoy_data
-      - SATELLITE_TOPIC=satellite_imagery
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery
       - ANALYZED_DATA_TOPIC=analyzed_data
       - HOTSPOTS_TOPIC=pollution_hotspots
       - ALERTS_TOPIC=sensor_alerts
-    restart: on-failure
     networks:
       - marine_net
+    restart: on-failure
 
   ml_prediction_job:
     build:
@@ -165,37 +170,16 @@ services:
       - "8084:8081"
     depends_on:
       - kafka
-      - minio
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_SERVERS=kafka:9092
-      - AWS_ACCESS_KEY_ID=minioadmin
-      - AWS_SECRET_ACCESS_KEY=minioadmin
-      - MINIO_ENDPOINT=minio:9000
-      - BUOY_TOPIC=buoy_data
-      - SATELLITE_TOPIC=satellite_imagery
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery
       - PREDICTIONS_TOPIC=pollution_predictions
+    networks:
+      - marine_net
     restart: on-failure
-    networks:
-      - marine_net
 
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_INSTALL_PLUGINS=redis-datasource,grafana-worldmap-panel,grafana-piechart-panel
-    volumes:
-      - grafana_data:/var/lib/grafana
-    networks:
-      - marine_net
-    depends_on:
-      - redis
-    
-
+  # DATABASE LAYER
   postgres:
     image: postgres:14-alpine
     container_name: postgres
@@ -226,6 +210,56 @@ services:
       - marine_net
     restart: unless-stopped
 
+  # CONSUMER LAYER
+  storage_consumer:
+    build:
+      context: ./storage_consumer
+    container_name: storage_consumer
+    depends_on:
+      - kafka
+      - timescaledb
+      - minio
+      - create_buckets
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      # Topic subscriptions
+      - BUOY_TOPIC=buoy_data
+      - SATELLITE_TOPIC=satellite_imagery
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - ANALYZED_TOPIC=analyzed_data
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - PREDICTIONS_TOPIC=pollution_predictions
+      - ALERTS_TOPIC=sensor_alerts
+    networks:
+      - marine_net
+    restart: on-failure
+
+  dashboard_consumer:
+    build:
+      context: ./dashboard_consumer
+    container_name: dashboard_consumer
+    depends_on:
+      - kafka
+      - redis
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Topic subscriptions (tutti i topic)
+    volumes:
+      - ./common:/app/common
+    networks:
+      - marine_net
+    restart: on-failure
+
   alert_manager:
     build:
       context: ./alert_manager
@@ -243,54 +277,30 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - ALERTS_TOPIC=sensor_alerts
-      - NOTIFICATIONS_TOPIC=notifications
     volumes:
       - ./common:/app/common
     networks:
       - marine_net
     restart: on-failure
 
-  dashboard_consumer:
-    build:
-      context: ./dashboard_consumer
-    container_name: dashboard_consumer
+  # VISUALIZATION LAYER
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=redis-datasource,grafana-worldmap-panel,grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - marine_net
     depends_on:
-      - kafka
       - redis
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    volumes:
-      - ./common:/app/common
-    networks:
-      - marine_net
-    restart: on-failure
-
-  storage_consumer:
-    build:
-      context: ./storage_consumer
-    container_name: storage_consumer
-    depends_on:
-      - kafka
+      - postgres
       - timescaledb
-      - minio
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - TIMESCALE_HOST=timescaledb
-      - TIMESCALE_DB=marine_pollution
-      - TIMESCALE_USER=postgres
-      - TIMESCALE_PASSWORD=postgres
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-      - ANALYZED_TOPIC=analyzed_data
-      - HOTSPOTS_TOPIC=pollution_hotspots
-      - PREDICTIONS_TOPIC=pollution_predictions
-      - ALERTS_TOPIC=sensor_alerts
-    networks:
-      - marine_net
-    restart: on-failure
 
 networks:
   marine_net:

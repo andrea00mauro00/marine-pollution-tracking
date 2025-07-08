@@ -2,3 +2,9 @@ kafka-python
 boto3
 psycopg2-binary
 loguru
+pillow
+numpy
+redis
+pandas
+uuid
+pyarrow 
