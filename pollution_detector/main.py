@@ -565,20 +565,11 @@ class HotspotDetector(KeyedProcessFunction):
         return True
     
     def _should_generate_alert(self, area_data):
-        """Determine if the area data qualifies for an alert"""
-        # Criteria for generating an alert:
-        # 1. High enough risk score
-        # 2. High enough confidence
-        
-        avg_risk_score = area_data.get("avg_risk_score", 0.0)
-        confidence = area_data.get("confidence", 0.0)
         level = area_data.get("level", "low")
+        confidence = area_data.get("confidence", 0.0)
         
-        # Generate alerts for medium or high level hotspots with good confidence
-        if level == "high" and confidence > 0.5:
-            return True
-        
-        if level == "medium" and confidence > 0.7:
+        # Allineato con i criteri di alert_required in _create_hotspot
+        if level in ["medium", "high"] and confidence > 0.4:
             return True
         
         return False
