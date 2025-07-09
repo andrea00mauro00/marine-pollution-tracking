@@ -284,23 +284,37 @@ services:
     restart: on-failure
 
   # VISUALIZATION LAYER
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
+  # STREAMLIT DASHBOARD
+  dashboard:
+    build:
+      context: ./dashboard
+    container_name: marine_dashboard
     ports:
-      - "3000:3000"
+      - "8501:8501"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_INSTALL_PLUGINS=redis-datasource,grafana-worldmap-panel,grafana-piechart-panel
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
     volumes:
-      - grafana_data:/var/lib/grafana
+      - ./dashboard:/app
     networks:
       - marine_net
     depends_on:
       - redis
       - postgres
       - timescaledb
+      - minio
+    restart: on-failure
 
 networks:
   marine_net:
@@ -308,6 +322,6 @@ networks:
 
 volumes:
   minio_data:
-  grafana_data:
+  dashboard_data:
   postgres_data:
   timescaledb_data:
