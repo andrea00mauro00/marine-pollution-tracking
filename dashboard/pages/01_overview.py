@@ -118,8 +118,33 @@ def display_key_metrics(redis_client):
         
         # Water quality metric (if available)
         with col4:
+            # Prova a ottenere l'indice di qualità dall'acqua da Redis
             avg_wqi = metrics.get("avg_water_quality_index")
-            if avg_wqi:
+            
+            # Se non è disponibile, calcolalo dai dati dei sensori
+            if not avg_wqi or avg_wqi == "0":
+                active_sensor_ids = redis_client.get_active_sensors()
+                wqi_values = []
+                
+                for sensor_id in active_sensor_ids:
+                    sensor = redis_client.get_sensor(sensor_id)
+                    if sensor and "water_quality_index" in sensor:
+                        try:
+                            wqi = float(sensor["water_quality_index"])
+                            wqi_values.append(wqi)
+                        except (ValueError, TypeError):
+                            pass
+                
+                if wqi_values:
+                    avg_wqi = sum(wqi_values) / len(wqi_values)
+                    # Aggiorna il valore in Redis per usi futuri
+                    try:
+                        redis_client.update_metric("avg_water_quality_index", str(avg_wqi))
+                    except:
+                        pass
+            
+            # Visualizza il valore calcolato o un messaggio informativo
+            if avg_wqi and float(avg_wqi) > 0:
                 try:
                     wqi_value = float(avg_wqi)
                     delta_wqi = wqi_value - float(metrics.get("previous_avg_water_quality_index", 0))
@@ -132,12 +157,13 @@ def display_key_metrics(redis_client):
                 except (ValueError, TypeError):
                     st.metric(
                         label="Indice Qualità Media",
-                        value="N/A"
+                        value="Dati insufficienti"
                     )
             else:
                 st.metric(
                     label="Indice Qualità Media",
-                    value="N/A"
+                    value="Nessun dato disponibile",
+                    delta=None
                 )
         
         # Last update time
@@ -258,6 +284,45 @@ def display_interactive_map(redis_client, timescale_client, area_filter="Tutte l
                         "level": alert.get("level", "low")
                     })
         
+        for item in sensors_data:
+            item["type"] = "sensor"
+            item["symbol"] = "circle"
+            # Aggiungi una colonna per il colore basata sul livello di inquinamento
+            pollution_level = item.get("pollution_level", "minimal")
+            if pollution_level == "high":
+                item["color"] = "red"
+            elif pollution_level == "medium":
+                item["color"] = "orange"
+            elif pollution_level == "low":
+                item["color"] = "yellow"
+            else:
+                item["color"] = "green"
+        
+        for item in hotspots_data:
+            item["type"] = "hotspot"
+            item["symbol"] = "diamond"
+            # Colore basato sul livello
+            level = item.get("level", "low")
+            if level == "high":
+                item["color"] = "darkred"  # Rosso scuro per distinguerlo dai sensori
+            elif level == "medium":
+                item["color"] = "darkorange"
+            else:
+                item["color"] = "gold"  # Giallo oro per hotspot bassi
+
+        for item in alerts_data:
+            item["type"] = "alert"
+            item["symbol"] = "triangle-up"
+            
+            # Colore basato sul livello
+            level = item.get("level", "low")
+            if level == "high":
+                item["color"] = "purple"  # Viola per allerte critiche
+            elif level == "medium":
+                item["color"] = "magenta"
+            else:
+                item["color"] = "blue"
+            
         # Combine all data for the map
         map_data = pd.DataFrame(sensors_data + hotspots_data + alerts_data)
         
@@ -265,7 +330,8 @@ def display_interactive_map(redis_client, timescale_client, area_filter="Tutte l
         if not map_data.empty:
             fig = create_map(
                 map_data, 
-                default_center=area_coords[area_filter],
+                color_by="color",  # Usa la colonna color che abbiamo popolato
+                default_center={"lat": area_coords[area_filter]["lat"], "lon": area_coords[area_filter]["lon"]},
                 default_zoom=area_coords[area_filter]["zoom"]
             )
             st.plotly_chart(fig, use_container_width=True)

@@ -237,51 +237,90 @@ def create_heatmap(df, x_column, y_column, value_column, x_title=None, y_title=N
 
 def create_map(data_df, color_by=None, default_zoom=7, default_center=None):
     """
-    Create a map visualization using Plotly
-    
-    Args:
-        data_df: DataFrame with lat, lon, name, and optionally type/pollution columns
-        color_by: Column to use for color coding (default: None)
-        default_zoom: Default zoom level
-        default_center: Default center coordinates [lat, lon]
-        
-    Returns:
-        Plotly figure object
+    Create a map visualization using Plotly with basic markers
     """
-    import plotly.express as px
+    import plotly.graph_objects as go
     
     # Default center if not provided
     if default_center is None:
-        default_center = {"lat": 38.5, "lon": -76.4}  # Chesapeake Bay
+        default_center = {"lat": 38.5, "lon": -76.4}
     
-    # Crea una copia del dizionario center senza zoom
-    center_dict = {}
-    if isinstance(default_center, dict):
-        center_dict = {k: v for k, v in default_center.items() if k in ["lat", "lon"]}
+    # Estrai lat e lon dal dizionario default_center
+    center_lat = default_center.get("lat", 38.5)
+    center_lon = default_center.get("lon", -76.4)
     
-    # Create the map
-    fig = px.scatter_mapbox(
-        data_df,
-        lat="lat",
-        lon="lon",
-        color=color_by if color_by in data_df.columns else None,
-        size="marker_size" if "marker_size" in data_df.columns else None,
-        hover_name="name" if "name" in data_df.columns else None,
-        hover_data=['name'] if 'name' in data_df.columns else None,
-        zoom=default_zoom,
-        height=500,
-        size_max=20,
-        opacity=0.8
-    )
+    # Crea una figura base
+    fig = go.Figure()
     
-    # Update map layout - CORREZIONE QUI
+    # Usa colori diversi per distinguere i tipi
+    type_colors = {
+        'sensor': 'blue',
+        'hotspot': 'red',
+        'alert': 'orange'
+    }
+    
+    # Usa dimensioni diverse per distinguere i tipi
+    type_sizes = {
+        'sensor': 8,
+        'hotspot': 12,
+        'alert': 14
+    }
+    
+    # Aggiungi un trace separato per ogni tipo di punto
+    if 'type' in data_df.columns:
+        for point_type in data_df['type'].unique():
+            subset = data_df[data_df['type'] == point_type]
+            
+            if not subset.empty:
+                # Determina il colore base per questo tipo
+                base_color = type_colors.get(point_type, 'gray')
+                # Determina la dimensione per questo tipo
+                marker_size = type_sizes.get(point_type, 10)
+                
+                # Crea una traccia semplice con solo punti colorati 
+                # Non usiamo simboli personalizzati perché sembrano non funzionare bene
+                fig.add_trace(go.Scattermapbox(
+                    lat=subset['lat'],
+                    lon=subset['lon'],
+                    mode='markers',
+                    marker=dict(
+                        size=marker_size,
+                        color=subset[color_by] if color_by in subset.columns else base_color
+                    ),
+                    text=subset.apply(lambda row: f"{point_type.capitalize()}: {row.get('id', 'N/A')}<br>"
+                                                  f"Livello: {row.get('level', row.get('pollution_level', 'N/A'))}", axis=1),
+                    name=point_type.capitalize()
+                ))
+    else:
+        # Se non c'è una colonna type, aggiungi tutti i punti con lo stesso stile
+        fig.add_trace(go.Scattermapbox(
+            lat=data_df['lat'],
+            lon=data_df['lon'],
+            mode='markers',
+            marker=dict(
+                size=10,
+                color=data_df[color_by] if color_by in data_df.columns else 'blue'
+            ),
+            text=data_df['id'] if 'id' in data_df.columns else None,
+            name="Punti"
+        ))
+    
+    # Imposta layout e stile della mappa
     fig.update_layout(
-        mapbox_style="carto-positron",
         mapbox=dict(
-            center=center_dict,  # Usa solo lat e lon
-            zoom=default_zoom  # Zoom va qui, fuori da center
+            style="carto-positron",
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=default_zoom
         ),
         margin={"r": 0, "t": 0, "l": 0, "b": 0},
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5
+        ),
+        height=600
     )
     
     return fig
