@@ -197,7 +197,21 @@ def render_predictions_view(redis_client):
     )
     
     # Render the map
-    st.pydeck_chart(deck, use_container_width=True, height=500)
+    st.pydeck_chart(deck, use_container_width=True)
+
+    # Aggiungi controllo altezza con CSS
+    st.markdown("""
+    <style>
+        div.element-container:has(div.stPydeckChart) {
+            min-height: 500px;
+        }
+        
+        iframe.stPydeckChart {
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.15);
+        }
+    </style>
+    """, unsafe_allow_html=True)
     
     # Additional information about the prediction
     with st.expander("Prediction Details", expanded=False):

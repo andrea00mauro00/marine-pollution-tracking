@@ -5,7 +5,7 @@ Marine Pollution Monitoring System - Pollution Detector
 This job:
 1. Consumes analyzed sensor data and processed imagery from Kafka
 2. Integrates data sources to detect pollution hotspots
-3. Generates alerts for detected pollution
+3. Generates alerts for detected pollution with deduplication
 4. Publishes results to analyzed_data, pollution_hotspots, and sensor_alerts topics
 """
 
@@ -24,11 +24,10 @@ from collections import deque
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
 from pyflink.datastream.connectors import FlinkKafkaConsumer, FlinkKafkaProducer
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.datastream.functions import KeyedProcessFunction
+from pyflink.datastream.functions import KeyedProcessFunction, ProcessFunction
 from pyflink.common import WatermarkStrategy, Time, TypeInformation
 from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
 from pyflink.common.typeinfo import Types
-from pyflink.datastream.functions import ProcessFunction
 
 # Configure logging
 logging.basicConfig(
@@ -45,6 +44,10 @@ PROCESSED_IMAGERY_TOPIC = os.environ.get("PROCESSED_IMAGERY_TOPIC", "processed_i
 ANALYZED_DATA_TOPIC = os.environ.get("ANALYZED_DATA_TOPIC", "analyzed_data")
 HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
 ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
+
+# Redis connection configuration
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 
 # Recommendations based on pollution type and severity
 RECOMMENDATIONS = {
@@ -115,15 +118,17 @@ class HotspotDetector(KeyedProcessFunction):
     """
     Detects pollution hotspots by analyzing combined sensor and imagery data.
     Uses spatial clustering to identify areas with significant pollution.
+    Includes enhanced alert deduplication and lifecycle management.
     """
     
     def __init__(self):
         self.state = None
         self.area_state = None
         self.EARTH_RADIUS_KM = 6371.0  # Earth radius in km
+        self.redis_client = None
     
     def open(self, runtime_context):
-        """Initialize state descriptors"""
+        """Initialize state descriptors and connections"""
         # State for storing measurements in the same area
         area_state_descriptor = ValueStateDescriptor(
             "area_measurements",
@@ -138,6 +143,21 @@ class HotspotDetector(KeyedProcessFunction):
             Types.STRING()
         )
         self.active_areas = runtime_context.get_map_state(active_areas_descriptor)
+        
+        # Initialize Redis connection
+        try:
+            import redis
+            self.redis_client = redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                decode_responses=True
+            )
+            # Test connection
+            self.redis_client.ping()
+            logger.info("Successfully connected to Redis")
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {e}")
+            self.redis_client = None
     
     def process_element(self, value, ctx):
         try:
@@ -226,6 +246,10 @@ class HotspotDetector(KeyedProcessFunction):
                 # Register area in active areas if not already there
                 if not self._is_area_active(area_id):
                     self.active_areas.put(area_id, json.dumps({"last_updated": timestamp}))
+                
+                # Check for alert resolutions based on improving conditions
+                if self.redis_client:
+                    self._check_for_alert_resolution(updated_area)
                 
                 # Generate hotspot if criteria are met
                 if self._should_generate_hotspot(updated_area):
@@ -375,6 +399,10 @@ class HotspotDetector(KeyedProcessFunction):
                 # Register area in active areas if not already there
                 if not self._is_area_active(area_id):
                     self.active_areas.put(area_id, json.dumps({"last_updated": timestamp}))
+                
+                # Check for alert resolutions based on improving conditions
+                if self.redis_client:
+                    self._check_for_alert_resolution(updated_area)
                 
                 # Generate hotspot if criteria are met
                 if self._should_generate_hotspot(updated_area):
@@ -565,14 +593,200 @@ class HotspotDetector(KeyedProcessFunction):
         return True
     
     def _should_generate_alert(self, area_data):
-        level = area_data.get("level", "low")
+        """Determine if the area data qualifies for an alert with deduplication"""
+        # Existing qualification criteria
+        avg_risk_score = area_data.get("avg_risk_score", 0.0)
         confidence = area_data.get("confidence", 0.0)
+        level = area_data.get("level", "low")
+        hotspot_id = area_data.get("hotspot_id")
         
-        # Allineato con i criteri di alert_required in _create_hotspot
-        if level in ["medium", "high"] and confidence > 0.4:
+        # Basic alert criteria (same as original)
+        qualifies_for_alert = (
+            (level == "high" and confidence > 0.5) or
+            (level == "medium" and confidence > 0.7)
+        )
+        
+        if not qualifies_for_alert:
+            return False
+        
+        # If Redis is not available, fall back to original behavior
+        if not self.redis_client:
             return True
         
-        return False
+        try:
+            # Check for existing alerts for this hotspot
+            existing_alerts = self._check_existing_alerts_for_hotspot(hotspot_id)
+            
+            if existing_alerts:
+                # Get the most recent alert
+                latest_alert = self._get_most_recent_alert(existing_alerts)
+                
+                if not latest_alert:
+                    return True
+                
+                # Calculate time since last alert
+                now = int(time.time() * 1000)
+                last_alert_time = int(latest_alert.get("timestamp", "0"))
+                time_since_last_alert = now - last_alert_time
+                
+                # Define cooling periods based on severity
+                cooling_periods = {
+                    "high": 30 * 60 * 1000,    # 30 minutes for high severity
+                    "medium": 60 * 60 * 1000,  # 60 minutes for medium severity
+                    "low": 120 * 60 * 1000     # 120 minutes for low severity
+                }
+                
+                cooling_period = cooling_periods.get(level, 60 * 60 * 1000)
+                
+                # If we're still in cooling period, don't generate a new alert
+                if time_since_last_alert < cooling_period:
+                    logger.info(f"Skipping alert generation for hotspot {hotspot_id} - in cooling period")
+                    return False
+                
+                # Check if risk score has significantly changed
+                last_risk_score = float(latest_alert.get("risk_score", "0"))
+                risk_change = abs(avg_risk_score - last_risk_score) / max(last_risk_score, 0.1)
+                
+                # Only generate new alert if risk has changed significantly (20%)
+                if risk_change < 0.2:
+                    # Update existing alert instead of creating a new one
+                    self._update_existing_alert(latest_alert, area_data)
+                    logger.info(f"Updated existing alert for hotspot {hotspot_id} - risk change insufficient for new alert")
+                    return False
+            
+            # If we reach here, we should generate a new alert
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in alert deduplication logic: {e}")
+            logger.error(traceback.format_exc())
+            # Fall back to original behavior
+            return True
+    
+    def _check_existing_alerts_for_hotspot(self, hotspot_id):
+        """Check if there are existing active alerts for this hotspot"""
+        if not self.redis_client:
+            return []
+            
+        try:
+            # Get all active alerts
+            active_alerts = self.redis_client.smembers("active_alerts")
+            matching_alerts = []
+            
+            for alert_id in active_alerts:
+                alert_key = f"alert:{alert_id}"
+                alert_hotspot_id = self.redis_client.hget(alert_key, "hotspot_id")
+                
+                if alert_hotspot_id == hotspot_id:
+                    matching_alerts.append(alert_id)
+            
+            return matching_alerts
+        except Exception as e:
+            logger.error(f"Error checking existing alerts: {e}")
+            return []
+    
+    def _get_most_recent_alert(self, alert_ids):
+        """Get the most recent alert from a list of alert IDs"""
+        if not self.redis_client or not alert_ids:
+            return None
+            
+        try:
+            most_recent_time = 0
+            most_recent_alert = None
+            
+            for alert_id in alert_ids:
+                alert_key = f"alert:{alert_id}"
+                alert_data = self.redis_client.hgetall(alert_key)
+                
+                timestamp = int(alert_data.get("timestamp", "0"))
+                if timestamp > most_recent_time:
+                    most_recent_time = timestamp
+                    most_recent_alert = alert_data
+                    most_recent_alert["alert_id"] = alert_id  # Include the ID
+            
+            return most_recent_alert
+        except Exception as e:
+            logger.error(f"Error getting most recent alert: {e}")
+            return None
+    
+    def _update_existing_alert(self, alert, new_data):
+        """Update an existing alert with new data"""
+        if not self.redis_client:
+            return
+            
+        try:
+            alert_id = alert.get("alert_id")
+            alert_key = f"alert:{alert_id}"
+            
+            # Update the timestamp and risk_score
+            updates = {
+                "last_updated": str(int(time.time() * 1000)),
+                "risk_score": str(new_data.get("avg_risk_score", 0.0)),
+                "update_count": str(int(alert.get("update_count", "0")) + 1)
+            }
+            
+            # Update in Redis
+            self.redis_client.hset(alert_key, mapping=updates)
+            
+            # Reset TTL (24 hours)
+            self.redis_client.expire(alert_key, 86400)
+            
+            logger.info(f"Updated alert {alert_id} for hotspot {new_data.get('hotspot_id')}")
+        except Exception as e:
+            logger.error(f"Error updating existing alert: {e}")
+    
+    def _check_for_alert_resolution(self, area_data):
+        """Check if any alerts for this area should be resolved"""
+        if not self.redis_client:
+            return
+            
+        try:
+            hotspot_id = area_data.get("hotspot_id")
+            level = area_data.get("level", "low")
+            avg_risk_score = area_data.get("avg_risk_score", 0.0)
+            
+            # Get alerts for this hotspot
+            matching_alerts = self._check_existing_alerts_for_hotspot(hotspot_id)
+            
+            for alert_id in matching_alerts:
+                alert_key = f"alert:{alert_id}"
+                alert_data = self.redis_client.hgetall(alert_key)
+                
+                alert_severity = alert_data.get("severity", "low")
+                
+                # If current level is lower than alert level and risk score is low enough,
+                # resolve the alert
+                if (self._severity_rank(level) < self._severity_rank(alert_severity) and
+                    avg_risk_score < 0.3):
+                    
+                    self._resolve_alert(alert_id)
+                    logger.info(f"Resolved alert {alert_id} for hotspot {hotspot_id} - conditions improved")
+        except Exception as e:
+            logger.error(f"Error checking for alert resolution: {e}")
+    
+    def _severity_rank(self, severity):
+        """Convert severity string to numeric rank for comparison"""
+        ranks = {"low": 1, "medium": 2, "high": 3}
+        return ranks.get(severity, 0)
+    
+    def _resolve_alert(self, alert_id):
+        """Mark an alert as resolved"""
+        if not self.redis_client:
+            return
+            
+        try:
+            alert_key = f"alert:{alert_id}"
+            
+            # Update in Redis
+            self.redis_client.hset(alert_key, "status", "resolved")
+            self.redis_client.hset(alert_key, "resolved_at", str(int(time.time() * 1000)))
+            
+            # Remove from active alerts set
+            self.redis_client.srem("active_alerts", alert_id)
+            
+            logger.info(f"Alert {alert_id} marked as resolved")
+        except Exception as e:
+            logger.error(f"Error resolving alert: {e}")
     
     def _create_hotspot(self, area_data, timestamp):
         """Create hotspot data structure for publishing"""
@@ -649,7 +863,9 @@ class HotspotDetector(KeyedProcessFunction):
             "pollutant_type": pollutant_type,
             "confidence": area_data.get("confidence"),
             "recommendations": recommendations,
-            "generated_at": int(time.time() * 1000)
+            "generated_at": int(time.time() * 1000),
+            "status": "active",
+            "update_count": 0  # Initialize update count
         }
         
         return alert_data

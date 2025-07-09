@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import plotly.express as px
+import json
 
 def render_alerts_view(redis_client, limit=None, show_header=True):
     if show_header:
@@ -19,7 +20,6 @@ def render_alerts_view(redis_client, limit=None, show_header=True):
             location = data.get('location', {})
             if isinstance(location, str):
                 try:
-                    import json
                     location = json.loads(location)
                 except:
                     location = {}
@@ -28,7 +28,6 @@ def render_alerts_view(redis_client, limit=None, show_header=True):
             recommendations = data.get('recommendations', [])
             if isinstance(recommendations, str):
                 try:
-                    import json
                     recommendations = json.loads(recommendations)
                 except:
                     recommendations = []
@@ -65,15 +64,15 @@ def render_alerts_view(redis_client, limit=None, show_header=True):
     col1, col2, col3 = st.columns(3)
     with col1:
         high_alerts = sum(1 for a in alerts if a['severity'] == 'high')
-        st.metric("High Severity Alerts", high_alerts, delta=None, delta_color="inverse")
+        st.metric("High Severity Alerts", high_alerts, delta=None)
         
     with col2:
         medium_alerts = sum(1 for a in alerts if a['severity'] == 'medium')
-        st.metric("Medium Severity Alerts", medium_alerts, delta=None, delta_color="inverse")
+        st.metric("Medium Severity Alerts", medium_alerts, delta=None)
         
     with col3:
         low_alerts = sum(1 for a in alerts if a['severity'] == 'low')
-        st.metric("Low Severity Alerts", low_alerts, delta=None, delta_color="inverse")
+        st.metric("Low Severity Alerts", low_alerts, delta=None)
     
     # Create tabs for different views
     tab1, tab2 = st.tabs(["Alert List", "Alert Analytics"])
@@ -126,4 +125,7 @@ def render_alerts_view(redis_client, limit=None, show_header=True):
                 labels={'pollutant_type': 'Pollutant Type', 'count': 'Number of Alerts', 'severity': 'Severity'},
                 color_discrete_map={'high': 'red', 'medium': 'orange', 'low': 'blue'}
             )
-            st.plotly_chart(fig, use_container_width=True)
+            
+            # Aggiungi spaziatura per evitare sovrapposizioni
+            st.markdown("<div style='margin-bottom: 2rem;'></div>", unsafe_allow_html=True)
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})

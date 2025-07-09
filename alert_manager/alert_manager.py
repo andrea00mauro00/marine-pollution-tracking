@@ -5,6 +5,7 @@ This component:
 2. Manages alert lifecycle in PostgreSQL
 3. Sends notifications based on alert severity
 4. Maintains alert state in Redis for dashboard access
+5. Handles alert deduplication and update logic
 """
 
 import os
@@ -119,7 +120,9 @@ def create_tables(conn):
             recommended_actions TEXT[],
             status TEXT NOT NULL,
             resolved_at TIMESTAMPTZ,
-            resolved_by TEXT
+            resolved_by TEXT,
+            update_count INTEGER DEFAULT 0,
+            last_updated TIMESTAMPTZ
         )
         """)
         
@@ -152,6 +155,31 @@ def process_alert(alert_data, conn, redis_client):
         pollutant_type = alert_data.get("pollutant_type", "unknown")
         location = alert_data.get("location", {})
         recommendations = alert_data.get("recommendations", [])
+        status = alert_data.get("status", "active")
+        update_count = alert_data.get("update_count", 0)
+        
+        # Check if this is an update to an existing alert
+        is_update = False
+        existing_alert_id = None
+        
+        # Check if the alert already exists in Redis
+        if redis_client.exists(f"alert:{alert_id}"):
+            is_update = True
+            existing_alert_id = alert_id
+            logger.info(f"Processing update for existing alert {alert_id}")
+        else:
+            # Check if there's another alert for the same hotspot
+            active_alerts = redis_client.smembers("active_alerts")
+            
+            for active_alert_id in active_alerts:
+                hotspot_from_alert = redis_client.hget(f"alert:{active_alert_id}", "hotspot_id")
+                
+                if hotspot_from_alert == hotspot_id:
+                    # Found an existing alert for this hotspot
+                    is_update = True
+                    existing_alert_id = active_alert_id
+                    logger.info(f"Found existing alert {existing_alert_id} for hotspot {hotspot_id}")
+                    break
         
         # Convert timestamp to datetime
         dt = datetime.fromtimestamp(timestamp / 1000)
@@ -214,23 +242,68 @@ def process_alert(alert_data, conn, redis_client):
             # Create alert message
             alert_message = f"Pollution detected: {pollutant_type.replace('_', ' ')} with {severity} severity"
             
-            # Insert alert
-            cur.execute("""
-            INSERT INTO alerts
-            (event_id, created_at, severity, message, recommended_actions, status)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING alert_id
-            """, (
-                event_id,
-                dt,
-                severity,
-                alert_message,
-                recommendations,
-                "active"
-            ))
-            
-            db_alert_id = cur.fetchone()[0]
-            logger.info(f"Alert stored in PostgreSQL with ID: {db_alert_id}")
+            if is_update and existing_alert_id:
+                # Update existing alert
+                cur.execute("""
+                UPDATE alerts
+                SET severity = %s, message = %s, recommended_actions = %s, status = %s,
+                update_count = update_count + 1, last_updated = %s
+                WHERE alert_id = (SELECT alert_id FROM alerts WHERE alert_id::text = %s)
+                RETURNING alert_id
+                """, (
+                    severity,
+                    alert_message,
+                    recommendations,
+                    status,
+                    datetime.now(),
+                    existing_alert_id
+                ))
+                
+                result = cur.fetchone()
+                if result:
+                    db_alert_id = result[0]
+                    logger.info(f"Updated alert in PostgreSQL with ID: {db_alert_id}")
+                else:
+                    # If the alert doesn't exist in the database yet (might only be in Redis)
+                    # Insert it as a new alert
+                    cur.execute("""
+                    INSERT INTO alerts
+                    (event_id, created_at, severity, message, recommended_actions, status, update_count, last_updated)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING alert_id
+                    """, (
+                        event_id,
+                        dt,
+                        severity,
+                        alert_message,
+                        recommendations,
+                        status,
+                        update_count,
+                        datetime.now()
+                    ))
+                    
+                    db_alert_id = cur.fetchone()[0]
+                    logger.info(f"Inserted existing Redis alert into PostgreSQL with ID: {db_alert_id}")
+            else:
+                # Insert alert
+                cur.execute("""
+                INSERT INTO alerts
+                (event_id, created_at, severity, message, recommended_actions, status, update_count, last_updated)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING alert_id
+                """, (
+                    event_id,
+                    dt,
+                    severity,
+                    alert_message,
+                    recommendations,
+                    status,
+                    update_count,
+                    datetime.now()
+                ))
+                
+                db_alert_id = cur.fetchone()[0]
+                logger.info(f"Alert stored in PostgreSQL with ID: {db_alert_id}")
             
             conn.commit()
         
@@ -249,7 +322,9 @@ def process_alert(alert_data, conn, redis_client):
             "lon": str(location.get("center_lon", 0)),
             "radius_km": str(location.get("radius_km", 5.0)),
             "recommendations": json.dumps(recommendations),
-            "status": "active",
+            "status": status,
+            "update_count": str(update_count),
+            "last_updated": str(int(time.time() * 1000)),
             "json": json.dumps(alert_data)
         }
         
@@ -259,14 +334,30 @@ def process_alert(alert_data, conn, redis_client):
         # Set TTL (24 hours)
         redis_client.expire(alert_key, 86400)
         
-        # Add to active alerts set
-        redis_client.sadd("active_alerts", alert_id)
+        # Add to active alerts set if status is active
+        if status == "active":
+            redis_client.sadd("active_alerts", alert_id)
+        elif status == "resolved":
+            # Remove from active alerts if resolved
+            redis_client.srem("active_alerts", alert_id)
         
         # Update dashboard metrics
         update_dashboard_metrics(redis_client)
         
-        # 3. Generate notifications if needed
-        if severity in ["medium", "high"]:
+        # 3. Generate notifications if needed - only for new alerts or significant updates
+        should_notify = False
+        
+        if not is_update:
+            # Always notify for new alerts
+            should_notify = severity in ["medium", "high"]
+        else:
+            # For updates, only notify if severity increased
+            old_severity = redis_client.hget(f"alert:{existing_alert_id}", "severity")
+            if severity_rank(severity) > severity_rank(old_severity):
+                should_notify = True
+                logger.info(f"Alert severity increased from {old_severity} to {severity}, generating notification")
+        
+        if should_notify:
             generate_notification(conn, redis_client, alert_data, db_alert_id)
         
         logger.info(f"Alert {alert_id} processed successfully")
@@ -275,6 +366,11 @@ def process_alert(alert_data, conn, redis_client):
         logger.error(f"Error processing alert: {e}")
         if conn:
             conn.rollback()
+
+def severity_rank(severity):
+    """Convert severity string to numeric rank for comparison"""
+    ranks = {"low": 1, "medium": 2, "high": 3}
+    return ranks.get(severity, 0)
 
 def update_dashboard_metrics(redis_client):
     """Update dashboard metrics in Redis"""
@@ -428,6 +524,53 @@ def send_email_notification(subject, message, recipients):
     except Exception as e:
         logger.error(f"Error sending email notification: {e}")
 
+def check_for_expired_alerts(conn, redis_client):
+    """Check for alerts that have been active for too long without updates"""
+    try:
+        # Get all active alerts
+        active_alerts = redis_client.smembers("active_alerts")
+        now = int(time.time() * 1000)
+        
+        for alert_id in active_alerts:
+            alert_key = f"alert:{alert_id}"
+            alert_data = redis_client.hgetall(alert_key)
+            
+            # Skip if the alert doesn't exist
+            if not alert_data:
+                continue
+            
+            # Get the last updated time
+            last_updated = int(alert_data.get("last_updated", alert_data.get("timestamp", "0")))
+            time_since_update = now - last_updated
+            
+            # Auto-resolve alerts that haven't been updated in 24 hours
+            if time_since_update > 24 * 60 * 60 * 1000:  # 24 hours in milliseconds
+                logger.info(f"Auto-resolving alert {alert_id} that hasn't been updated in 24 hours")
+                
+                # Update Redis
+                redis_client.hset(alert_key, "status", "resolved")
+                redis_client.hset(alert_key, "resolved_at", str(now))
+                redis_client.hset(alert_key, "resolved_by", "system")
+                redis_client.srem("active_alerts", alert_id)
+                
+                # Update PostgreSQL
+                with conn.cursor() as cur:
+                    cur.execute("""
+                    UPDATE alerts SET status = 'resolved', resolved_at = %s, resolved_by = 'system'
+                    WHERE alert_id::text = %s
+                    """, (
+                        datetime.now(),
+                        alert_id
+                    ))
+                    conn.commit()
+                
+                logger.info(f"Alert {alert_id} auto-resolved")
+    
+    except Exception as e:
+        logger.error(f"Error checking for expired alerts: {e}")
+        if conn:
+            conn.rollback()
+
 def main():
     """Main function"""
     logger.info("Starting Alert Manager")
@@ -458,6 +601,10 @@ def main():
     
     logger.info(f"Connected to Kafka, listening on topic: {ALERTS_TOPIC}")
     
+    # Set up periodic alert expiration check
+    last_check_time = 0
+    check_interval = 15 * 60  # 15 minutes
+    
     # Process messages
     try:
         for message in consumer:
@@ -467,6 +614,12 @@ def main():
                 
                 # Process alert
                 process_alert(alert_data, conn, redis_client)
+                
+                # Periodically check for expired alerts
+                current_time = int(time.time())
+                if current_time - last_check_time > check_interval:
+                    check_for_expired_alerts(conn, redis_client)
+                    last_check_time = current_time
                 
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
