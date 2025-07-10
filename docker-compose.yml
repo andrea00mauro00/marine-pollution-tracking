@@ -1,4 +1,3 @@
-
 services:
   # DATABASE E MESSAGGISTICA
   redis:
@@ -41,6 +40,38 @@ services:
     networks:
       - marine_net
 
+  # Schema Registry
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: schema-registry
+    depends_on:
+      - kafka
+      - zookeeper
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    networks:
+      - marine_net
+    restart: always
+  
+  # Schema Registry UI
+  schema-registry-ui:
+    image: landoop/schema-registry-ui:latest
+    container_name: schema-registry-ui
+    depends_on:
+      - schema-registry
+    ports:
+      - "8000:8000"
+    environment:
+      SCHEMAREGISTRY_URL: http://schema-registry:8081
+      PROXY: "true"
+    networks:
+      - marine_net
+    restart: always
+
   minio:
     image: minio/minio:latest
     container_name: minio
@@ -70,6 +101,22 @@ services:
     networks:
       - marine_net
 
+  # Create DLQ topics
+  create_dlq_topics:
+    image: python:3.9
+    container_name: create_dlq_topics
+    depends_on:
+      - kafka
+    volumes:
+      - ./scripts:/scripts
+    working_dir: /scripts
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    command: ["sh", "-c", "pip install kafka-python && python create_dlq_topics.py"]
+    restart: "no"
+    networks:
+      - marine_net
+
   # PRODUCER LAYER
   buoy_producer:
     build:
@@ -77,10 +124,16 @@ services:
     container_name: buoy_producer
     depends_on:
       - kafka
+      - schema-registry
+      - create_dlq_topics
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC=buoy_data
       - GENERATE_INTERVAL_SECONDS=30
+      - SCHEMA_REGISTRY_URL=http://schema-registry:8081
+      - DLQ_TOPIC=buoy_data_dlq
+    volumes:
+      - ./schemas:/app/schemas  # Mount schemas directory
     restart: always
     networks:
       - marine_net
@@ -277,8 +330,43 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - ALERTS_TOPIC=sensor_alerts
-    volumes:
-      - ./common:/app/common
+      # Enhanced notification configuration
+      - EMAIL_ENABLED=false
+      - EMAIL_SERVER=smtp.example.com
+      - EMAIL_PORT=587
+      - EMAIL_USER=alerts@example.com
+      - EMAIL_PASSWORD=password
+      - HIGH_PRIORITY_RECIPIENTS=emergency@example.com,operations@example.com
+      - MEDIUM_PRIORITY_RECIPIENTS=operations@example.com
+      - LOW_PRIORITY_RECIPIENTS=monitoring@example.com
+      # SMS configuration (optional)
+      - SMS_ENABLED=false
+      # Webhook configuration (optional)
+      - WEBHOOK_ENABLED=false
+      # Regional configuration
+      - REGIONAL_CONFIG={"upper_bay":{"email_recipients":["upperchesapeake@example.com"]}}
+    networks:
+      - marine_net
+    restart: on-failure
+
+  # DLQ Consumer
+  dlq_consumer:
+    build:
+      context: ./dlq_consumer
+    container_name: dlq_consumer
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+      - create_dlq_topics
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
     networks:
       - marine_net
     restart: on-failure

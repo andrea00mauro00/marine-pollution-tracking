@@ -1,6 +1,5 @@
 FROM flink:1.17-scala_2.12
 USER root
-
 # 1. System packages + JDK
 RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-dev build-essential \
@@ -15,12 +14,13 @@ RUN JAVA_DIR=$(dirname $(dirname $(readlink -f $(which javac)))) && \
 # 3. Python link
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# 4. PyFlink and libraries for image processing
+# 4. PyFlink and essential libraries only
 RUN pip3 install \
       apache-flink==1.17.0 \
       boto3 pandas \
-      pillow numpy \
-      kafka-python loguru python-dotenv
+      pillow \
+      kafka-python loguru python-dotenv \
+      psutil
 
 # 5. Copy code and Kafka JAR files
 COPY main.py /opt/main.py
@@ -31,7 +31,7 @@ COPY kafka-clients-3.3.2.jar /opt/flink/lib/
 RUN printf '#!/bin/bash\n\
 echo "Waiting for Kafka and MinIO..."\n\
 sleep 30\n\
-echo "Starting Image Standardizer Flink job..."\n\
+echo "Starting Image Standardizer with Fallback Embeddings..."\n\
 python /opt/main.py\n' > /opt/entrypoint.sh && chmod +x /opt/entrypoint.sh
 
 CMD ["/opt/entrypoint.sh"]

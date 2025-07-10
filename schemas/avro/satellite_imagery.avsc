@@ -1,0 +1,9 @@
+{
+  "type": "record",
+  "name": "SatelliteImagery",
+  "namespace": "com.marine.pollution",
+  "fields": [
+    {"name": "image_pointer", "type": "string"},
+    {"name": "metadata", "type": ["null", "string"], "default": null}
+  ]
+}

@@ -3,3 +3,5 @@ requests==2.31.0
 python-dotenv==1.0.0
 loguru==0.7.2
 PyYAML==6.0
+confluent-kafka==2.2.0
+fastavro==1.7.3
