@@ -1,12 +1,13 @@
 """
 ==============================================================================
-Marine Pollution Monitoring System - Sensor Analyzer
+Marine Pollution Monitoring System - Sensor Analyzer with ML Integration
 ==============================================================================
 This job:
 1. Consumes raw buoy data from Kafka
 2. Analyzes sensor readings to detect anomalies and pollution patterns
-3. Calculates risk scores and classifies pollution types
-4. Publishes analyzed sensor data to Kafka for further processing
+3. Utilizes ML models for classification and anomaly detection with fallback
+4. Calculates risk scores and classifies pollution types
+5. Publishes analyzed sensor data to Kafka for further processing
 """
 
 import os
@@ -25,6 +26,14 @@ from pyflink.datastream.connectors import FlinkKafkaConsumer, FlinkKafkaProducer
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream.functions import MapFunction
 from pyflink.common import Types
+
+# Import ML infrastructure
+import sys
+import os
+
+# Add the common directory to the Python path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from common.ml_infrastructure import ModelManager, ErrorHandler
 
 # Configure logging
 logging.basicConfig(
@@ -94,6 +103,7 @@ POLLUTION_SIGNATURES = {
 class SensorAnalyzer(MapFunction):
     """
     Analyzes buoy sensor data to detect pollution patterns and anomalies.
+    Enhanced with ML models for classification and anomaly detection.
     """
     
     def __init__(self):
@@ -104,6 +114,37 @@ class SensorAnalyzer(MapFunction):
         # Current month for seasonal adjustments
         self.current_month = datetime.now().month
         self.is_summer = 5 <= self.current_month <= 9
+        
+        # IMPORTANTE: NON inizializzare ModelManager ed ErrorHandler qui
+        # Saranno inizializzati nel metodo open()
+        self.model_manager = None
+        self.error_handler = None
+    
+    def open(self, runtime_context):
+        """Inizializza le risorse non serializzabili quando il worker viene avviato"""
+        # Inizializza ModelManager ed ErrorHandler qui
+        self.model_manager = ModelManager("sensor_analyzer")
+        self.error_handler = ErrorHandler("sensor_analyzer")
+        
+        # Log ML availability status
+        pollutant_classifier = self.model_manager.get_model("pollutant_classifier")
+        anomaly_detector = self.model_manager.get_model("anomaly_detector")
+        
+        if pollutant_classifier:
+            logger.info("Pollutant classifier ML model loaded successfully")
+        else:
+            logger.warning("Pollutant classifier ML model not available, will use rule-based classification")
+            
+        if anomaly_detector:
+            logger.info("Anomaly detector ML model loaded successfully")
+        else:
+            logger.warning("Anomaly detector ML model not available, will use statistical anomaly detection")
+    
+    def close(self):
+        """Pulisce le risorse quando il worker viene chiuso"""
+        # Pulizia delle risorse se necessario
+        self.model_manager = None
+        self.error_handler = None
     
     def map(self, value):
         try:
@@ -167,11 +208,23 @@ class SensorAnalyzer(MapFunction):
                 self._analyze_parameter(sensor_id, "microplastics_concentration", 
                                      data["microplastics_concentration"], parameter_scores, anomalies)
             
+            # Try to detect anomalies using ML model
+            anomaly_score = self._detect_anomalies_ml(data)
+            if anomaly_score is not None:
+                logger.info(f"ML anomaly detection score: {anomaly_score}")
+                # Add anomaly score to parameter scores if significant
+                if anomaly_score < -0.5:  # Threshold for anomaly
+                    parameter_scores["ml_anomaly"] = min(1.0, abs(anomaly_score))
+                    anomalies["ml_anomaly"] = {
+                        "score": anomaly_score,
+                        "description": "Detected by ML anomaly detector"
+                    }
+            
             # Calculate weighted risk score
             risk_score = self._calculate_risk_score(parameter_scores)
             
-            # Classify pollution type
-            pollution_type, type_confidence = self._classify_pollution_type(parameter_scores)
+            # Classify pollution type - with ML if available, falling back to rule-based
+            pollution_type, type_confidence = self._classify_pollution_type(parameter_scores, data)
             
             # Determine overall pollution level
             if risk_score > 0.7:
@@ -191,6 +244,7 @@ class SensorAnalyzer(MapFunction):
                 "type_confidence": round(type_confidence, 3),
                 "risk_components": parameter_scores,
                 "anomalies": anomalies,
+                "ml_enhanced": True,  # Flag indicating ML enhancements are active
                 "analysis_timestamp": int(time.time() * 1000)
             }
             
@@ -232,6 +286,7 @@ class SensorAnalyzer(MapFunction):
     
     def _analyze_core_parameters(self, sensor_id, data, parameter_scores, anomalies):
         """Analyze core water quality parameters (pH, turbidity, temperature)"""
+        # Original implementation remains unchanged
         # Extract parameters
         ph = data.get("pH")
         turbidity = data.get("turbidity")
@@ -448,62 +503,131 @@ class SensorAnalyzer(MapFunction):
                 anomalies[param_name]["z_score"] = z_score
                 anomalies[param_name]["mean"] = mean_val
     
-    def _calculate_risk_score(self, parameter_scores):
-        """Calculate overall risk score based on weighted parameter scores"""
-        if not parameter_scores:
-            return 0.0
+    def _detect_anomalies_ml(self, data):
+        """
+        Detect anomalies using ML model if available.
         
-        # Weights for different parameter types
-        weights = {
-            # Core parameters
-            "pH_deviation": 0.7,
-            "turbidity": 0.8,
-            "temperature_anomaly": 0.5,
-            
-            # Heavy metals (all hm_* parameters)
-            "hm_mercury_hg": 0.9,
-            "hm_lead_pb": 0.85,
-            "hm_cadmium_cd": 0.8,
-            "hm_chromium_cr": 0.75,
-            
-            # Default weights by category
-            "hm_": 0.8,  # Other heavy metals
-            "hc_": 0.7,  # Hydrocarbons
-            "nt_": 0.6,  # Nutrients
-            "cp_": 0.7,  # Chemical pollutants
-            "bi_": 0.6,  # Biological indicators
-            
-            # Special case
-            "microplastics_concentration": 0.7
-        }
+        Args:
+            data (dict): Sensor data
         
-        # Calculate weighted sum
-        weighted_sum = 0.0
-        total_weight = 0.0
-        
-        for param, score in parameter_scores.items():
-            # Find appropriate weight
-            weight = weights.get(param, None)
+        Returns:
+            float or None: Anomaly score if ML model is available, None otherwise
+        """
+        try:
+            # Get the anomaly detector model
+            anomaly_detector = self.model_manager.get_model("anomaly_detector")
+            if not anomaly_detector:
+                return None
             
-            if weight is None:
-                # Check for category prefix match
-                for prefix, prefix_weight in weights.items():
-                    if prefix.endswith("_") and param.startswith(prefix):
-                        weight = prefix_weight
-                        break
-                
-                # Default weight if no match found
-                if weight is None:
-                    weight = 0.5
+            # Extract features for anomaly detection
+            features = self._extract_ml_features(data)
+            if not features:
+                logger.warning("Could not extract features for anomaly detection")
+                return None
             
-            weighted_sum += score * weight
-            total_weight += weight
-        
-        # Return normalized score
-        return weighted_sum / total_weight if total_weight > 0 else 0.0
+            # Get feature names from model metadata
+            feature_names = self.model_manager.get_model_metadata("anomaly_detector").get("features", [])
+            
+            # Detect anomalies
+            anomaly_score = anomaly_detector.decision_function([features])[0]
+            return anomaly_score
+            
+        except Exception as e:
+            # Log error and fallback to traditional methods
+            self.error_handler.handle_error(e, "anomaly_detection")
+            return None
     
-    def _classify_pollution_type(self, parameter_scores):
-        """Classify pollution type based on parameter scores and signatures"""
+    def _classify_pollution_type(self, parameter_scores, data):
+        """
+        Classify pollution type using ML model with fallback to rule-based approach.
+        
+        Args:
+            parameter_scores (dict): Parameter scores
+            data (dict): Original sensor data
+        
+        Returns:
+            tuple: (pollution_type, confidence)
+        """
+        # Try ML classification first
+        try:
+            # Get the pollutant classifier model
+            pollutant_classifier = self.model_manager.get_model("pollutant_classifier")
+            
+            if pollutant_classifier:
+                # Extract features for ML classification
+                features = self._extract_ml_features(data)
+                
+                if features:
+                    # Get prediction and confidence
+                    ml_prediction = pollutant_classifier.predict([features])[0]
+                    prediction_proba = pollutant_classifier.predict_proba([features])[0]
+                    ml_confidence = max(prediction_proba)
+                    
+                    logger.info(f"ML classification: {ml_prediction} with confidence {ml_confidence:.3f}")
+                    
+                    # Get rule-based prediction for comparison
+                    rule_prediction, rule_confidence = self._classify_pollution_type_rule_based(parameter_scores)
+                    
+                    # Use ML prediction if confidence is high enough, otherwise use rule-based
+                    confidence_threshold = self.model_manager.get_config_value("fallback.prefer_ml_above_confidence", 0.7)
+                    
+                    if ml_confidence >= confidence_threshold:
+                        logger.info(f"Using ML classification: {ml_prediction} ({ml_confidence:.3f})")
+                        return ml_prediction, ml_confidence
+                    else:
+                        logger.info(f"ML confidence too low, using rule-based: {rule_prediction} ({rule_confidence:.3f})")
+                        return rule_prediction, rule_confidence
+            
+            # Fallback to rule-based if ML model not available or features not extracted
+            return self._classify_pollution_type_rule_based(parameter_scores)
+            
+        except Exception as e:
+            # Log error and fallback to rule-based approach
+            self.error_handler.handle_error(e, "pollution_classification")
+            return self._classify_pollution_type_rule_based(parameter_scores)
+    
+    def _extract_ml_features(self, data):
+        """
+        Extract features for ML models from sensor data.
+        
+        Args:
+            data (dict): Sensor data
+        
+        Returns:
+            list or None: Feature vector for ML models
+        """
+        try:
+            # Get feature mapping from configuration
+            feature_mapping = self.model_manager.get_config_value("feature_mapping", {})
+            
+            # Default feature names if not in configuration
+            if not feature_mapping:
+                feature_mapping = {
+                    "pH": "pH",
+                    "turbidity": "turbidity",
+                    "temperature": "WTMP",
+                    "mercury": "hm_mercury_hg",
+                    "lead": "hm_lead_pb", 
+                    "petroleum": "hc_total_petroleum_hydrocarbons",
+                    "oxygen": "bi_dissolved_oxygen_saturation",
+                    "microplastics": "microplastics_concentration"
+                }
+            
+            # Extract features
+            features = []
+            for feature_name, data_key in feature_mapping.items():
+                # Get value, default to 0 if not present
+                value = data.get(data_key, 0)
+                features.append(value)
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error extracting ML features: {e}")
+            return None
+    
+    def _classify_pollution_type_rule_based(self, parameter_scores):
+        """Classify pollution type based on parameter scores using rule-based approach"""
         if not parameter_scores:
             return "unknown", 0.0
         
@@ -573,6 +697,63 @@ class SensorAnalyzer(MapFunction):
         
         return best_type[0], best_type[1]
     
+    def _calculate_risk_score(self, parameter_scores):
+        """Calculate overall risk score based on weighted parameter scores"""
+        if not parameter_scores:
+            return 0.0
+        
+        # Weights for different parameter types
+        weights = {
+            # Core parameters
+            "pH_deviation": 0.7,
+            "turbidity": 0.8,
+            "temperature_anomaly": 0.5,
+            
+            # Heavy metals (all hm_* parameters)
+            "hm_mercury_hg": 0.9,
+            "hm_lead_pb": 0.85,
+            "hm_cadmium_cd": 0.8,
+            "hm_chromium_cr": 0.75,
+            
+            # Default weights by category
+            "hm_": 0.8,  # Other heavy metals
+            "hc_": 0.7,  # Hydrocarbons
+            "nt_": 0.6,  # Nutrients
+            "cp_": 0.7,  # Chemical pollutants
+            "bi_": 0.6,  # Biological indicators
+            
+            # Special case
+            "microplastics_concentration": 0.7,
+            
+            # ML anomaly detection
+            "ml_anomaly": 0.9  # High weight for ML-detected anomalies
+        }
+        
+        # Calculate weighted sum
+        weighted_sum = 0.0
+        total_weight = 0.0
+        
+        for param, score in parameter_scores.items():
+            # Find appropriate weight
+            weight = weights.get(param, None)
+            
+            if weight is None:
+                # Check for category prefix match
+                for prefix, prefix_weight in weights.items():
+                    if prefix.endswith("_") and param.startswith(prefix):
+                        weight = prefix_weight
+                        break
+                
+                # Default weight if no match found
+                if weight is None:
+                    weight = 0.5
+            
+            weighted_sum += score * weight
+            total_weight += weight
+        
+        # Return normalized score
+        return weighted_sum / total_weight if total_weight > 0 else 0.0
+    
     def _calculate_std(self, values):
         """Calculate standard deviation"""
         if len(values) < 2:
@@ -607,7 +788,7 @@ def wait_for_services():
 
 def main():
     """Main function to set up and run the Flink job"""
-    logger.info("Starting Sensor Analyzer Job")
+    logger.info("Starting ML-Enhanced Sensor Analyzer Job")
     
     # Wait for Kafka to be ready
     wait_for_services()
@@ -643,14 +824,14 @@ def main():
     buoy_stream = env.add_source(buoy_consumer)
     analyzed_stream = buoy_stream \
         .map(SensorAnalyzer(), output_type=Types.STRING()) \
-        .name("Analyze_Buoy_Sensor_Data")
+        .name("Analyze_Buoy_Sensor_Data_With_ML")
     
     # Add sink to analyzed_sensor_data topic
     analyzed_stream.add_sink(analyzed_producer).name("Publish_Analyzed_Sensor_Data")
     
     # Execute the Flink job
-    logger.info("Executing Sensor Analyzer Job")
-    env.execute("Marine_Pollution_Sensor_Analyzer")
+    logger.info("Executing ML-Enhanced Sensor Analyzer Job")
+    env.execute("Marine_Pollution_Sensor_Analyzer_ML")
 
 if __name__ == "__main__":
     main()

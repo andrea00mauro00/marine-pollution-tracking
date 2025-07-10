@@ -89,17 +89,21 @@ services:
       - marine_net
 
   create_buckets:
-    image: python:3.9
+    build:
+      context: ./setup_minio
+      dockerfile: Dockerfile
     container_name: create_buckets
     depends_on:
       - minio
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
     volumes:
-      - ./setup_minio:/scripts
-    working_dir: /scripts
-    command: ["sh", "-c", "pip install boto3 && python create_minio_buckets.py"]
-    restart: "no"
+      - ./setup_minio:/setup
     networks:
       - marine_net
+    restart: "no"
 
   # Create DLQ topics
   create_dlq_topics:
@@ -182,16 +186,22 @@ services:
 
   sensor_analyzer:
     build:
-      context: ./sensor_analyzer  # Nuovo componente
+      context: ./sensor_analyzer
     container_name: sensor_analyzer
     ports:
       - "8085:8081"
     depends_on:
       - kafka
+      - minio
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - BUOY_TOPIC=buoy_data
-      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data  # Nuovo topic
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - MINIO_ENDPOINT=minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - ./common:/opt/flink/usrlib/common
     networks:
       - marine_net
     restart: on-failure

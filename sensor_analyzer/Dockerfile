@@ -18,15 +18,22 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 # 4. PyFlink and analysis libraries
 RUN pip3 install \
       apache-flink==1.17.0 \
-      numpy scipy \
-      kafka-python loguru python-dotenv
+      numpy scipy scikit-learn \
+      kafka-python loguru python-dotenv \
+      boto3 pandas
 
-# 5. Copy code and Kafka JAR files
+# 5. Create directory for common code
+RUN mkdir -p /opt/flink/usrlib/common
+
+# 6. Copy code and Kafka JAR files
 COPY main.py /opt/main.py
 COPY flink-connector-kafka-1.17.0.jar /opt/flink/lib/
 COPY kafka-clients-3.3.2.jar /opt/flink/lib/
 
-# 6. Entrypoint
+# 7. Set PYTHONPATH to include /opt/flink/usrlib
+ENV PYTHONPATH="${PYTHONPATH}:/opt/flink/usrlib"
+
+# 8. Entrypoint
 RUN printf '#!/bin/bash\n\
 echo "Waiting for Kafka..."\n\
 sleep 20\n\
