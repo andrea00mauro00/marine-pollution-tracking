@@ -20,12 +20,18 @@ RUN pip3 install \
       boto3 pandas \
       pillow \
       kafka-python loguru python-dotenv \
-      psutil
+      psutil scikit-learn==1.2.2
 
-# 5. Copy code and Kafka JAR files
+# 5. Create directory for common code
+RUN mkdir -p /opt/flink/usrlib/common
+
+# 6. Copy code and Kafka JAR files
 COPY main.py /opt/main.py
 COPY flink-connector-kafka-1.17.0.jar /opt/flink/lib/
 COPY kafka-clients-3.3.2.jar /opt/flink/lib/
+
+# 7. Set PYTHONPATH to include /opt/flink/usrlib
+ENV PYTHONPATH="${PYTHONPATH}:/opt/flink/usrlib"
 
 # 6. Entrypoint
 RUN printf '#!/bin/bash\n\

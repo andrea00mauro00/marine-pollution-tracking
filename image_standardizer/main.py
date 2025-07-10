@@ -1,13 +1,14 @@
 """
 ==============================================================================
-Marine Pollution Monitoring System - Enhanced Image Standardizer
+Marine Pollution Monitoring System - Enhanced Image Standardizer with ML
 ==============================================================================
 This job:
 1. Consumes satellite imagery metadata from Kafka
 2. Retrieves the original image from MinIO Bronze layer
 3. Standardizes the image format and applies basic preprocessing
-4. Publishes the processed imagery metadata back to Kafka
-5. Creates spatial index in Silver layer
+4. Analyzes images using ML models for pollution detection
+5. Publishes the processed imagery metadata back to Kafka
+6. Creates spatial index in Silver layer
 """
 
 import os
@@ -20,6 +21,8 @@ import traceback
 from datetime import datetime
 import tempfile
 from io import BytesIO
+import numpy as np
+import pickle
 from PIL import Image, ImageEnhance, ImageFilter
 
 # PyFlink imports
@@ -51,6 +54,43 @@ class ImageStandardizer(ProcessFunction):
     Standardize satellite imagery from the raw format into a consistent format
     suitable for further analysis. Creates spatial index for efficient retrieval.
     """
+    
+    def __init__(self):
+        self.pollution_classifier = None
+    
+    def open(self, runtime_context):
+        """Initialize resources when worker starts"""
+        # Load ML model from MinIO
+        self._load_models()
+    
+    def _load_models(self):
+        """Load classification model from MinIO"""
+        try:
+            import boto3
+            
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=f'http://{MINIO_ENDPOINT}',
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY
+            )
+            
+            # Load pollution classification model
+            model_key = "image_analysis/classification_model_v1.pkl"
+            
+            try:
+                logger.info(f"Loading pollution classification model from models/{model_key}")
+                response = s3_client.get_object(Bucket="models", Key=model_key)
+                model_bytes = response['Body'].read()
+                self.pollution_classifier = pickle.loads(model_bytes)
+                logger.info("Pollution classification model loaded successfully")
+            except Exception as e:
+                logger.error(f"Error loading pollution classification model: {e}")
+                logger.info("Will use rule-based classification instead")
+                self.pollution_classifier = None
+        except Exception as e:
+            logger.error(f"Error in model loading: {e}")
+            self.pollution_classifier = None
     
     def process_element(self, value, ctx):
         try:
@@ -182,6 +222,18 @@ class ImageStandardizer(ProcessFunction):
                 # Extract thumbnail for faster processing downstream
                 thumbnail = self._create_thumbnail(img)
                 
+                # NEW: Extract features for pollution classification
+                features = self._extract_image_features(img)
+                logger.info(f"Extracted image features: {features}")
+                
+                # NEW: Detect pollution type using ML model or rules
+                pollution_type, confidence = self._detect_pollution_type(features)
+                logger.info(f"Detected pollution type: {pollution_type} with confidence {confidence:.2f}")
+                
+                # NEW: Create pollution segmentation mask
+                pollution_mask, affected_area_ratio = self._create_pollution_mask(img, pollution_type)
+                logger.info(f"Pollution affected area: {affected_area_ratio:.2%} of image")
+                
                 # Get date parts for partitioning
                 dt = datetime.fromtimestamp(timestamp / 1000) if isinstance(timestamp, int) else datetime.now()
                 year = dt.strftime("%Y")
@@ -225,6 +277,23 @@ class ImageStandardizer(ProcessFunction):
                         ContentType="image/tiff"
                     )
                     logger.info(f"Saved processed image to silver/{processed_image_path}")
+                    
+                    # NEW: Save pollution mask if detected
+                    if pollution_mask is not None:
+                        mask_path = f"analyzed_data/satellite/year={year}/month={month}/day={day}/mask_{image_id}_{timestamp}.png"
+                        with BytesIO() as mask_output:
+                            mask_img = Image.fromarray((pollution_mask * 255).astype(np.uint8))
+                            mask_img.save(mask_output, format="PNG")
+                            mask_data = mask_output.getvalue()
+                        
+                        s3_client.put_object(
+                            Bucket="silver",
+                            Key=mask_path,
+                            Body=mask_data,
+                            ContentType="image/png"
+                        )
+                        logger.info(f"Saved pollution mask to silver/{mask_path}")
+                        
                 except Exception as e:
                     logger.error(f"Error saving processed image: {e}")
                     logger.error(traceback.format_exc())
@@ -242,10 +311,24 @@ class ImageStandardizer(ProcessFunction):
                     "processed_image_path": processed_image_path,
                     "spatial_index_path": spatial_index_path,
                     "processed_at": int(time.time() * 1000),
-                    "source_type": "satellite"
+                    "source_type": "satellite",
+                    # NEW: Add pollution detection results
+                    "pollution_detection": {
+                        "type": pollution_type,
+                        "confidence": confidence,
+                        "affected_area_ratio": affected_area_ratio,
+                        "mask_path": f"analyzed_data/satellite/year={year}/month={month}/day={day}/mask_{image_id}_{timestamp}.png" if pollution_mask is not None else None,
+                        "features": {
+                            "dark_patch_ratio": features[0],
+                            "green_dominance": features[1],
+                            "spectral_contrast": features[2],
+                            "texture_variance": features[3],
+                            "edge_density": features[4]
+                        }
+                    }
                 }
                 
-                logger.info(f"Image {image_id} standardized successfully")
+                logger.info(f"Image {image_id} standardized and analyzed successfully")
                 
                 # Return processed data for Kafka
                 yield json.dumps(processed_data)
@@ -434,6 +517,149 @@ class ImageStandardizer(ProcessFunction):
             logger.error(f"Error creating spatial index: {e}")
             logger.error(traceback.format_exc())
             return None
+    
+    # NEW METHODS FOR POLLUTION DETECTION
+    
+    def _extract_image_features(self, img):
+        """
+        Extract features for pollution detection:
+        - dark_patch_ratio: Ratio of dark pixels (oil spills appear dark)
+        - green_dominance: Ratio of green dominant pixels (algae blooms)
+        - spectral_contrast: Contrast between bands (pollution creates contrasts)
+        - texture_variance: Variance in texture (indicates disturbances)
+        - edge_density: Density of edges (pollution boundaries)
+        """
+        try:
+            # Convert image to numpy array
+            img_array = np.array(img)
+            
+            # Calculate dark patch ratio (oil spills appear as dark patches)
+            # Dark is defined as pixels where average RGB is below 50
+            rgb_avg = np.mean(img_array, axis=2)
+            dark_pixels = np.sum(rgb_avg < 50)
+            dark_patch_ratio = dark_pixels / (img_array.shape[0] * img_array.shape[1])
+            
+            # Calculate green dominance (for algal blooms)
+            # Green dominant pixels have G channel significantly higher than R and B
+            r, g, b = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2]
+            green_dominant = np.logical_and(g > r * 1.1, g > b * 1.1)
+            green_dominance = np.sum(green_dominant) / (img_array.shape[0] * img_array.shape[1])
+            
+            # Calculate spectral contrast (pollution creates spectral anomalies)
+            # Using standard deviation between RGB channels
+            spectral_contrast = np.mean(np.std(img_array, axis=2))
+            
+            # Calculate texture variance (pollution changes water texture)
+            # Use a simple window variance approach
+            texture_variance = np.var(rgb_avg)
+            
+            # Calculate edge density (pollution creates edges)
+            # Simple gradient-based edge detection
+            dx = np.abs(np.diff(rgb_avg, axis=1, append=rgb_avg[:,-1:]))
+            dy = np.abs(np.diff(rgb_avg, axis=0, append=rgb_avg[-1:,:]))
+            gradient_magnitude = np.sqrt(dx**2 + dy**2)
+            edge_pixels = np.sum(gradient_magnitude > 20)  # Threshold for edge detection
+            edge_density = edge_pixels / (img_array.shape[0] * img_array.shape[1])
+            
+            # Return features as a list
+            return [dark_patch_ratio, green_dominance, spectral_contrast, texture_variance, edge_density]
+            
+        except Exception as e:
+            logger.error(f"Error extracting image features: {e}")
+            # Return default features
+            return [0.0, 0.0, 0.0, 0.0, 0.0]
+    
+    def _detect_pollution_type(self, features):
+        """
+        Detect pollution type using ML model or rule-based classification.
+        
+        Returns:
+            tuple: (pollution_type, confidence)
+        """
+        # Try to use ML model if available
+        if self.pollution_classifier is not None:
+            try:
+                # Reshape features for sklearn model
+                X = np.array(features).reshape(1, -1)
+                
+                # Get class prediction
+                pollution_type = self.pollution_classifier.predict(X)[0]
+                
+                # Get probability/confidence
+                probabilities = self.pollution_classifier.predict_proba(X)[0]
+                confidence = np.max(probabilities)
+                
+                return pollution_type, float(confidence)
+            
+            except Exception as e:
+                logger.error(f"Error using ML model for pollution detection: {e}")
+                logger.info("Falling back to rule-based classification")
+        
+        # Rule-based classification (fallback or primary approach if model not available)
+        dark_patch_ratio, green_dominance, _, _, edge_density = features
+        
+        # Apply rules from specifications
+        if dark_patch_ratio > 0.15:  # High dark patch ratio indicates oil spill
+            return "oil_spill", 0.7
+        elif green_dominance > 0.2:  # High green dominance indicates algal bloom
+            return "algal_bloom", 0.8
+        elif 0.05 < edge_density < 0.2:  # Medium edge density indicates sediment
+            return "sediment", 0.6
+        elif edge_density > 0.2:  # High edge density might indicate chemical discharge
+            return "chemical_discharge", 0.5
+        else:
+            return "unknown", 0.3
+    
+    def _create_pollution_mask(self, img, pollution_type):
+        """
+        Create a binary mask of polluted areas based on the pollution type.
+        Uses threshold-based segmentation with rules specific to each pollutant.
+        
+        Returns:
+            tuple: (mask, affected_area_ratio)
+            - mask: binary numpy array (1 for pollution, 0 for clean water)
+            - affected_area_ratio: ratio of polluted pixels to total pixels
+        """
+        try:
+            # Convert image to numpy array
+            img_array = np.array(img)
+            height, width, _ = img_array.shape
+            
+            # Initialize mask
+            mask = np.zeros((height, width), dtype=bool)
+            
+            # Extract RGB channels
+            r, g, b = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2]
+            
+            # Apply different thresholding based on pollution type
+            if pollution_type == "oil_spill":
+                # Oil appears dark and has low blue channel
+                rgb_avg = np.mean(img_array, axis=2)
+                mask = np.logical_and(rgb_avg < 60, b < 70)
+                
+            elif pollution_type == "algal_bloom":
+                # Algae appears green
+                mask = np.logical_and(g > r * 1.1, g > b * 1.1)
+                
+            elif pollution_type == "sediment":
+                # Sediment appears brownish (high red, medium green, low blue)
+                mask = np.logical_and(np.logical_and(r > 100, g > 50), b < g * 0.8)
+                
+            elif pollution_type == "chemical_discharge":
+                # Chemicals often create unusual colors with high contrast
+                rgb_std = np.std(img_array, axis=2)
+                mask = rgb_std > 40
+            
+            # Calculate affected area ratio
+            affected_pixels = np.sum(mask)
+            total_pixels = height * width
+            affected_area_ratio = affected_pixels / total_pixels
+            
+            return mask, affected_area_ratio
+            
+        except Exception as e:
+            logger.error(f"Error creating pollution mask: {e}")
+            return None, 0.0
 
 def wait_for_services():
     """Wait for Kafka and MinIO to be available"""
@@ -493,7 +719,7 @@ def wait_for_services():
 
 def main():
     """Main function to set up and run the Flink job"""
-    logger.info("Starting Enhanced Image Standardizer Job")
+    logger.info("Starting Enhanced Image Standardizer Job with ML")
     
     # Wait for services to be ready
     logger.info("Waiting for services to be available...")
@@ -536,14 +762,14 @@ def main():
     satellite_stream = env.add_source(satellite_consumer)
     processed_stream = satellite_stream \
         .process(ImageStandardizer(), output_type=Types.STRING()) \
-        .name("Standardize_Satellite_Imagery")
+        .name("Standardize_Satellite_Imagery_With_ML")
     
     # Add sink to processed_imagery topic
     processed_stream.add_sink(processed_producer).name("Publish_Processed_Imagery")
     
     # Execute the Flink job
-    logger.info("Executing Enhanced Image Standardizer Job")
-    env.execute("Marine_Pollution_Image_Standardizer")
+    logger.info("Executing Enhanced Image Standardizer Job with ML")
+    env.execute("Marine_Pollution_Image_Standardizer_ML")
 
 if __name__ == "__main__":
     main()

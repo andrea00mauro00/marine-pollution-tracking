@@ -59,6 +59,7 @@ services:
   
   # Schema Registry UI
   schema-registry-ui:
+    platform: linux/amd64
     image: landoop/schema-registry-ui:latest
     container_name: schema-registry-ui
     depends_on:
@@ -180,6 +181,8 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - SATELLITE_TOPIC=satellite_imagery
       - PROCESSED_IMAGERY_TOPIC=processed_imagery  # Nuovo topic
+    volumes:
+      - ./common:/opt/flink/usrlib/common
     networks:
       - marine_net
     restart: on-failure
