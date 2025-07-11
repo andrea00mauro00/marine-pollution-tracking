@@ -144,10 +144,13 @@ def create_tables(conn_timescale, conn_postgres):
             ph DOUBLE PRECISION,
             turbidity DOUBLE PRECISION,
             wave_height DOUBLE PRECISION,
+            microplastics DOUBLE PRECISION,
+            water_quality_index DOUBLE PRECISION,
             risk_score DOUBLE PRECISION,
             pollution_level TEXT
         );
         """)
+
         
         # Convert to hypertable if not already
         cur.execute("SELECT create_hypertable('sensor_measurements', 'time', if_not_exists => TRUE);")
@@ -370,19 +373,18 @@ def process_analyzed_data(s3_client, conn_timescale, data):
         return False
 
 def process_hotspot_data(s3_client, conn_timescale, data):
-    """Processes hotspot data and stores it in the Gold layer and TimescaleDB"""
+    """Processes hotspot data and stores it in the Gold layer, TimescaleDB, and Redis"""
     try:
-        # Extract data
         hotspot_id = data.get("hotspot_id", "unknown")
         timestamp = data.get("timestamp", int(time.time() * 1000))
-        
-        # Convert timestamp to date for partitioning
+
+        # Partitioning path
         dt = datetime.fromtimestamp(timestamp / 1000)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
         day = dt.strftime("%d")
-        
-        # Save in Gold layer
+
+        # Save on MinIO Gold
         key = f"hotspots/year={year}/month={month}/day={day}/hotspot_{hotspot_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
@@ -391,14 +393,21 @@ def process_hotspot_data(s3_client, conn_timescale, data):
             ContentType="application/json"
         )
         logger.info(f"Hotspot salvato in Gold: gold/{key}")
-        
-        # Save in TimescaleDB
+
+        # Save on TimescaleDB
         save_to_timescaledb(conn_timescale, "hotspots", data)
-        
+
+        # ✅ Save on Redis
+        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        redis_client.hset(f"hotspot:{hotspot_id}", mapping=data)
+        redis_client.sadd("active_hotspots", hotspot_id)
+        logger.info(f"Hotspot {hotspot_id} salvato in Redis")
+
         return True
     except Exception as e:
         logger.error(f"Errore nel processare i dati hotspot: {e}")
         return False
+
 
 def process_prediction_data(s3_client, data):
     """Processes prediction data and stores it in the Gold layer"""
@@ -461,18 +470,20 @@ def save_to_timescaledb(conn, table_type, data):
     try:
         if table_type == "sensor_analysis":
             with conn.cursor() as cur:
-                # Extract the necessary values with standardized variable names
+                # Extract standardized data
                 timestamp = datetime.fromtimestamp(data.get("timestamp", 0) / 1000)
                 location = data.get("location", {})
                 measurements = data.get("measurements", {})
                 pollution_analysis = data.get("pollution_analysis", {})
-                
-                # Insert into TimescaleDB
+
+                # Insert into sensor_measurements table
                 cur.execute("""
-                INSERT INTO sensor_measurements
-                (time, source_type, source_id, latitude, longitude, temperature, ph, turbidity, 
-                wave_height, risk_score, pollution_level)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO sensor_measurements (
+                        time, source_type, source_id, latitude, longitude,
+                        temperature, ph, turbidity, wave_height, microplastics,
+                        water_quality_index, risk_score, pollution_level
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     timestamp,
                     data.get("source_type", "buoy"),
@@ -483,24 +494,28 @@ def save_to_timescaledb(conn, table_type, data):
                     measurements.get("ph", measurements.get("pH")),
                     measurements.get("turbidity"),
                     measurements.get("wave_height", measurements.get("WVHT")),
+                    measurements.get("microplastics", 0),
+                    measurements.get("water_quality_index", 0),
                     pollution_analysis.get("risk_score"),
                     pollution_analysis.get("level")
                 ))
                 conn.commit()
                 logger.info(f"Salvati dati in TimescaleDB: sensor_measurements per sensore {location.get('sensor_id')}")
-                
+
         elif table_type == "hotspots":
             with conn.cursor() as cur:
-                # Extract necessary values with standardized variable names
+                # Extract standardized data
                 timestamp = datetime.fromtimestamp(data.get("timestamp", 0) / 1000)
                 location = data.get("location", {})
                 summary = data.get("pollution_summary", {})
-                
-                # Insert into TimescaleDB
+
+                # Insert into pollution_metrics table
                 cur.execute("""
-                INSERT INTO pollution_metrics
-                (time, region, avg_risk_score, max_risk_score, pollutant_types, affected_area_km2, sensor_count)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO pollution_metrics (
+                        time, region, avg_risk_score, max_risk_score,
+                        pollutant_types, affected_area_km2, sensor_count
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (
                     timestamp,
                     "Chesapeake Bay",  # Default region
@@ -512,13 +527,15 @@ def save_to_timescaledb(conn, table_type, data):
                 ))
                 conn.commit()
                 logger.info(f"Salvati dati in TimescaleDB: pollution_metrics per hotspot {data.get('hotspot_id')}")
-                
+
         return True
+
     except Exception as e:
         logger.error(f"Errore nel salvare in TimescaleDB ({table_type}): {e}")
         if conn:
             conn.rollback()
         return False
+
 
 def main():
     """Main function"""
