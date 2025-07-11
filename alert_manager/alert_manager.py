@@ -58,8 +58,8 @@ SMS_AUTH_TOKEN = os.environ.get("SMS_AUTH_TOKEN", "")
 SMS_FROM_NUMBER = os.environ.get("SMS_FROM_NUMBER", "")
 SMS_RECIPIENTS = os.environ.get("SMS_RECIPIENTS", "").split(",")
 
-# Webhook configuration (new)
-WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "false").lower() == "true")
+# Webhook configuration (new) - Fixed syntax error
+WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "false").lower() == "true"
 WEBHOOK_URLS = os.environ.get("WEBHOOK_URLS", "").split(",")
 WEBHOOK_AUTH_TOKEN = os.environ.get("WEBHOOK_AUTH_TOKEN", "")
 
@@ -299,14 +299,15 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
     """Process alert in PostgreSQL with enhanced fields"""
     with conn.cursor() as cur:
         # First, create or find associated pollution event
+        # Standardized variable names for latitude and longitude
         cur.execute("""
         SELECT event_id FROM pollution_events 
         WHERE status = 'active' AND pollutant_type = %s 
         AND center_latitude = %s AND center_longitude = %s
         """, (
             pollutant_type,
-            location.get("center_lat"),
-            location.get("center_lon")
+            location.get("center_latitude", location.get("center_lat")),  # Support for backwards compatibility
+            location.get("center_longitude", location.get("center_lon"))  # Support for backwards compatibility
         ))
         
         event_row = cur.fetchone()
@@ -328,7 +329,7 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
                 event_id
             ))
         else:
-            # Create new event
+            # Create new event - using standardized variable names
             cur.execute("""
             INSERT INTO pollution_events
             (start_time, region, center_latitude, center_longitude, radius_km, 
@@ -337,9 +338,10 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
             RETURNING event_id
             """, (
                 dt,
-                determine_region(location.get("center_lat"), location.get("center_lon")),
-                location.get("center_lat"),
-                location.get("center_lon"),
+                determine_region(location.get("center_latitude", location.get("center_lat")), 
+                                location.get("center_longitude", location.get("center_lon"))),
+                location.get("center_latitude", location.get("center_lat")),
+                location.get("center_longitude", location.get("center_lon")),
                 location.get("radius_km", 5.0),
                 severity,
                 pollutant_type,
@@ -458,6 +460,7 @@ def process_alert_in_redis(redis_client, alert_id, hotspot_id, timestamp, severi
     alert_key = f"alert:{actual_alert_id}"
     
     # Prepare data for Redis (all values must be strings)
+    # Use standardized variable names
     redis_data = {
         "alert_id": actual_alert_id,
         "hotspot_id": hotspot_id,
@@ -465,8 +468,8 @@ def process_alert_in_redis(redis_client, alert_id, hotspot_id, timestamp, severi
         "severity": severity,
         "risk_score": str(risk_score),
         "pollutant_type": pollutant_type,
-        "lat": str(location.get("center_lat", 0)),
-        "lon": str(location.get("center_lon", 0)),
+        "latitude": str(location.get("center_latitude", location.get("center_lat", 0))),
+        "longitude": str(location.get("center_longitude", location.get("center_lon", 0))),
         "radius_km": str(location.get("radius_km", 5.0)),
         "recommendations": json.dumps(recommendations),
         "status": status,
@@ -505,8 +508,9 @@ def determine_notification_targets(severity, pollutant_type, location, is_update
     """Determine who should be notified based on alert details and regional configuration"""
     targets = []
     
-    # Get regional information
-    region = determine_region(location.get("center_lat"), location.get("center_lon"))
+    # Get regional information - using standardized variable names
+    region = determine_region(location.get("center_latitude", location.get("center_lat")), 
+                            location.get("center_longitude", location.get("center_lon")))
     
     # Email notification targets
     if EMAIL_ENABLED:

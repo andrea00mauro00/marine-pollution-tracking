@@ -1,10 +1,10 @@
 """
-Marine Pollution Monitoring System - Enhanced Storage Consumer
+Marine Pollution Monitoring System - Storage Consumer
 This component:
 1. Consumes data from all Kafka topics
-2. Stores raw data in Bronze layer (JSON)
-3. Stores processed data in Silver layer (Parquet)
-4. Stores business insights in Gold layer (JSON)
+2. Stores raw data in Bronze layer
+3. Stores processed data in Silver layer
+4. Stores business insights in Gold layer
 5. Manages time-series data in TimescaleDB
 """
 
@@ -13,7 +13,7 @@ import logging
 import json
 import time
 import sys
-import uuid
+import uuid  # Added missing import
 from datetime import datetime
 from kafka import KafkaConsumer
 import redis
@@ -44,8 +44,8 @@ POSTGRES_DB = os.environ.get("POSTGRES_DB", "marine_pollution")
 POSTGRES_USER = os.environ.get("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", os.environ.get("MINIO_ACCESS_KEY", "minioadmin"))
+MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", os.environ.get("MINIO_SECRET_KEY", "minioadmin"))
 
 # Kafka topics to monitor
 TOPICS = [
@@ -68,14 +68,14 @@ def connect_to_timescaledb():
                 user=TIMESCALE_USER,
                 password=TIMESCALE_PASSWORD
             )
-            logger.info("Connected to TimescaleDB")
+            logger.info("Connesso a TimescaleDB")
             return conn
         except psycopg2.OperationalError as e:
             if attempt < max_retries - 1:
-                logger.warning(f"Attempt {attempt+1}/{max_retries} failed: {e}. Retrying in {retry_interval} seconds...")
+                logger.warning(f"Tentativo {attempt+1}/{max_retries} fallito: {e}. Riprovo tra {retry_interval} secondi...")
                 time.sleep(retry_interval)
             else:
-                logger.error(f"Failed to connect to TimescaleDB after {max_retries} attempts: {e}")
+                logger.error(f"Impossibile connettersi a TimescaleDB dopo {max_retries} tentativi: {e}")
                 raise
 
 def connect_to_postgres():
@@ -91,14 +91,14 @@ def connect_to_postgres():
                 user=POSTGRES_USER,
                 password=POSTGRES_PASSWORD
             )
-            logger.info("Connected to PostgreSQL")
+            logger.info("Connesso a PostgreSQL")
             return conn
         except psycopg2.OperationalError as e:
             if attempt < max_retries - 1:
-                logger.warning(f"Attempt {attempt+1}/{max_retries} failed: {e}. Retrying in {retry_interval} seconds...")
+                logger.warning(f"Tentativo {attempt+1}/{max_retries} fallito: {e}. Riprovo tra {retry_interval} secondi...")
                 time.sleep(retry_interval)
             else:
-                logger.error(f"Failed to connect to PostgreSQL after {max_retries} attempts: {e}")
+                logger.error(f"Impossibile connettersi a PostgreSQL dopo {max_retries} tentativi: {e}")
                 raise
 
 def get_minio_client():
@@ -117,34 +117,13 @@ def ensure_minio_buckets(s3_client):
     for bucket in buckets:
         try:
             s3_client.head_bucket(Bucket=bucket)
-            logger.info(f"MinIO bucket '{bucket}' exists")
+            logger.info(f"Bucket MinIO '{bucket}' esiste")
         except ClientError:
             try:
                 s3_client.create_bucket(Bucket=bucket)
-                logger.info(f"Created MinIO bucket '{bucket}'")
+                logger.info(f"Creato bucket MinIO '{bucket}'")
             except Exception as e:
-                logger.error(f"Error creating bucket '{bucket}': {e}")
-
-def flatten_data(data, prefix=''):
-    """Flattens nested JSON structure for Parquet conversion"""
-    flattened = {}
-    
-    if not isinstance(data, dict):
-        return {prefix: data}
-    
-    for key, value in data.items():
-        # Handle nested dictionaries
-        if isinstance(value, dict):
-            nested = flatten_data(value, prefix=f"{prefix}{key}_" if prefix else f"{key}_")
-            flattened.update(nested)
-        # Handle lists - convert to JSON strings
-        elif isinstance(value, list):
-            flattened[f"{prefix}{key}"] = json.dumps(value)
-        # Handle primitive types
-        else:
-            flattened[f"{prefix}{key}"] = value
-            
-    return flattened
+                logger.error(f"Errore nella creazione del bucket '{bucket}': {e}")
 
 def create_tables(conn_timescale, conn_postgres):
     """Creates necessary tables in TimescaleDB and PostgreSQL if they don't exist"""
@@ -153,7 +132,7 @@ def create_tables(conn_timescale, conn_postgres):
         # Extension for TimescaleDB
         cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
         
-        # Table for sensor measurements
+        # Table for sensor measurements with standardized variable names
         cur.execute("""
         CREATE TABLE IF NOT EXISTS sensor_measurements (
             time TIMESTAMPTZ NOT NULL,
@@ -173,7 +152,7 @@ def create_tables(conn_timescale, conn_postgres):
         # Convert to hypertable if not already
         cur.execute("SELECT create_hypertable('sensor_measurements', 'time', if_not_exists => TRUE);")
         
-        # Table for aggregated pollution metrics
+        # Table for aggregated pollution metrics with standardized variable names
         cur.execute("""
         CREATE TABLE IF NOT EXISTS pollution_metrics (
             time TIMESTAMPTZ NOT NULL,
@@ -190,11 +169,11 @@ def create_tables(conn_timescale, conn_postgres):
         cur.execute("SELECT create_hypertable('pollution_metrics', 'time', if_not_exists => TRUE);")
         
         conn_timescale.commit()
-        logger.info("TimescaleDB tables created/verified")
+        logger.info("Tabelle TimescaleDB create/verificate")
     
     # PostgreSQL tables
     with conn_postgres.cursor() as cur:
-        # Table for pollution events
+        # Table for pollution events with standardized variable names
         cur.execute("""
         CREATE TABLE IF NOT EXISTS pollution_events (
             event_id SERIAL PRIMARY KEY,
@@ -242,7 +221,7 @@ def create_tables(conn_timescale, conn_postgres):
         """)
         
         conn_postgres.commit()
-        logger.info("PostgreSQL tables created/verified")
+        logger.info("Tabelle PostgreSQL create/verificate")
 
 def process_raw_buoy_data(s3_client, data):
     """Processes raw buoy data and stores it in the Bronze layer"""
@@ -257,7 +236,7 @@ def process_raw_buoy_data(s3_client, data):
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save in Bronze layer as JSON (raw data preservation)
+        # Save in Bronze layer
         key = f"buoy_data/year={year}/month={month}/day={day}/buoy_{sensor_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="bronze",
@@ -265,11 +244,11 @@ def process_raw_buoy_data(s3_client, data):
             Body=json.dumps(data).encode('utf-8'),
             ContentType="application/json"
         )
-        logger.info(f"Raw buoy data saved to Bronze: bronze/{key}")
+        logger.info(f"Dati buoy salvati in Bronze: bronze/{key}")
         
         return True
     except Exception as e:
-        logger.error(f"Error processing raw buoy data: {e}")
+        logger.error(f"Errore nel processare i dati buoy grezzi: {e}")
         return False
 
 def process_raw_satellite_data(s3_client, data):
@@ -278,7 +257,7 @@ def process_raw_satellite_data(s3_client, data):
         # Verify that there is an image_path (pointer to the image already saved)
         image_path = data.get("image_pointer")
         if not image_path:
-            logger.warning("Satellite data without image_pointer, skipping")
+            logger.warning("Dati satellite senza image_path, impossibile processare")
             return False
             
         # Extract timestamp and metadata
@@ -300,15 +279,15 @@ def process_raw_satellite_data(s3_client, data):
             Body=json.dumps(metadata).encode('utf-8'),
             ContentType="application/json"
         )
-        logger.info(f"Satellite metadata saved to Bronze: bronze/{metadata_key}")
+        logger.info(f"Metadati satellite salvati in Bronze: bronze/{metadata_key}")
         
         return True
     except Exception as e:
-        logger.error(f"Error processing raw satellite metadata: {e}")
+        logger.error(f"Errore nel processare i metadati satellite grezzi: {e}")
         return False
 
 def process_processed_imagery(s3_client, data):
-    """Processes processed imagery data and stores it in the Silver layer as Parquet"""
+    """Processes processed imagery data and stores it in the Silver layer"""
     try:
         # Extract data
         image_id = data.get("image_id", "unknown")
@@ -318,7 +297,7 @@ def process_processed_imagery(s3_client, data):
         processed_image_path = data.get("processed_image_path", "")
         
         if not original_image_path:
-            logger.warning("Processed image data without original_image_path, skipping")
+            logger.warning("Dati immagine processata senza original_image_path, impossibile processare")
             return False
         
         # Convert timestamp to date for partitioning
@@ -327,50 +306,25 @@ def process_processed_imagery(s3_client, data):
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Flatten data for Parquet conversion
-        flat_data = flatten_data(data)
+        # Save processed data to Silver layer
+        processed_key = f"analyzed_data/satellite/year={year}/month={month}/day={day}/analyzed_{image_id}_{timestamp}.json"
+        s3_client.put_object(
+            Bucket="silver",
+            Key=processed_key,
+            Body=json.dumps(data).encode('utf-8'),
+            ContentType="application/json"
+        )
+        logger.info(f"Dati immagine processata salvati in Silver: silver/{processed_key}")
         
-        # Convert to Parquet
-        try:
-            df = pd.DataFrame([flat_data])
-            table = pa.Table.from_pandas(df)
-            buffer = BytesIO()
-            pq.write_table(table, buffer)
-            buffer.seek(0)
-            
-            # Save to Silver layer as Parquet
-            parquet_key = f"analyzed_data/satellite/year={year}/month={month}/day={day}/analyzed_{image_id}_{timestamp}.parquet"
-            s3_client.put_object(
-                Bucket="silver",
-                Key=parquet_key,
-                Body=buffer.getvalue()
-            )
-            logger.info(f"Processed imagery data saved to Silver as Parquet: silver/{parquet_key}")
-            
-            return True
-        except Exception as e:
-            logger.warning(f"Error converting to Parquet: {e}, falling back to JSON")
-            
-            # Fallback to JSON if Parquet conversion fails
-            json_key = f"analyzed_data/satellite/year={year}/month={month}/day={day}/analyzed_{image_id}_{timestamp}.json"
-            s3_client.put_object(
-                Bucket="silver",
-                Key=json_key,
-                Body=json.dumps(data).encode('utf-8'),
-                ContentType="application/json"
-            )
-            logger.info(f"Processed imagery data saved to Silver as JSON: silver/{json_key}")
-            
-            return True
-            
+        return True
     except Exception as e:
-        logger.error(f"Error processing processed imagery data: {e}")
+        logger.error(f"Errore nel processare i dati immagine processata: {e}")
         return False
 
 def process_analyzed_sensor_data(s3_client, conn_timescale, data):
-    """Processes analyzed sensor data and stores it in the Silver layer as Parquet and TimescaleDB"""
+    """Processes analyzed sensor data and stores it in the Silver layer and TimescaleDB"""
     try:
-        # Extract data
+        # Extract data - with standardized variable names
         timestamp = data.get("timestamp", int(time.time() * 1000))
         location = data.get("location", {})
         source_id = location.get("sensor_id", "unknown")
@@ -381,44 +335,22 @@ def process_analyzed_sensor_data(s3_client, conn_timescale, data):
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Flatten data for Parquet conversion
-        flat_data = flatten_data(data)
-        
-        # Convert to Parquet
-        try:
-            df = pd.DataFrame([flat_data])
-            table = pa.Table.from_pandas(df)
-            buffer = BytesIO()
-            pq.write_table(table, buffer)
-            buffer.seek(0)
-            
-            # Save to Silver layer as Parquet
-            parquet_key = f"analyzed_data/buoy/year={year}/month={month}/day={day}/analyzed_{source_id}_{timestamp}.parquet"
-            s3_client.put_object(
-                Bucket="silver",
-                Key=parquet_key,
-                Body=buffer.getvalue()
-            )
-            logger.info(f"Analyzed sensor data saved to Silver as Parquet: silver/{parquet_key}")
-        except Exception as e:
-            logger.warning(f"Error converting to Parquet: {e}, falling back to JSON")
-            
-            # Fallback to JSON if Parquet conversion fails
-            json_key = f"analyzed_data/buoy/year={year}/month={month}/day={day}/analyzed_{source_id}_{timestamp}.json"
-            s3_client.put_object(
-                Bucket="silver",
-                Key=json_key,
-                Body=json.dumps(data).encode('utf-8'),
-                ContentType="application/json"
-            )
-            logger.info(f"Analyzed sensor data saved to Silver as JSON: silver/{json_key}")
+        # Save in Silver layer
+        key = f"analyzed_data/buoy/year={year}/month={month}/day={day}/analyzed_{source_id}_{timestamp}.json"
+        s3_client.put_object(
+            Bucket="silver",
+            Key=key,
+            Body=json.dumps(data).encode('utf-8'),
+            ContentType="application/json"
+        )
+        logger.info(f"Dati sensore analizzati salvati in Silver: silver/{key}")
         
         # Save in TimescaleDB
         save_to_timescaledb(conn_timescale, "sensor_analysis", data)
         
         return True
     except Exception as e:
-        logger.error(f"Error processing analyzed sensor data: {e}")
+        logger.error(f"Errore nel processare i dati sensore analizzati: {e}")
         return False
 
 def process_analyzed_data(s3_client, conn_timescale, data):
@@ -431,10 +363,10 @@ def process_analyzed_data(s3_client, conn_timescale, data):
         elif source_type == "satellite":
             return process_processed_imagery(s3_client, data)
         else:
-            logger.warning(f"Unknown source type: {source_type}")
+            logger.warning(f"Tipo sorgente sconosciuto: {source_type}")
             return False
     except Exception as e:
-        logger.error(f"Error processing analyzed data: {e}")
+        logger.error(f"Errore nel processare i dati analizzati: {e}")
         return False
 
 def process_hotspot_data(s3_client, conn_timescale, data):
@@ -450,7 +382,7 @@ def process_hotspot_data(s3_client, conn_timescale, data):
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save in Gold layer as JSON (business-ready insights)
+        # Save in Gold layer
         key = f"hotspots/year={year}/month={month}/day={day}/hotspot_{hotspot_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
@@ -458,35 +390,14 @@ def process_hotspot_data(s3_client, conn_timescale, data):
             Body=json.dumps(data).encode('utf-8'),
             ContentType="application/json"
         )
-        logger.info(f"Hotspot data saved to Gold: gold/{key}")
-        
-        # Also save as Parquet for analytical workloads
-        try:
-            # Flatten data for Parquet conversion
-            flat_data = flatten_data(data)
-            df = pd.DataFrame([flat_data])
-            table = pa.Table.from_pandas(df)
-            buffer = BytesIO()
-            pq.write_table(table, buffer)
-            buffer.seek(0)
-            
-            # Save to Gold layer as Parquet
-            parquet_key = f"hotspots/year={year}/month={month}/day={day}/hotspot_{hotspot_id}_{timestamp}.parquet"
-            s3_client.put_object(
-                Bucket="gold",
-                Key=parquet_key,
-                Body=buffer.getvalue()
-            )
-            logger.info(f"Hotspot data also saved as Parquet: gold/{parquet_key}")
-        except Exception as e:
-            logger.warning(f"Error saving hotspot as Parquet: {e}, JSON version still saved")
+        logger.info(f"Hotspot salvato in Gold: gold/{key}")
         
         # Save in TimescaleDB
         save_to_timescaledb(conn_timescale, "hotspots", data)
         
         return True
     except Exception as e:
-        logger.error(f"Error processing hotspot data: {e}")
+        logger.error(f"Errore nel processare i dati hotspot: {e}")
         return False
 
 def process_prediction_data(s3_client, data):
@@ -502,7 +413,7 @@ def process_prediction_data(s3_client, data):
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save in Gold layer as JSON (business-ready insights)
+        # Save in Gold layer
         key = f"predictions/year={year}/month={month}/day={day}/prediction_{prediction_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
@@ -510,32 +421,11 @@ def process_prediction_data(s3_client, data):
             Body=json.dumps(data).encode('utf-8'),
             ContentType="application/json"
         )
-        logger.info(f"Prediction data saved to Gold: gold/{key}")
-        
-        # Also save as Parquet for analytical workloads
-        try:
-            # Flatten data for Parquet conversion
-            flat_data = flatten_data(data)
-            df = pd.DataFrame([flat_data])
-            table = pa.Table.from_pandas(df)
-            buffer = BytesIO()
-            pq.write_table(table, buffer)
-            buffer.seek(0)
-            
-            # Save to Gold layer as Parquet
-            parquet_key = f"predictions/year={year}/month={month}/day={day}/prediction_{prediction_id}_{timestamp}.parquet"
-            s3_client.put_object(
-                Bucket="gold",
-                Key=parquet_key,
-                Body=buffer.getvalue()
-            )
-            logger.info(f"Prediction data also saved as Parquet: gold/{parquet_key}")
-        except Exception as e:
-            logger.warning(f"Error saving prediction as Parquet: {e}, JSON version still saved")
+        logger.info(f"Predizione salvata in Gold: gold/{key}")
         
         return True
     except Exception as e:
-        logger.error(f"Error processing prediction data: {e}")
+        logger.error(f"Errore nel processare i dati predizione: {e}")
         return False
 
 def process_alert_data(s3_client, data):
@@ -551,7 +441,7 @@ def process_alert_data(s3_client, data):
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save in Gold layer as JSON (business-ready insights)
+        # Save in Gold layer
         key = f"alerts/year={year}/month={month}/day={day}/alert_{alert_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
@@ -559,32 +449,11 @@ def process_alert_data(s3_client, data):
             Body=json.dumps(data).encode('utf-8'),
             ContentType="application/json"
         )
-        logger.info(f"Alert data saved to Gold: gold/{key}")
-        
-        # Also save as Parquet for analytical workloads
-        try:
-            # Flatten data for Parquet conversion
-            flat_data = flatten_data(data)
-            df = pd.DataFrame([flat_data])
-            table = pa.Table.from_pandas(df)
-            buffer = BytesIO()
-            pq.write_table(table, buffer)
-            buffer.seek(0)
-            
-            # Save to Gold layer as Parquet
-            parquet_key = f"alerts/year={year}/month={month}/day={day}/alert_{alert_id}_{timestamp}.parquet"
-            s3_client.put_object(
-                Bucket="gold",
-                Key=parquet_key,
-                Body=buffer.getvalue()
-            )
-            logger.info(f"Alert data also saved as Parquet: gold/{parquet_key}")
-        except Exception as e:
-            logger.warning(f"Error saving alert as Parquet: {e}, JSON version still saved")
+        logger.info(f"Alert salvato in Gold: gold/{key}")
         
         return True
     except Exception as e:
-        logger.error(f"Error processing alert data: {e}")
+        logger.error(f"Errore nel processare i dati alert: {e}")
         return False
 
 def save_to_timescaledb(conn, table_type, data):
@@ -592,7 +461,7 @@ def save_to_timescaledb(conn, table_type, data):
     try:
         if table_type == "sensor_analysis":
             with conn.cursor() as cur:
-                # Extract the necessary values
+                # Extract the necessary values with standardized variable names
                 timestamp = datetime.fromtimestamp(data.get("timestamp", 0) / 1000)
                 location = data.get("location", {})
                 measurements = data.get("measurements", {})
@@ -608,21 +477,21 @@ def save_to_timescaledb(conn, table_type, data):
                     timestamp,
                     data.get("source_type", "buoy"),
                     location.get("sensor_id", "unknown"),
-                    location.get("lat"),
-                    location.get("lon"),
-                    measurements.get("temperature"),
-                    measurements.get("ph"),
+                    location.get("latitude", location.get("lat")),
+                    location.get("longitude", location.get("lon")),
+                    measurements.get("temperature", measurements.get("WTMP")),
+                    measurements.get("ph", measurements.get("pH")),
                     measurements.get("turbidity"),
-                    measurements.get("wave_height"),
+                    measurements.get("wave_height", measurements.get("WVHT")),
                     pollution_analysis.get("risk_score"),
                     pollution_analysis.get("level")
                 ))
                 conn.commit()
-                logger.info(f"Saved data to TimescaleDB: sensor_measurements for sensor {location.get('sensor_id')}")
+                logger.info(f"Salvati dati in TimescaleDB: sensor_measurements per sensore {location.get('sensor_id')}")
                 
         elif table_type == "hotspots":
             with conn.cursor() as cur:
-                # Extract necessary values
+                # Extract necessary values with standardized variable names
                 timestamp = datetime.fromtimestamp(data.get("timestamp", 0) / 1000)
                 location = data.get("location", {})
                 summary = data.get("pollution_summary", {})
@@ -642,11 +511,11 @@ def save_to_timescaledb(conn, table_type, data):
                     summary.get("measurement_count", 1)
                 ))
                 conn.commit()
-                logger.info(f"Saved data to TimescaleDB: pollution_metrics for hotspot {data.get('hotspot_id')}")
+                logger.info(f"Salvati dati in TimescaleDB: pollution_metrics per hotspot {data.get('hotspot_id')}")
                 
         return True
     except Exception as e:
-        logger.error(f"Error saving to TimescaleDB ({table_type}): {e}")
+        logger.error(f"Errore nel salvare in TimescaleDB ({table_type}): {e}")
         if conn:
             conn.rollback()
         return False
@@ -659,14 +528,14 @@ def main():
     try:
         conn_timescale = connect_to_timescaledb()
     except Exception as e:
-        logger.error(f"Error connecting to TimescaleDB: {e}")
+        logger.error(f"Errore nella connessione a TimescaleDB: {e}")
         return
     
     # Connect to PostgreSQL
     try:
         conn_postgres = connect_to_postgres()
     except Exception as e:
-        logger.error(f"Error connecting to PostgreSQL: {e}")
+        logger.error(f"Errore nella connessione a PostgreSQL: {e}")
         return
     
     # Create MinIO client and ensure buckets
@@ -674,14 +543,14 @@ def main():
         s3_client = get_minio_client()
         ensure_minio_buckets(s3_client)
     except Exception as e:
-        logger.error(f"Error configuring MinIO: {e}")
+        logger.error(f"Errore nella configurazione di MinIO: {e}")
         return
     
     # Create tables
     try:
         create_tables(conn_timescale, conn_postgres)
     except Exception as e:
-        logger.error(f"Error creating tables: {e}")
+        logger.error(f"Errore nella creazione delle tabelle: {e}")
         return
     
     # Create Kafka consumer
@@ -692,7 +561,7 @@ def main():
         auto_offset_reset="earliest",
         value_deserializer=lambda x: json.loads(x.decode('utf-8'))
     )
-    logger.info(f"Kafka consumer started, listening on topics: {', '.join(TOPICS)}")
+    logger.info(f"Consumer Kafka avviato, in ascolto sui topic: {', '.join(TOPICS)}")
     
     # Main loop
     try:
@@ -701,7 +570,7 @@ def main():
             data = message.value
             
             try:
-                logger.info(f"Received message from topic {topic}")
+                logger.info(f"Ricevuto messaggio dal topic {topic}")
                 
                 # Process based on topic
                 if topic == "buoy_data":
@@ -722,19 +591,19 @@ def main():
                     process_alert_data(s3_client, data)
                 
             except Exception as e:
-                logger.error(f"Error processing message from {topic}: {e}")
+                logger.error(f"Errore nell'elaborazione del messaggio {topic}: {e}")
                 
     except KeyboardInterrupt:
-        logger.info("Consumer interrupted by user")
+        logger.info("Interruzione manuale del consumer")
     except Exception as e:
-        logger.error(f"Error in consumer loop: {e}")
+        logger.error(f"Errore nel consumer: {e}")
     finally:
         if conn_timescale:
             conn_timescale.close()
         if conn_postgres:
             conn_postgres.close()
         consumer.close()
-        logger.info("Consumer shutdown complete")
+        logger.info("Consumer chiuso")
 
 if __name__ == "__main__":
     main()

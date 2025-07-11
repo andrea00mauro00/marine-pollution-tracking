@@ -70,29 +70,29 @@ def connect_to_redis():
 def process_buoy_data(redis_client, data):
     """Process raw buoy data for dashboard visualization"""
     try:
-        # Extract key data
+        # Extract key data - Standardized variable names
         sensor_id = data.get("sensor_id", "unknown")
         timestamp = data.get("timestamp", int(time.time() * 1000))
-        lat = data.get("LAT")
-        lon = data.get("LON")
+        latitude = data.get("latitude", data.get("LAT"))  # Support for backward compatibility
+        longitude = data.get("longitude", data.get("LON"))  # Support for backward compatibility
         
-        if not sensor_id or not lat or not lon:
+        if not sensor_id or not latitude or not longitude:
             logger.warning("Missing critical data in buoy message")
             return
         
-        # Prepare sensor data for Redis
+        # Prepare sensor data for Redis with standardized names
         sensor_key = f"{NAMESPACES['sensors']}{sensor_id}"
         sensor_data = {
             "sensor_id": sensor_id,
             "timestamp": str(timestamp),
-            "lat": str(lat),
-            "lon": str(lon),
+            "latitude": str(latitude),
+            "longitude": str(longitude),
             "type": "buoy",
-            "ph": str(data.get("pH", 0)),
+            "ph": str(data.get("ph", data.get("pH", 0))),
             "turbidity": str(data.get("turbidity", 0)),
-            "temperature": str(data.get("WTMP", 0)),
-            "wave_height": str(data.get("WVHT", 0)),
-            "microplastics": str(data.get("microplastics_concentration", 0)),
+            "temperature": str(data.get("temperature", data.get("WTMP", 0))),
+            "wave_height": str(data.get("wave_height", data.get("WVHT", 0))),
+            "microplastics": str(data.get("microplastics", data.get("microplastics_concentration", 0))),
             "water_quality_index": str(data.get("water_quality_index", 0))
         }
         
@@ -109,14 +109,14 @@ def process_buoy_data(redis_client, data):
         # Add to active sensors set
         redis_client.sadd(NAMESPACES['active_sensors'], sensor_id)
         
-        # Store time series data for charts
+        # Store time series data for charts with standardized names
         ts_key = f"{NAMESPACES['timeseries']}buoy:{sensor_id}"
         ts_data = {
             "timestamp": str(timestamp),
-            "ph": str(data.get("pH", 0)),
+            "ph": str(data.get("ph", data.get("pH", 0))),
             "turbidity": str(data.get("turbidity", 0)),
-            "temperature": str(data.get("WTMP", 0)),
-            "microplastics": str(data.get("microplastics_concentration", 0))
+            "temperature": str(data.get("temperature", data.get("WTMP", 0))),
+            "microplastics": str(data.get("microplastics", data.get("microplastics_concentration", 0)))
         }
         
         # Use Redis list for time series (limited to last 100 points)
@@ -235,7 +235,7 @@ def process_processed_imagery(redis_client, data):
 def process_analyzed_sensor_data(redis_client, data):
     """Process analyzed sensor data for dashboard visualization"""
     try:
-        # Extract key data
+        # Extract key data - using standardized variable names
         location = data.get("location", {})
         sensor_id = location.get("sensor_id", "unknown")
         timestamp = data.get("timestamp", int(time.time() * 1000))
@@ -251,12 +251,12 @@ def process_analyzed_sensor_data(redis_client, data):
         # Check if entry already exists
         existing_data = redis_client.hgetall(sensor_key)
         
-        # Create or update data
+        # Create or update data with standardized names
         sensor_data = {
             "sensor_id": sensor_id,
             "timestamp": str(timestamp),
-            "lat": str(location.get("lat", 0)),
-            "lon": str(location.get("lon", 0)),
+            "latitude": str(location.get("latitude", location.get("lat", 0))),
+            "longitude": str(location.get("longitude", location.get("lon", 0))),
             "type": "buoy",
             "analyzed": "true",
             "pollution_level": pollution_analysis.get("level", "unknown"),
@@ -313,13 +313,13 @@ def process_hotspot_data(redis_client, data):
             logger.warning("Missing critical data in hotspot message")
             return
         
-        # Prepare hotspot data for Redis
+        # Prepare hotspot data for Redis with standardized variable names
         hotspot_key = f"{NAMESPACES['hotspots']}{hotspot_id}"
         hotspot_data = {
             "hotspot_id": hotspot_id,
             "timestamp": str(timestamp),
-            "lat": str(location.get("center_lat", 0)),
-            "lon": str(location.get("center_lon", 0)),
+            "latitude": str(location.get("center_latitude", location.get("center_lat", 0))),
+            "longitude": str(location.get("center_longitude", location.get("center_lon", 0))),
             "radius_km": str(location.get("radius_km", 0)),
             "level": pollution_summary.get("level", "unknown"),
             "risk_score": str(pollution_summary.get("risk_score", 0)),
@@ -362,7 +362,7 @@ def process_prediction_data(redis_client, data):
             logger.warning("Missing critical data in prediction message")
             return
         
-        # Prepare prediction set data for Redis
+        # Prepare prediction set data for Redis with standardized variable names
         prediction_key = f"{NAMESPACES['predictions']}set:{prediction_set_id}"
         prediction_set_data = {
             "prediction_set_id": prediction_set_id,
@@ -370,8 +370,8 @@ def process_prediction_data(redis_client, data):
             "timestamp": str(timestamp),
             "pollutant_type": pollutant_type,
             "severity": severity,
-            "source_lat": str(source_location.get("lat", 0)),
-            "source_lon": str(source_location.get("lon", 0)),
+            "source_latitude": str(source_location.get("latitude", source_location.get("lat", 0))),
+            "source_longitude": str(source_location.get("longitude", source_location.get("lon", 0))),
             "source_radius_km": str(source_location.get("radius_km", 0)),
             "prediction_count": str(len(predictions)),
             "json": json.dumps(data)
@@ -396,8 +396,8 @@ def process_prediction_data(redis_client, data):
                 "event_id": event_id,
                 "timestamp": str(timestamp),
                 "hours_ahead": str(hours_ahead),
-                "lat": str(prediction_location.get("center_lat", 0)),
-                "lon": str(prediction_location.get("center_lon", 0)),
+                "latitude": str(prediction_location.get("center_latitude", prediction_location.get("center_lat", 0))),
+                "longitude": str(prediction_location.get("center_longitude", prediction_location.get("center_lon", 0))),
                 "radius_km": str(prediction_location.get("radius_km", 0)),
                 "predicted_area_km2": str(prediction.get("predicted_area_km2", 0)),
                 "confidence": str(prediction.get("confidence", 0)),
@@ -434,13 +434,13 @@ def process_alert_data(redis_client, data):
             logger.warning("Missing critical data in alert message")
             return
         
-        # Prepare alert data for Redis
+        # Prepare alert data for Redis with standardized variable names
         alert_key = f"{NAMESPACES['alerts']}{alert_id}"
         alert_data = {
             "alert_id": alert_id,
             "timestamp": str(timestamp),
-            "lat": str(location.get("center_lat", 0)),
-            "lon": str(location.get("center_lon", 0)),
+            "latitude": str(location.get("center_latitude", location.get("center_lat", 0))),
+            "longitude": str(location.get("center_longitude", location.get("center_lon", 0))),
             "radius_km": str(location.get("radius_km", 0)),
             "severity": severity,
             "risk_score": str(risk_score),

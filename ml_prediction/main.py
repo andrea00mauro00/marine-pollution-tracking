@@ -41,8 +41,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-HOTSPOTS_TOPIC = os.environ.get("POLLUTION_HOTSPOTS_TOPIC", "pollution_hotspots")
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
 PREDICTIONS_TOPIC = os.environ.get("PREDICTIONS_TOPIC", "pollution_predictions")
 
 # Pollutant physical properties for diffusion modeling
@@ -294,11 +294,11 @@ class PollutionSpreadPredictor(MapFunction):
                 return None
             
             # Extract coordinates and radius
-            center_lat = location.get("center_lat")
-            center_lon = location.get("center_lon")
+            center_latitude = location.get("center_latitude", location.get("center_lat"))
+            center_longitude = location.get("center_longitude", location.get("center_lon"))
             radius_km = location.get("radius_km", 1.0)
             
-            if center_lat is None or center_lon is None:
+            if center_latitude is None or center_longitude is None:
                 logger.warning(f"Skipping hotspot without valid coordinates: {hotspot_id}")
                 return None
             
@@ -307,11 +307,11 @@ class PollutionSpreadPredictor(MapFunction):
             region_id = env_ref.get("region_id", "default_region")
             
             # Get current and wind patterns
-            current_pattern = self._get_current_pattern(center_lat, center_lon, region_id)
+            current_pattern = self._get_current_pattern(center_latitude, center_longitude, region_id)
             wind_pattern = self._get_wind_pattern(region_id)
             
             # Identify local ecosystem types
-            ecosystem_types = self._identify_ecosystem_types(center_lat, center_lon, radius_km)
+            ecosystem_types = self._identify_ecosystem_types(center_latitude, center_longitude, radius_km)
             
             # Generate predictions
             prediction_set_id = str(uuid.uuid4())
@@ -320,7 +320,7 @@ class PollutionSpreadPredictor(MapFunction):
             # Generate predictions for each time interval
             for hours in self.prediction_intervals:
                 prediction = self._generate_prediction(
-                    center_lat, center_lon, radius_km, pollutant_type,
+                    center_latitude, center_longitude, radius_km, pollutant_type,
                     risk_score, current_pattern, wind_pattern,
                     hours, timestamp, severity, ecosystem_types
                 )
@@ -334,8 +334,8 @@ class PollutionSpreadPredictor(MapFunction):
                 "severity": severity,
                 "generated_at": int(time.time() * 1000),
                 "source_location": {
-                    "lat": center_lat,
-                    "lon": center_lon,
+                    "latitude": center_latitude,
+                    "longitude": center_longitude,
                     "radius_km": radius_km
                 },
                 "environmental_conditions": {
@@ -362,7 +362,7 @@ class PollutionSpreadPredictor(MapFunction):
             logger.error(traceback.format_exc())
             return None
     
-    def _generate_prediction(self, lat, lon, radius_km, pollutant_type, 
+    def _generate_prediction(self, latitude, longitude, radius_km, pollutant_type, 
                             risk_score, current, wind, hours, timestamp, 
                             severity, ecosystem_types):
         """
@@ -393,7 +393,7 @@ class PollutionSpreadPredictor(MapFunction):
             
             # Current-driven movement
             lat_km_per_degree = 111.32
-            lon_km_per_degree = 111.32 * math.cos(math.radians(lat))
+            lon_km_per_degree = 111.32 * math.cos(math.radians(latitude))
             
             current_lat_change = (current_distance * math.cos(current_dir_rad)) / lat_km_per_degree
             current_lon_change = (current_distance * math.sin(current_dir_rad)) / lon_km_per_degree
@@ -410,8 +410,8 @@ class PollutionSpreadPredictor(MapFunction):
             wind_lon_change = (wind_distance * math.sin(wind_dir_rad)) / lon_km_per_degree
             
             # 3. Combine movements for new position
-            new_lat = lat + current_lat_change + wind_lat_change
-            new_lon = lon + current_lon_change + wind_lon_change
+            new_latitude = latitude + current_lat_change + wind_lat_change
+            new_longitude = longitude + current_lon_change + wind_lon_change
             
             # 4. Calculate radius growth due to diffusion
             # Diffusion causes radial growth proportional to square root of time
@@ -493,8 +493,8 @@ class PollutionSpreadPredictor(MapFunction):
                 "hours_ahead": hours,
                 "prediction_time": prediction_time,
                 "location": {
-                    "lat": new_lat,
-                    "lon": new_lon,
+                    "latitude": new_latitude,
+                    "longitude": new_longitude,
                     "radius_km": new_radius_km
                 },
                 "area_km2": new_area_km2,
@@ -544,7 +544,7 @@ class PollutionSpreadPredictor(MapFunction):
             return {
                 "hours_ahead": hours,
                 "prediction_time": timestamp + (hours * 3600 * 1000),
-                "location": {"lat": lat, "lon": lon, "radius_km": radius_km},
+                "location": {"latitude": latitude, "longitude": longitude, "radius_km": radius_km},
                 "confidence": 0.5,
                 "error": str(e)
             }
@@ -654,7 +654,7 @@ class PollutionSpreadPredictor(MapFunction):
         
         return recommended_methods, priority_score, window_critical
     
-    def _identify_ecosystem_types(self, lat, lon, radius_km):
+    def _identify_ecosystem_types(self, latitude, longitude, radius_km):
         """
         Identify ecosystem types in the affected area
         This is a simplified version - in production would use GIS data
@@ -672,20 +672,20 @@ class PollutionSpreadPredictor(MapFunction):
         # Bay Mouth: 36.9-37.3
         
         # Latitude-based ecosystem estimation
-        if 36.9 <= lat <= 37.3:
+        if 36.9 <= latitude <= 37.3:
             # Bay mouth - mix of open water and beaches
             ecosystems["open_water"] = 0.6
             ecosystems["beach"] = 0.4
-        elif 37.0 <= lat <= 38.0:
+        elif 37.0 <= latitude <= 38.0:
             # Lower bay - more open water, some wetlands and oyster beds
             ecosystems["open_water"] = 0.7
             ecosystems["oyster_bed"] = 0.2
             ecosystems["wetland"] = 0.1
-        elif 38.0 <= lat <= 39.0:
+        elif 38.0 <= latitude <= 39.0:
             # Mid bay - mix of open water and estuaries
             ecosystems["open_water"] = 0.5
             ecosystems["estuary"] = 0.5
-        elif 39.0 <= lat <= 39.7:
+        elif 39.0 <= latitude <= 39.7:
             # Upper bay - more wetlands and estuaries
             ecosystems["estuary"] = 0.6
             ecosystems["wetland"] = 0.3
@@ -698,14 +698,14 @@ class PollutionSpreadPredictor(MapFunction):
         # Eastern shore: -76.2 to -75.5 (more wetlands)
         # Western shore: -77.0 to -76.2 (more developed, beaches)
         
-        if -76.2 <= lon <= -75.5:
+        if -76.2 <= longitude <= -75.5:
             # Eastern shore - increase wetlands
             if "wetland" in ecosystems:
                 ecosystems["wetland"] *= 1.5
                 # Normalize
                 total = sum(ecosystems.values())
                 ecosystems = {k: v/total for k, v in ecosystems.items()}
-        elif -77.0 <= lon <= -76.2:
+        elif -77.0 <= longitude <= -76.2:
             # Western shore - increase beaches
             if "beach" not in ecosystems:
                 ecosystems["beach"] = 0.2
@@ -719,13 +719,13 @@ class PollutionSpreadPredictor(MapFunction):
         
         return ecosystems
     
-    def _get_current_pattern(self, lat, lon, region_id=None):
+    def _get_current_pattern(self, latitude, longitude, region_id=None):
         """Determine the current pattern for a location"""
         # Find which region contains the point
         for name, pattern in CURRENT_PATTERNS.items():
             bounds = pattern["bounds"]
-            if (bounds["lat_min"] <= lat <= bounds["lat_max"] and
-                bounds["lon_min"] <= lon <= bounds["lon_max"]):
+            if (bounds["lat_min"] <= latitude <= bounds["lat_max"] and
+                bounds["lon_min"] <= longitude <= bounds["lon_max"]):
                 
                 # Determine if we're in flood or ebb tide (simplified, alternating every 6 hours)
                 # In a real system, this would use actual tide data
@@ -794,7 +794,7 @@ def wait_for_services():
     for i in range(10):
         try:
             from kafka.admin import KafkaAdminClient
-            admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_SERVERS)
+            admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
             admin_client.list_topics()
             kafka_ready = True
             logger.info("Kafka is ready")
@@ -823,7 +823,7 @@ def main():
     
     # Set up Kafka properties
     properties = {
-        'bootstrap.servers': KAFKA_SERVERS,
+        'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
         'group.id': 'ml_prediction_group'
     }
     

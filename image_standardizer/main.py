@@ -41,13 +41,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration variables
-KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 SATELLITE_TOPIC = os.environ.get("SATELLITE_TOPIC", "satellite_imagery")
 PROCESSED_IMAGERY_TOPIC = os.environ.get("PROCESSED_IMAGERY_TOPIC", "processed_imagery")
 
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
-MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
-MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
 
 class ImageStandardizer(ProcessFunction):
     """
@@ -673,7 +673,7 @@ def wait_for_services():
     for attempt in range(max_retries):
         try:
             from kafka.admin import KafkaAdminClient
-            admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_SERVERS)
+            admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
             topics = admin_client.list_topics()
             kafka_ready = True
             logger.info(f"✅ Kafka is ready, available topics: {topics}")
@@ -735,7 +735,7 @@ def main():
     
     # Kafka consumer properties
     props = {
-        'bootstrap.servers': KAFKA_SERVERS,
+        'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
         'group.id': 'image_standardizer',
         'auto.offset.reset': 'earliest'
     }

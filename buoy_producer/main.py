@@ -10,7 +10,7 @@ from loguru import logger
 load_dotenv()
 
 # Configuration
-KAFKA_BROKER = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "buoy_data")
 POLL_INTERVAL_SEC = int(os.getenv("GENERATE_INTERVAL_SECONDS", 30))
 DLQ_TOPIC = os.getenv("DLQ_TOPIC", "buoy_data_dlq")  # Dead Letter Queue
@@ -40,7 +40,7 @@ def schema_registry_producer():
         
         # Configure Kafka producer with Avro serializer
         producer_conf = {
-            'bootstrap.servers': KAFKA_BROKER,
+            'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
             'value.serializer': avro_serializer,
             'error.cb': on_delivery_error
         }
@@ -56,7 +56,7 @@ def fallback_producer():
     for _ in range(5):
         try:
             return KafkaProducer(
-                bootstrap_servers=KAFKA_BROKER,
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
                 value_serializer=lambda v: json.dumps(v).encode("utf-8"))
         except NoBrokersAvailable:
             logger.warning("Kafka not reachable, retrying in 5s...")
@@ -70,7 +70,7 @@ def on_delivery_error(err, msg):
     # Send to DLQ if possible
     try:
         dlq_producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BROKER,
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
             value_serializer=lambda v: json.dumps(v).encode("utf-8")
         )
         error_msg = {
@@ -114,7 +114,7 @@ def fetch_usgs(sid: str) -> dict | None:
     for s in ts:
         code=s["variable"]["variableCode"][0]["value"]
         val=float(s["values"][0]["value"][0]["value"])
-        if code=="00400": out["pH"]=val
+        if code=="00400": out["ph"]=val
         elif code=="63675": out["turbidity"]=val
     return out or None
 
@@ -128,22 +128,22 @@ def simulate_pollution_parameters(buoy_id: str, lat: float, lon: float) -> dict:
     # Base parameters with realistic variations
     pollution_data = {
         # Microplastics (particles per m³)
-        "microplastics_concentration": round(rng.uniform(0.1, 15.0), 2),
+        "microplastics": round(rng.uniform(0.1, 15.0), 2),
         
         # Heavy metals (mg/L)
-        "hm_mercury_hg": round(rng.uniform(0.001, 0.05), 4),
-        "hm_lead_pb": round(rng.uniform(0.001, 0.1), 4),
-        "hm_cadmium_cd": round(rng.uniform(0.0005, 0.02), 4),
-        "hm_chromium_cr": round(rng.uniform(0.002, 0.15), 4),
+        "mercury": round(rng.uniform(0.001, 0.05), 4),
+        "lead": round(rng.uniform(0.001, 0.1), 4),
+        "cadmium": round(rng.uniform(0.0005, 0.02), 4),
+        "chromium": round(rng.uniform(0.002, 0.15), 4),
         
         # Hydrocarbons (mg/L)
-        "hc_total_petroleum_hydrocarbons": round(rng.uniform(0.01, 2.0), 3),
-        "hc_polycyclic_aromatic_hydrocarbons": round(rng.uniform(0.001, 0.5), 4),
+        "petroleum_hydrocarbons": round(rng.uniform(0.01, 2.0), 3),
+        "polycyclic_aromatic": round(rng.uniform(0.001, 0.5), 4),
         
         # Nutrients and eutrophication
-        "nt_nitrates_no3": round(rng.uniform(0.1, 25.0), 2),
-        "nt_phosphates_po4": round(rng.uniform(0.01, 3.0), 3),
-        "nt_ammonia_nh3": round(rng.uniform(0.01, 1.5), 3),
+        "nitrates": round(rng.uniform(0.1, 25.0), 2),
+        "phosphates": round(rng.uniform(0.01, 3.0), 3),
+        "ammonia": round(rng.uniform(0.01, 1.5), 3),
         
         # Additional chemical parameters
         "cp_pesticides_total": round(rng.uniform(0.001, 0.1), 4),
@@ -151,9 +151,9 @@ def simulate_pollution_parameters(buoy_id: str, lat: float, lon: float) -> dict:
         "cp_dioxins": round(rng.uniform(0.00001, 0.001), 6),
         
         # Biological indicators
-        "bi_coliform_bacteria": int(rng.uniform(1, 1000)),
-        "bi_chlorophyll_a": round(rng.uniform(0.5, 50.0), 2),
-        "bi_dissolved_oxygen_saturation": round(rng.uniform(70.0, 120.0), 1),
+        "coliform_bacteria": int(rng.uniform(1, 1000)),
+        "chlorophyll_a": round(rng.uniform(0.5, 50.0), 2),
+        "dissolved_oxygen": round(rng.uniform(70.0, 120.0), 1),
         
         # Water quality index (0-100, where 100 = excellent)
         "water_quality_index": round(rng.uniform(45.0, 95.0), 1),
@@ -165,7 +165,7 @@ def simulate_pollution_parameters(buoy_id: str, lat: float, lon: float) -> dict:
     # Adjustments based on location (simulation of hotspots)
     # Coastal zones tend to have more pollution
     if abs(lat) < 60:  # More populated zones
-        pollution_data["microplastics_concentration"] *= rng.uniform(1.2, 2.0)
+        pollution_data["microplastics"] *= rng.uniform(1.2, 2.0)
         pollution_data["water_quality_index"] *= rng.uniform(0.8, 0.95)
     
     # Simulate occasional pollution events
@@ -187,13 +187,13 @@ def simulate_basic_environmental_data(buoy_id: str, lat: float, lon: float) -> d
     rng = random.Random(base_seed)
     
     return {
-        "WDIR": round(rng.uniform(0, 360), 1),  # Wind direction
-        "WSPD": round(rng.uniform(2, 25), 1),   # Wind speed
-        "WTMP": round(rng.uniform(8, 28), 1),   # Water temperature
-        "WVHT": round(rng.uniform(0.5, 4.0), 2), # Wave height
-        "PRES": round(rng.uniform(1010, 1025), 1), # Atmospheric pressure
-        "ATMP": round(rng.uniform(5, 35), 1),   # Air temperature
-        "pH": round(rng.uniform(7.8, 8.2), 2),  # Water pH
+        "wind_direction": round(rng.uniform(0, 360), 1),  # Wind direction
+        "wind_speed": round(rng.uniform(2, 25), 1),   # Wind speed
+        "temperature": round(rng.uniform(8, 28), 1),   # Water temperature
+        "wave_height": round(rng.uniform(0.5, 4.0), 2), # Wave height
+        "pressure": round(rng.uniform(1010, 1025), 1), # Atmospheric pressure
+        "air_temp": round(rng.uniform(5, 35), 1),   # Air temperature
+        "ph": round(rng.uniform(7.8, 8.2), 2),  # Water pH
         "turbidity": round(rng.uniform(1, 15), 1)  # Turbidity
     }
 
@@ -223,44 +223,34 @@ def main():
                 buoy = simulate_basic_environmental_data(loc["id"], loc["lat"], loc["lon"])
 
             buoy["sensor_id"] = loc["id"]
-            buoy["LAT"] = loc["lat"]
-            buoy["LON"] = loc["lon"]
+            buoy["latitude"] = loc["lat"]
+            buoy["longitude"] = loc["lon"]
 
             # Add pollution parameter simulation
             pollution_params = simulate_pollution_parameters(loc["id"], loc["lat"], loc["lon"])
             buoy.update(pollution_params)
             
             # Add simulated pH if missing
-            if "pH" not in buoy or buoy["pH"] is None:
+            if "ph" not in buoy or buoy["ph"] is None:
                 base_seed = hash(loc["id"]) % 1000 + int(time.time()) % 100
                 rng = random.Random(base_seed)
-                buoy["pH"] = round(rng.uniform(7.8, 8.2), 2)  # Typical seawater pH
+                buoy["ph"] = round(rng.uniform(7.8, 8.2), 2)  # Typical seawater pH
             
-            # Flatten nested structures for easier processing
-            if "heavy_metals" in buoy:
-                for k,v in buoy["heavy_metals"].items():
-                    buoy[f"hm_{k}"]=v
-                del buoy["heavy_metals"]
-            
-            if "hydrocarbons" in buoy:
-                for k,v in buoy["hydrocarbons"].items():
-                    buoy[f"hc_{k}"]=v
-                del buoy["hydrocarbons"]
-            
-            if "nutrients" in buoy:
-                for k,v in buoy["nutrients"].items():
-                    buoy[f"nt_{k}"]=v
-                del buoy["nutrients"]
-            
-            if "chemical_pollutants" in buoy:
-                for k,v in buoy["chemical_pollutants"].items():
-                    buoy[f"cp_{k}"]=v
-                del buoy["chemical_pollutants"]
-            
-            if "biological_indicators" in buoy:
-                for k,v in buoy["biological_indicators"].items():
-                    buoy[f"bi_{k}"]=v
-                del buoy["biological_indicators"]
+            # Handle NOAA data mapping to standardized names
+            if "WDIR" in buoy:
+                buoy["wind_direction"] = buoy.pop("WDIR")
+            if "WSPD" in buoy:
+                buoy["wind_speed"] = buoy.pop("WSPD")
+            if "WTMP" in buoy:
+                buoy["temperature"] = buoy.pop("WTMP")
+            if "WVHT" in buoy:
+                buoy["wave_height"] = buoy.pop("WVHT")
+            if "PRES" in buoy:
+                buoy["pressure"] = buoy.pop("PRES")
+            if "ATMP" in buoy:
+                buoy["air_temp"] = buoy.pop("ATMP")
+            if "pH" in buoy:
+                buoy["ph"] = buoy.pop("pH")
 
             buoy["timestamp"] = int(time.time()*1000)
             
@@ -283,7 +273,7 @@ def main():
                 # Send to DLQ
                 try:
                     dlq_producer = KafkaProducer(
-                        bootstrap_servers=KAFKA_BROKER,
+                        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
                         value_serializer=lambda v: json.dumps(v).encode("utf-8")
                     )
                     error_msg = {
@@ -302,14 +292,14 @@ def main():
             logger.info(f"→ SENT {loc['id']} ({loc['lat']}, {loc['lon']})")
             # Show complete JSON sent (for debugging)
             logger.debug(f"📄 Complete JSON: {json.dumps(buoy, indent=2)}")
-            logger.info(f"  📊 Environmental: pH={buoy.get('pH', 'N/A')}, Temp={buoy.get('WTMP', 'N/A')}°C, Wind={buoy.get('WSPD', 'N/A')}kt")
-            logger.info(f"  🌊 Sea: Waves={buoy.get('WVHT', 'N/A')}m, Pressure={buoy.get('PRES', 'N/A')}hPa")
+            logger.info(f"  📊 Environmental: pH={buoy.get('ph', 'N/A')}, Temp={buoy.get('temperature', 'N/A')}°C, Wind={buoy.get('wind_speed', 'N/A')}kt")
+            logger.info(f"  🌊 Sea: Waves={buoy.get('wave_height', 'N/A')}m, Pressure={buoy.get('pressure', 'N/A')}hPa")
             logger.info(f"  🔬 Pollution: WQI={buoy.get('water_quality_index')}, Level={buoy.get('pollution_level')}")
-            logger.info(f"  🧪 Microplastics={buoy.get('microplastics_concentration', 'N/A')} part/m³")
-            logger.info(f"  ⚗️ Metals: Hg={buoy.get('hm_mercury_hg', 'N/A')}mg/L, Pb={buoy.get('hm_lead_pb', 'N/A')}mg/L")
-            logger.info(f"  🛢️ Hydrocarbons: TPH={buoy.get('hc_total_petroleum_hydrocarbons', 'N/A')}mg/L")
-            logger.info(f"  🌱 Nutrients: NO3={buoy.get('nt_nitrates_no3', 'N/A')}mg/L, PO4={buoy.get('nt_phosphates_po4', 'N/A')}mg/L")
-            logger.info(f"  🦠 Biological: Coliform={buoy.get('bi_coliform_bacteria', 'N/A')}, Chlorophyll={buoy.get('bi_chlorophyll_a', 'N/A')}μg/L")
+            logger.info(f"  🧪 Microplastics={buoy.get('microplastics', 'N/A')} part/m³")
+            logger.info(f"  ⚗️ Metals: Hg={buoy.get('mercury', 'N/A')}mg/L, Pb={buoy.get('lead', 'N/A')}mg/L")
+            logger.info(f"  🛢️ Hydrocarbons: TPH={buoy.get('petroleum_hydrocarbons', 'N/A')}mg/L")
+            logger.info(f"  🌱 Nutrients: NO3={buoy.get('nitrates', 'N/A')}mg/L, PO4={buoy.get('phosphates', 'N/A')}mg/L")
+            logger.info(f"  🦠 Biological: Coliform={buoy.get('coliform_bacteria', 'N/A')}, Chlorophyll={buoy.get('chlorophyll_a', 'N/A')}μg/L")
             if buoy.get('pollution_event'):
                 logger.warning(f"  🚨 POLLUTION EVENT: {buoy['pollution_event']['type']} - {buoy['pollution_event']['severity']}")
             logger.info("  " + "-"*80)

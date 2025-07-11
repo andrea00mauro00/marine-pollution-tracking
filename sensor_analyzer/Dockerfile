@@ -18,7 +18,7 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 # 4. PyFlink and analysis libraries
 RUN pip3 install \
       apache-flink==1.17.0 \
-      numpy scipy scikit-learn \
+      numpy scipy scikit-learn==1.2.2 \
       kafka-python loguru python-dotenv \
       boto3 pandas
 

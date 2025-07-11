@@ -38,11 +38,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 ANALYZED_SENSOR_TOPIC = os.environ.get("ANALYZED_SENSOR_TOPIC", "analyzed_sensor_data")
 PROCESSED_IMAGERY_TOPIC = os.environ.get("PROCESSED_IMAGERY_TOPIC", "processed_imagery")
-POLLUTION_HOTSPOTS_TOPIC = os.environ.get("POLLUTION_HOTSPOTS_TOPIC", "pollution_hotspots")
-SENSOR_ALERTS_TOPIC = os.environ.get("SENSOR_ALERTS_TOPIC", "sensor_alerts")
+HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
+ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
 ANALYZED_DATA_TOPIC = os.environ.get("ANALYZED_DATA_TOPIC", "analyzed_data")
 
 # Spatial clustering parameters
@@ -107,10 +107,16 @@ class PollutionEventDetector(MapFunction):
                     logger.info(f"[DEBUG] Using location: {location}")
                 elif "metadata" in data and isinstance(data["metadata"], dict):
                     metadata = data["metadata"]
-                    if "lat" in metadata and "lon" in metadata:
+                    if "latitude" in metadata and "longitude" in metadata:
                         location = {
-                            "lat": metadata["lat"], 
-                            "lon": metadata["lon"]
+                            "latitude": metadata["latitude"], 
+                            "longitude": metadata["longitude"]
+                        }
+                        logger.info(f"[DEBUG] Using metadata location: {location}")
+                    elif "lat" in metadata and "lon" in metadata:
+                        location = {
+                            "latitude": metadata["lat"], 
+                            "longitude": metadata["lon"]
                         }
                         logger.info(f"[DEBUG] Using metadata location: {location}")
                 elif "pollution_detection" in data and "spectral_analysis" in data:
@@ -118,8 +124,8 @@ class PollutionEventDetector(MapFunction):
                         bands = data["spectral_analysis"]["processed_bands"]
                         if bands and "lat" in bands[0] and "lon" in bands[0]:
                             location = {
-                                "lat": bands[0]["lat"],
-                                "lon": bands[0]["lon"]
+                                "latitude": bands[0]["lat"],
+                                "longitude": bands[0]["lon"]
                             }
                             logger.info(f"[DEBUG] Using processed_bands location: {location}")
             
@@ -182,19 +188,22 @@ class PollutionEventDetector(MapFunction):
                 return value
             
             # Normalize location format
-            lat = None
-            lon = None
-            if "lat" in location:
-                lat = location.get("lat")
-                lon = location.get("lon")
+            latitude = None
+            longitude = None
+            if "latitude" in location:
+                latitude = location.get("latitude")
+                longitude = location.get("longitude")
+            elif "center_latitude" in location:
+                latitude = location.get("center_latitude")
+                longitude = location.get("center_longitude")
             elif "center_lat" in location:
-                lat = location.get("center_lat")
-                lon = location.get("center_lon")
-            elif "latitude" in location:
-                lat = location.get("latitude")
-                lon = location.get("longitude")
+                latitude = location.get("center_lat")
+                longitude = location.get("center_lon")
+            elif "lat" in location:
+                latitude = location.get("lat")
+                longitude = location.get("lon")
             
-            if lat is None or lon is None:
+            if latitude is None or longitude is None:
                 logger.warning(f"[DEBUG] Invalid location coordinates for {source_type}: {location}")
                 return value
             
@@ -206,14 +215,14 @@ class PollutionEventDetector(MapFunction):
                 event_id = str(uuid.uuid4())
                 
                 # Find environmental region
-                region_id = self._get_environmental_region(lat, lon)
+                region_id = self._get_environmental_region(latitude, longitude)
                 
                 event_data = {
                     "event_id": event_id,
                     "timestamp": data.get("timestamp", int(time.time() * 1000)),
                     "location": {
-                        "lat": lat,
-                        "lon": lon
+                        "latitude": latitude,
+                        "longitude": longitude
                     },
                     "pollutant_type": pollutant_type,
                     "severity": severity,
@@ -230,7 +239,7 @@ class PollutionEventDetector(MapFunction):
                 
                 # Add event info to original data
                 data["pollution_event_detection"] = event_data
-                logger.info(f"[EVENT DETECTED] {source_type} pollution event at ({lat}, {lon}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
+                logger.info(f"[EVENT DETECTED] {source_type} pollution event at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
                 
                 # Force severity to high for testing if risk_score is sufficient
                 if risk_score >= HIGH_RISK_THRESHOLD and severity != "high":
@@ -246,12 +255,12 @@ class PollutionEventDetector(MapFunction):
             traceback.print_exc()
             return value
     
-    def _get_environmental_region(self, lat, lon):
+    def _get_environmental_region(self, latitude, longitude):
         """Determine which environmental region contains the coordinates"""
         for region_id, region_data in ENVIRONMENTAL_REGIONS.items():
             bounds = region_data["bounds"]
-            if (bounds["lat_min"] <= lat <= bounds["lat_max"] and
-                bounds["lon_min"] <= lon <= bounds["lon_max"]):
+            if (bounds["lat_min"] <= latitude <= bounds["lat_max"] and
+                bounds["lon_min"] <= longitude <= bounds["lon_max"]):
                 return region_id
         
         # Default if no specific region matches
@@ -275,14 +284,14 @@ class AlertExtractor(MapFunction):
                 
                 # Extract location for logging
                 location = event_detection.get("location", {})
-                lat = location.get("lat", "unknown")
-                lon = location.get("lon", "unknown")
+                latitude = location.get("latitude", "unknown")
+                longitude = location.get("longitude", "unknown")
                 
                 logger.info(f"[ALERT CHECK] Checking event: severity={severity}, risk={risk_score}, source={source_type}")
                 
                 # Check severity - if medium or high, this is an alert
                 if severity in ["medium", "high"]:
-                    logger.info(f"[ALERT GENERATED] {source_type} alert at ({lat}, {lon}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
+                    logger.info(f"[ALERT GENERATED] {source_type} alert at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
                     return value
                 else:
                     logger.info(f"[ALERT FILTERED] Event severity '{severity}' not high enough for alert")
@@ -296,14 +305,14 @@ class AlertExtractor(MapFunction):
                 
                 # Extract location for logging
                 location = data.get("location", {})
-                lat = location.get("center_lat", "unknown")
-                lon = location.get("center_lon", "unknown")
+                latitude = location.get("center_latitude", location.get("center_lat", "unknown"))
+                longitude = location.get("center_longitude", location.get("center_lon", "unknown"))
                 
                 logger.info(f"[ALERT CHECK] Checking hotspot: severity={severity}, avg_risk={avg_risk}")
                 
                 # Check severity - if medium or high, this is an alert
                 if severity in ["medium", "high"]:
-                    logger.info(f"[ALERT GENERATED] Hotspot alert at ({lat}, {lon}): {pollutant_type}, severity: {severity}, avg_risk: {avg_risk}")
+                    logger.info(f"[ALERT GENERATED] Hotspot alert at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, avg_risk: {avg_risk}")
                     return value
                 else:
                     logger.info(f"[ALERT FILTERED] Hotspot severity '{severity}' not high enough for alert")
@@ -383,8 +392,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             point_data = {
                 "event_id": event_id,
                 "timestamp": timestamp,
-                "lat": location["lat"],
-                "lon": location["lon"],
+                "latitude": location["latitude"],
+                "longitude": location["longitude"],
                 "risk_score": risk_score,
                 "pollutant_type": pollutant_type,
                 "source_type": source_type,
@@ -529,8 +538,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             "cluster_id": 999,  # Special ID for test hotspots
             "detected_at": int(time.time() * 1000),
             "location": {
-                "center_lat": point["lat"],
-                "center_lon": point["lon"],
+                "center_latitude": point["latitude"],
+                "center_longitude": point["longitude"],
                 "radius_km": 1.0  # Small radius for single point
             },
             "pollutant_type": point["pollutant_type"],
@@ -564,7 +573,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                 
                 # Calculate distance
                 distance = self._haversine_distance(
-                    point["lat"], point["lon"], p["lat"], p["lon"])
+                    point["latitude"], point["longitude"], 
+                    p["latitude"], p["longitude"])
                 
                 # Calculate time difference in hours
                 time_diff = abs(point["timestamp"] - p["timestamp"]) / (1000 * 60 * 60)
@@ -619,8 +629,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
     def _analyze_cluster(self, cluster_id, points):
         """Calculate cluster characteristics"""
         # Extract coordinates
-        lats = [p["lat"] for p in points]
-        lons = [p["lon"] for p in points]
+        latitudes = [p["latitude"] for p in points]
+        longitudes = [p["longitude"] for p in points]
         risks = [p["risk_score"] for p in points]
         timestamps = [p["timestamp"] for p in points]
         
@@ -639,12 +649,12 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         dominant_pollutant = max(pollutant_counts.items(), key=lambda x: x[1])[0]
         
         # Calculate centroid
-        center_lat = sum(lats) / len(lats)
-        center_lon = sum(lons) / len(lons)
+        center_latitude = sum(latitudes) / len(latitudes)
+        center_longitude = sum(longitudes) / len(longitudes)
         
         # Calculate radius (95th percentile of distances)
-        distances = [self._haversine_distance(center_lat, center_lon, lat, lon) 
-                    for lat, lon in zip(lats, lons)]
+        distances = [self._haversine_distance(center_latitude, center_longitude, lat, lon) 
+                    for lat, lon in zip(latitudes, longitudes)]
         distances.sort()
         radius_km = distances[min(len(distances) - 1, int(len(distances) * 0.95))]
         
@@ -667,8 +677,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             "cluster_id": cluster_id,
             "detected_at": int(time.time() * 1000),
             "location": {
-                "center_lat": center_lat,
-                "center_lon": center_lon,
+                "center_latitude": center_latitude,
+                "center_longitude": center_longitude,
                 "radius_km": radius_km
             },
             "pollutant_type": dominant_pollutant,
@@ -768,7 +778,7 @@ def wait_for_services():
     for i in range(10):
         try:
             from kafka.admin import KafkaAdminClient
-            admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_SERVERS)
+            admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
             admin_client.list_topics()
             kafka_ready = True
             logger.info("Kafka is ready")
@@ -797,7 +807,7 @@ def main():
     
     # Set up Kafka properties
     properties = {
-        'bootstrap.servers': KAFKA_SERVERS,
+        'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
         'group.id': 'pollution_detector_group'
     }
     
@@ -820,13 +830,13 @@ def main():
     
     # Create Kafka producers
     hotspot_producer = FlinkKafkaProducer(
-        topic=POLLUTION_HOTSPOTS_TOPIC,
+        topic=HOTSPOTS_TOPIC,
         serialization_schema=SimpleStringSchema(),
         producer_config=properties
     )
     
     alert_producer = FlinkKafkaProducer(
-        topic=SENSOR_ALERTS_TOPIC,
+        topic=ALERTS_TOPIC,
         serialization_schema=SimpleStringSchema(),
         producer_config=properties
     )
