@@ -3,10 +3,11 @@
 Marine Pollution Monitoring System - ML Prediction Engine
 ==============================================================================
 This job:
-1. Consumes analyzed sensor data and processed imagery from Kafka
+1. Consumes pollution hotspots from Kafka
 2. Applies fluid dynamics models to predict pollution spread
-3. Generates 6/12/24/48-hour forecasts for pollution movement
-4. Publishes predictions to pollution_predictions topic
+3. Evaluates environmental impact and transformation over time
+4. Generates 6/12/24/48-hour forecasts with cleanup recommendations
+5. Publishes comprehensive predictions to pollution_predictions topic
 """
 
 import os
@@ -15,6 +16,7 @@ import json
 import time
 import uuid
 import math
+import traceback
 import random
 import numpy as np
 from datetime import datetime, timedelta
@@ -40,8 +42,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-ANALYZED_SENSOR_TOPIC = os.environ.get("ANALYZED_SENSOR_TOPIC", "analyzed_sensor_data")
-PROCESSED_IMAGERY_TOPIC = os.environ.get("PROCESSED_IMAGERY_TOPIC", "processed_imagery")
+HOTSPOTS_TOPIC = os.environ.get("POLLUTION_HOTSPOTS_TOPIC", "pollution_hotspots")
 PREDICTIONS_TOPIC = os.environ.get("PREDICTIONS_TOPIC", "pollution_predictions")
 
 # Pollutant physical properties for diffusion modeling
@@ -52,7 +53,10 @@ POLLUTANT_PROPERTIES = {
         "evaporation_rate": 0.3, # fraction per day
         "diffusion_coef": 0.5,   # m²/s
         "degradation_rate": 0.05,# fraction per day
-        "water_solubility": 0.01 # g/L
+        "water_solubility": 0.01,# g/L
+        "wind_influence": 0.7,   # High wind influence
+        "current_influence": 0.5,# Medium current influence
+        "cleanup_methods": ["containment_boom", "skimmer", "dispersant", "burning"]
     },
     "chemical_discharge": {
         "density": 1100,         # kg/m³
@@ -60,23 +64,10 @@ POLLUTANT_PROPERTIES = {
         "evaporation_rate": 0.1, # fraction per day
         "diffusion_coef": 1.2,   # m²/s
         "degradation_rate": 0.02,# fraction per day
-        "water_solubility": 100  # g/L (high for most chemicals)
-    },
-    "sewage": {
-        "density": 1020,         # kg/m³
-        "viscosity": 5,          # cSt
-        "evaporation_rate": 0.01,# fraction per day
-        "diffusion_coef": 0.8,   # m²/s
-        "degradation_rate": 0.2, # fraction per day (biological)
-        "water_solubility": 50   # g/L
-    },
-    "agricultural_runoff": {
-        "density": 1050,         # kg/m³
-        "viscosity": 3,          # cSt
-        "evaporation_rate": 0.05,# fraction per day
-        "diffusion_coef": 1.0,   # m²/s
-        "degradation_rate": 0.1, # fraction per day
-        "water_solubility": 30   # g/L
+        "water_solubility": 100, # g/L (high for most chemicals)
+        "wind_influence": 0.3,   # Low wind influence
+        "current_influence": 0.7,# High current influence
+        "cleanup_methods": ["neutralization", "extraction", "activated_carbon", "biodegradation"]
     },
     "algal_bloom": {
         "density": 1010,         # kg/m³
@@ -84,23 +75,43 @@ POLLUTANT_PROPERTIES = {
         "evaporation_rate": 0.0, # fraction per day
         "diffusion_coef": 0.3,   # m²/s
         "degradation_rate": -0.2,# negative = growth rate
-        "water_solubility": 100  # g/L
+        "water_solubility": 100, # g/L
+        "wind_influence": 0.2,   # Low wind influence
+        "current_influence": 0.4,# Medium current influence
+        "cleanup_methods": ["aeration", "algaecide", "nutrient_management", "ultrasonic"]
     },
-    "plastic_pollution": {
-        "density": 920,          # kg/m³ (varies widely)
-        "viscosity": 0,          # cSt (solid)
-        "evaporation_rate": 0.0, # fraction per day
-        "diffusion_coef": 0.1,   # m²/s
-        "degradation_rate": 0.0001, # fraction per day (very slow)
-        "water_solubility": 0.0  # g/L
+    "sewage": {
+        "density": 1020,         # kg/m³
+        "viscosity": 5,          # cSt
+        "evaporation_rate": 0.01,# fraction per day
+        "diffusion_coef": 0.8,   # m²/s
+        "degradation_rate": 0.2, # fraction per day (biological)
+        "water_solubility": 50,  # g/L
+        "wind_influence": 0.2,   # Low wind influence
+        "current_influence": 0.6,# Medium-high current influence
+        "cleanup_methods": ["biological_treatment", "disinfection", "filtration"]
     },
-    "sediment": {
-        "density": 1800,         # kg/m³
-        "viscosity": 0,          # cSt (solid)
-        "evaporation_rate": 0.0, # fraction per day
-        "diffusion_coef": 0.2,   # m²/s
-        "degradation_rate": 0.001, # fraction per day
-        "water_solubility": 0.5  # g/L
+    "agricultural_runoff": {
+        "density": 1050,         # kg/m³
+        "viscosity": 3,          # cSt
+        "evaporation_rate": 0.05,# fraction per day
+        "diffusion_coef": 1.0,   # m²/s
+        "degradation_rate": 0.1, # fraction per day
+        "water_solubility": 30,  # g/L
+        "wind_influence": 0.2,   # Low wind influence
+        "current_influence": 0.7,# High current influence
+        "cleanup_methods": ["wetland_filtration", "buffer_zones", "phytoremediation"]
+    },
+    "unknown": {
+        "density": 1000,         # kg/m³
+        "viscosity": 10,         # cSt
+        "evaporation_rate": 0.1, # fraction per day
+        "diffusion_coef": 0.7,   # m²/s
+        "degradation_rate": 0.1, # fraction per day
+        "water_solubility": 50,  # g/L
+        "wind_influence": 0.4,   # Medium wind influence
+        "current_influence": 0.6,# Medium current influence
+        "cleanup_methods": ["containment", "monitoring", "assessment"]
     }
 }
 
@@ -226,426 +237,489 @@ SEASONAL_WIND_PATTERNS = {
     }
 }
 
-class PollutionEventDetector(MapFunction):
+# Environmental impact factors by ecosystem type
+ECOSYSTEM_SENSITIVITY = {
+    "open_water": {
+        "sensitivity": 0.5,           # Medium sensitivity
+        "recovery_rate": 0.2,         # 20% recovery per month
+        "economic_impact_factor": 0.3 # Lower economic impact
+    },
+    "wetland": {
+        "sensitivity": 0.9,           # Very high sensitivity
+        "recovery_rate": 0.05,        # 5% recovery per month
+        "economic_impact_factor": 0.7 # High economic impact
+    },
+    "beach": {
+        "sensitivity": 0.7,           # High sensitivity
+        "recovery_rate": 0.1,         # 10% recovery per month
+        "economic_impact_factor": 0.9 # Very high economic impact (tourism)
+    },
+    "oyster_bed": {
+        "sensitivity": 0.8,           # High sensitivity
+        "recovery_rate": 0.03,        # 3% recovery per month
+        "economic_impact_factor": 0.8 # High economic impact (fisheries)
+    },
+    "estuary": {
+        "sensitivity": 0.8,           # High sensitivity
+        "recovery_rate": 0.07,        # 7% recovery per month
+        "economic_impact_factor": 0.6 # Medium-high economic impact
+    }
+}
+
+class PollutionSpreadPredictor(MapFunction):
     """
-    Detects pollution events from analyzed sensor and imagery data
+    Predicts the spread of detected pollution hotspots using fluid dynamics models
+    and provides impact assessment and cleanup recommendations
     """
     
     def __init__(self):
-        # Initialize pollution event history
-        self.events = {}
-        # Risk threshold for pollution event declaration
-        self.risk_threshold = 0.5
-    
+        self.prediction_intervals = [6, 12, 24, 48]  # Hours to predict ahead
+        
     def map(self, value):
         try:
-            # Parse input data
-            data = json.loads(value)
-            source_type = data.get("source_type")
+            # Parse hotspot data
+            hotspot = json.loads(value)
             
-            # Extract location info and pollution analysis
-            location = data.get("location", {})
+            # Extract key information
+            hotspot_id = hotspot.get("hotspot_id")
+            location = hotspot.get("location", {})
+            pollutant_type = hotspot.get("pollutant_type", "unknown")
+            severity = hotspot.get("severity", "low")
+            risk_score = hotspot.get("avg_risk_score", 0.5)
+            timestamp = hotspot.get("detected_at", int(time.time() * 1000))
             
-            if source_type == "buoy":
-                pollution_analysis = data.get("pollution_analysis", {})
-            elif source_type == "satellite":
-                # For satellite, extract from spectral analysis
-                spectral_analysis = data.get("spectral_analysis", {})
-                pollution_indicators = spectral_analysis.get("pollution_indicators", {})
-                
-                # Calculate risk score based on indicators
-                risk_score = 0.0
-                if pollution_indicators.get("dark_patches", False):
-                    risk_score += 0.4
-                if pollution_indicators.get("unusual_coloration", False):
-                    risk_score += 0.3
-                if pollution_indicators.get("spectral_anomalies", False):
-                    risk_score += 0.3
-                
-                # Determine pollutant type
-                pollutant_type = "unknown"
-                if pollution_indicators.get("dark_patches", False):
-                    pollutant_type = "oil_spill"
-                elif pollution_indicators.get("unusual_coloration", False):
-                    if spectral_analysis.get("rgb_averages", {}).get("g", 0) > spectral_analysis.get("rgb_averages", {}).get("b", 0):
-                        pollutant_type = "algal_bloom"
-                    else:
-                        pollutant_type = "chemical_discharge"
-                
-                # Construct pollution analysis
-                pollution_analysis = {
-                    "risk_score": risk_score,
-                    "pollutant_type": pollutant_type,
-                    "level": "high" if risk_score > 0.7 else "medium" if risk_score > 0.4 else "low"
-                }
-            else:
-                # Skip unknown source types
-                return value
+            # Skip invalid hotspots
+            if not hotspot_id or not location:
+                logger.warning(f"Skipping invalid hotspot: {value[:100]}...")
+                return None
             
-            # Skip if location info is insufficient
-            if not location or ("lat" not in location and "center_lat" not in location):
-                return value
+            # Extract coordinates and radius
+            center_lat = location.get("center_lat")
+            center_lon = location.get("center_lon")
+            radius_km = location.get("radius_km", 1.0)
             
-            # Normalize location format
-            lat = location.get("lat") or location.get("center_lat")
-            lon = location.get("lon") or location.get("center_lon")
+            if center_lat is None or center_lon is None:
+                logger.warning(f"Skipping hotspot without valid coordinates: {hotspot_id}")
+                return None
             
-            if lat is None or lon is None:
-                return value
+            # Get environmental conditions
+            env_ref = hotspot.get("environmental_reference", {})
+            region_id = env_ref.get("region_id", "default_region")
             
-            # Check for pollution event
-            risk_score = pollution_analysis.get("risk_score", 0.0)
+            # Get current and wind patterns
+            current_pattern = self._get_current_pattern(center_lat, center_lon, region_id)
+            wind_pattern = self._get_wind_pattern(region_id)
             
-            # If risk score exceeds threshold, create event data
-            if risk_score >= self.risk_threshold:
-                event_id = str(uuid.uuid4())
-                pollutant_type = pollution_analysis.get("pollutant_type", "unknown")
-                severity = pollution_analysis.get("level", "low")
-                
-                event_data = {
-                    "event_id": event_id,
-                    "timestamp": data.get("timestamp", int(time.time() * 1000)),
-                    "location": {
-                        "lat": lat,
-                        "lon": lon
+            # Identify local ecosystem types
+            ecosystem_types = self._identify_ecosystem_types(center_lat, center_lon, radius_km)
+            
+            # Generate predictions
+            prediction_set_id = str(uuid.uuid4())
+            predictions = []
+            
+            # Generate predictions for each time interval
+            for hours in self.prediction_intervals:
+                prediction = self._generate_prediction(
+                    center_lat, center_lon, radius_km, pollutant_type,
+                    risk_score, current_pattern, wind_pattern,
+                    hours, timestamp, severity, ecosystem_types
+                )
+                predictions.append(prediction)
+            
+            # Create full prediction output
+            output = {
+                "prediction_set_id": prediction_set_id,
+                "hotspot_id": hotspot_id,
+                "pollutant_type": pollutant_type,
+                "severity": severity,
+                "generated_at": int(time.time() * 1000),
+                "source_location": {
+                    "lat": center_lat,
+                    "lon": center_lon,
+                    "radius_km": radius_km
+                },
+                "environmental_conditions": {
+                    "current": {
+                        "pattern": current_pattern["name"],
+                        "speed": current_pattern["speed"],
+                        "direction": current_pattern["direction"]
                     },
-                    "pollutant_type": pollutant_type,
-                    "severity": severity,
-                    "risk_score": risk_score,
-                    "detection_source": source_type
-                }
-                
-                # Store in event history for tracking
-                self.events[event_id] = event_data
-                
-                # Add event info to original data
-                data["pollution_event_detection"] = event_data
-                logger.info(f"Detected pollution event at ({lat}, {lon}): {pollutant_type}")
+                    "wind": {
+                        "speed": wind_pattern["speed"],
+                        "direction": wind_pattern["direction"]
+                    },
+                    "ecosystem_types": list(ecosystem_types.keys())
+                },
+                "predictions": predictions
+            }
             
-            return json.dumps(data)
+            logger.info(f"Generated prediction {prediction_set_id} for hotspot {hotspot_id}")
+            
+            return json.dumps(output)
             
         except Exception as e:
-            logger.error(f"Error in pollution event detection: {e}")
-            return value
-
-class PollutionSpreadPredictor(KeyedProcessFunction):
-    """
-    Predicts the spread of detected pollution events using fluid dynamics models
-    and environmental conditions.
-    """
-    
-    def __init__(self):
-        self.state = None
-        self.event_state = None
-        self.prediction_window = 48  # Hours to predict ahead
-        self.prediction_intervals = [6, 12, 24, 48]  # Hours
-        self.EARTH_RADIUS_KM = 6371.0  # Earth radius in km
-    
-    def open(self, runtime_context):
-        """Initialize state descriptors"""
-        # State for storing event data
-        event_state_descriptor = ValueStateDescriptor(
-            "event_data",
-            Types.STRING()
-        )
-        self.event_state = runtime_context.get_state(event_state_descriptor)
-        
-        # State for storing all active events
-        active_events_descriptor = MapStateDescriptor(
-            "active_events",
-            Types.STRING(),
-            Types.STRING()
-        )
-        self.active_events = runtime_context.get_map_state(active_events_descriptor)
-    
-    def process_element(self, value, ctx):
-        try:
-            # Parse JSON
-            data = json.loads(value)
-            
-            # Check if this data has pollution event detection
-            event_detection = data.get("pollution_event_detection")
-            if not event_detection:
-                return  # Skip if no event detected
-            
-            # Extract event data
-            event_id = event_detection.get("event_id")
-            timestamp = event_detection.get("timestamp", int(time.time() * 1000))
-            location = event_detection.get("location", {})
-            pollutant_type = event_detection.get("pollutant_type", "unknown")
-            severity = event_detection.get("severity", "minor")
-            risk_score = event_detection.get("risk_score", 0.5)
-            
-            # Skip if missing critical data
-            if not event_id or not location or "lat" not in location or "lon" not in location:
-                return
-            
-            # Get lat/lon coordinates
-            lat = location.get("lat")
-            lon = location.get("lon")
-            
-            # Get current state for this event
-            event_data_json = self.event_state.value()
-            
-            if event_data_json:
-                # Update existing event data
-                event_data = json.loads(event_data_json)
-                
-                # Update event data with new information
-                event_data["last_updated"] = timestamp
-                event_data["risk_score"] = max(event_data["risk_score"], risk_score)
-                event_data["severity"] = severity if risk_score > event_data["risk_score"] else event_data["severity"]
-                
-                # Add observation to history
-                event_data["observations"].append({
-                    "timestamp": timestamp,
-                    "location": {
-                        "lat": lat,
-                        "lon": lon
-                    },
-                    "risk_score": risk_score,
-                    "source_type": data.get("source_type")
-                })
-                
-                # Update state
-                self.event_state.update(json.dumps(event_data))
-                
-                # Register event in active events if not already there
-                if not self._is_event_active(event_id):
-                    self.active_events.put(event_id, json.dumps({"last_updated": timestamp}))
-                
-                # Generate spread prediction
-                prediction_data = self._predict_spread(event_data, timestamp)
-                
-                # Output prediction
-                yield json.dumps(prediction_data)
-            else:
-                # Create new event data
-                event_data = {
-                    "event_id": event_id,
-                    "pollutant_type": pollutant_type,
-                    "severity": severity,
-                    "risk_score": risk_score,
-                    "created_at": timestamp,
-                    "last_updated": timestamp,
-                    "initial_location": {
-                        "lat": lat,
-                        "lon": lon
-                    },
-                    "observations": [{
-                        "timestamp": timestamp,
-                        "location": {
-                            "lat": lat,
-                            "lon": lon
-                        },
-                        "risk_score": risk_score,
-                        "source_type": data.get("source_type")
-                    }]
-                }
-                
-                # Update state
-                self.event_state.update(json.dumps(event_data))
-                
-                # Register event in active events
-                self.active_events.put(event_id, json.dumps({"last_updated": timestamp}))
-                
-                # Generate initial spread prediction
-                prediction_data = self._predict_spread(event_data, timestamp)
-                
-                # Output prediction
-                yield json.dumps(prediction_data)
-        except Exception as e:
-            logger.error(f"Error in pollution spread prediction: {e}")
+            logger.error(f"Error in pollution prediction: {e}")
             logger.error(traceback.format_exc())
+            return None
     
-    def _is_event_active(self, event_id):
-        """Check if event is in active events map"""
+    def _generate_prediction(self, lat, lon, radius_km, pollutant_type, 
+                            risk_score, current, wind, hours, timestamp, 
+                            severity, ecosystem_types):
+        """
+        Generate a comprehensive prediction for a pollution event at a specific time interval
+        """
         try:
-            return self.active_events.contains(event_id)
-        except Exception:
-            return False
-    
-    def _predict_spread(self, event_data, current_timestamp):
-        """
-        Predict pollution spread using a combination of models:
-        1. Lagrangian transport model (particle tracking)
-        2. Diffusion-based spreading
-        3. Wind and current influence
-        """
-        # Create prediction set
-        prediction_set_id = str(uuid.uuid4())
-        
-        # Get the initial location and pollutant type
-        initial_lat = event_data["initial_location"]["lat"]
-        initial_lon = event_data["initial_location"]["lon"]
-        pollutant_type = event_data["pollutant_type"]
-        risk_score = event_data["risk_score"]
-        severity = event_data["severity"]
-        
-        # Get pollutant properties
-        pollutant_props = POLLUTANT_PROPERTIES.get(pollutant_type, POLLUTANT_PROPERTIES["sediment"])
-        
-        # Determine initial radius based on severity
-        if severity == "major" or severity == "high":
-            initial_radius_km = 5.0
-        elif severity == "moderate" or severity == "medium":
-            initial_radius_km = 3.0
-        else:
-            initial_radius_km = 1.5
-        
-        # Calculate initial affected area
-        initial_area_km2 = math.pi * initial_radius_km * initial_radius_km
-        
-        # Get environmental conditions for the area
-        current_pattern = self._get_current_pattern(initial_lat, initial_lon)
-        wind_pattern = self._get_wind_pattern()
-        
-        # Generate predictions for different time intervals
-        predictions = []
-        for hours in self.prediction_intervals:
-            # Predict spread using Lagrangian transport model
-            prediction = self._lagrangian_transport_model(
-                initial_lat, initial_lon, initial_radius_km,
-                pollutant_props, current_pattern, wind_pattern,
-                hours, current_timestamp
+            # Get pollutant properties
+            props = POLLUTANT_PROPERTIES.get(pollutant_type, POLLUTANT_PROPERTIES["unknown"])
+            
+            # Extract key properties for easier access
+            wind_influence = props.get("wind_influence", 0.5)
+            current_influence = props.get("current_influence", 0.5)
+            diffusion_coef = props.get("diffusion_coef", 0.7)
+            degradation_rate = props.get("degradation_rate", 0.1)
+            evaporation_rate = props.get("evaporation_rate", 0.1)
+            viscosity = props.get("viscosity", 10)
+            density = props.get("density", 1000)
+            water_solubility = props.get("water_solubility", 10)
+            cleanup_methods = props.get("cleanup_methods", ["containment", "monitoring"])
+            
+            # 1. Calculate movement due to current (advection)
+            # Convert direction to radians
+            current_dir_rad = math.radians(current["direction"])
+            
+            # Distance moved by current
+            current_speed_kmh = current["speed"] * 3.6  # Convert m/s to km/h
+            current_distance = current_speed_kmh * hours * current_influence
+            
+            # Current-driven movement
+            lat_km_per_degree = 111.32
+            lon_km_per_degree = 111.32 * math.cos(math.radians(lat))
+            
+            current_lat_change = (current_distance * math.cos(current_dir_rad)) / lat_km_per_degree
+            current_lon_change = (current_distance * math.sin(current_dir_rad)) / lon_km_per_degree
+            
+            # 2. Calculate movement due to wind (for surface pollution)
+            wind_dir_rad = math.radians(wind["direction"])
+            wind_speed_kmh = wind["speed"] * 3.6  # Convert m/s to km/h
+            
+            # Wind drift (typically 3% of wind speed for surface materials)
+            wind_drift_factor = 0.03 * wind_influence
+            wind_distance = wind_speed_kmh * hours * wind_drift_factor
+            
+            wind_lat_change = (wind_distance * math.cos(wind_dir_rad)) / lat_km_per_degree
+            wind_lon_change = (wind_distance * math.sin(wind_dir_rad)) / lon_km_per_degree
+            
+            # 3. Combine movements for new position
+            new_lat = lat + current_lat_change + wind_lat_change
+            new_lon = lon + current_lon_change + wind_lon_change
+            
+            # 4. Calculate radius growth due to diffusion
+            # Diffusion causes radial growth proportional to square root of time
+            diffusion_growth = diffusion_coef * math.sqrt(hours * 3600)  # m
+            diffusion_growth_km = diffusion_growth / 1000  # km
+            
+            # Apply viscosity factor (higher viscosity = slower spread)
+            viscosity_factor = 1.0 / (1.0 + (viscosity / 50.0))
+            
+            # Total new radius combining initial radius and diffusion
+            new_radius_km = radius_km + (diffusion_growth_km * viscosity_factor)
+            
+            # 5. Apply degradation/growth to radius
+            if degradation_rate >= 0:
+                # Degradation (shrinking)
+                degradation_factor = 1.0 - (degradation_rate * hours / 24)
+                degradation_factor = max(0.1, degradation_factor)  # Never shrink below 10%
+            else:
+                # Growth (expansion) - for algal blooms
+                growth_rate = abs(degradation_rate)
+                degradation_factor = 1.0 + (growth_rate * hours / 24)
+                degradation_factor = min(3.0, degradation_factor)  # Cap growth at 3x
+            
+            new_radius_km *= degradation_factor
+            
+            # 6. Calculate new affected area
+            new_area_km2 = math.pi * new_radius_km * new_radius_km
+            
+            # 7. Calculate concentration changes
+            # Base concentration (100% at start)
+            initial_concentration = 1.0
+            
+            # Apply degradation and evaporation
+            remaining_fraction = (1.0 - (degradation_rate * hours / 24)) if degradation_rate >= 0 else (1.0 + (abs(degradation_rate) * hours / 24))
+            remaining_fraction = max(0.01, min(3.0, remaining_fraction))
+            
+            evaporated_fraction = min(1.0, evaporation_rate * hours / 24)
+            dissolved_fraction = min(1.0 - evaporated_fraction, water_solubility / 1000 * hours / 24)
+            
+            # Adjust for growth in case of algal bloom
+            if pollutant_type == "algal_bloom" and degradation_rate < 0:
+                # Algal blooms grow rather than degrade
+                surface_fraction = min(1.0, remaining_fraction)
+                evaporated_fraction = 0
+                dissolved_fraction = 0
+            else:
+                # Normal pollutants divide between surface, evaporated, and dissolved
+                surface_fraction = max(0, 1.0 - evaporated_fraction - dissolved_fraction)
+            
+            # 8. Calculate environmental impact
+            environmental_score = self._calculate_environmental_impact(
+                pollutant_type, 
+                risk_score,
+                new_area_km2, 
+                surface_fraction,
+                hours,
+                ecosystem_types
             )
             
-            predictions.append(prediction)
-        
-        # Create full prediction data
-        prediction_data = {
-            "prediction_set_id": prediction_set_id,
-            "event_id": event_data["event_id"],
-            "pollutant_type": pollutant_type,
-            "severity": severity,
-            "generated_at": current_timestamp,
-            "source_location": {
-                "lat": initial_lat,
-                "lon": initial_lon,
-                "radius_km": initial_radius_km,
-                "area_km2": initial_area_km2
-            },
-            "environmental_conditions": {
-                "current_pattern": current_pattern["name"],
-                "current_speed": current_pattern["speed"],
-                "current_direction": current_pattern["direction"],
-                "wind_speed": wind_pattern["speed"],
-                "wind_direction": wind_pattern["direction"]
-            },
-            "predictions": predictions
-        }
-        
-        logger.info(f"Generated spread prediction {prediction_set_id} for pollutant {pollutant_type}")
-        return prediction_data
-    
-    def _lagrangian_transport_model(self, lat, lon, radius_km, pollutant_props, current, wind, hours, timestamp):
-        """
-        Simulate pollutant transport using a simplified Lagrangian model
-        that combines advection, diffusion, and degradation processes.
-        """
-        # Extract properties
-        density = pollutant_props["density"]
-        viscosity = pollutant_props["viscosity"]
-        evaporation_rate = pollutant_props["evaporation_rate"]
-        diffusion_coef = pollutant_props["diffusion_coef"]
-        degradation_rate = pollutant_props["degradation_rate"]
-        water_solubility = pollutant_props["water_solubility"]
-        
-        # Calculate movement due to currents (advection)
-        # Convert current direction from degrees to radians
-        current_dir_rad = math.radians(current["direction"])
-        
-        # Distance moved by current in km
-        current_distance = current["speed"] * 3.6 * hours  # Convert m/s to km/hour and multiply by hours
-        
-        # Calculate new position due to current
-        # 111.32 km per degree latitude, longitude depends on latitude
-        lat_km_per_degree = 111.32
-        lon_km_per_degree = 111.32 * math.cos(math.radians(lat))
-        
-        # Current-driven movement
-        current_lat_change = (current_distance * math.cos(current_dir_rad)) / lat_km_per_degree
-        current_lon_change = (current_distance * math.sin(current_dir_rad)) / lon_km_per_degree
-        
-        # Wind effect (only for surface pollution)
-        # Wind has reduced effect based on pollutant density (heavier = less effect)
-        wind_influence = max(0, 1 - (density / 1500))  # Normalize: 0 for heavy, 1 for light
-        
-        # Apply wind drift (typically 3% of wind speed for surface material)
-        wind_drift_factor = 0.03 * wind_influence
-        wind_dir_rad = math.radians(wind["direction"])
-        wind_distance = wind["speed"] * 3.6 * hours * wind_drift_factor  # km
-        
-        # Wind-driven movement
-        wind_lat_change = (wind_distance * math.cos(wind_dir_rad)) / lat_km_per_degree
-        wind_lon_change = (wind_distance * math.sin(wind_dir_rad)) / lon_km_per_degree
-        
-        # Combine current and wind effects for final position
-        new_lat = lat + current_lat_change + wind_lat_change
-        new_lon = lon + current_lon_change + wind_lon_change
-        
-        # Calculate spread radius due to diffusion
-        # Diffusion causes radial growth proportional to square root of time
-        diffusion_growth = diffusion_coef * math.sqrt(hours * 3600)  # m
-        diffusion_growth_km = diffusion_growth / 1000  # km
-        
-        # Apply growth factor based on viscosity (higher viscosity = slower spread)
-        viscosity_factor = 1.0 / (1.0 + (viscosity / 50.0))
-        
-        # Total new radius combining initial radius, diffusion, and viscosity effect
-        new_radius_km = radius_km + (diffusion_growth_km * viscosity_factor)
-        
-        # Apply degradation to radius (shrinking due to degradation/evaporation)
-        degradation_factor = 1.0 - (degradation_rate * hours / 24)  # daily rate adjusted to hours
-        degradation_factor = max(0.1, degradation_factor)  # Never shrink below 10%
-        
-        new_radius_km *= degradation_factor
-        
-        # Calculate new affected area
-        new_area_km2 = math.pi * new_radius_km * new_radius_km
-        
-        # Calculate confidence level (decreases with time)
-        base_confidence = 0.95  # Start with high confidence
-        time_decay = 0.005 * hours  # Lose 0.5% confidence per hour
-        confidence = max(0.5, base_confidence - time_decay)
-        
-        # Create prediction
-        prediction_time = timestamp + (hours * 3600 * 1000)  # hours to milliseconds
-        prediction_id = str(uuid.uuid4())
-        
-        return {
-            "prediction_id": prediction_id,
-            "hours_ahead": hours,
-            "prediction_time": prediction_time,
-            "location": {
-                "center_lat": new_lat,
-                "center_lon": new_lon,
-                "radius_km": new_radius_km
-            },
-            "predicted_area_km2": new_area_km2,
-            "confidence": confidence,
-            "transport_factors": {
-                "current_effect": {
-                    "distance_km": current_distance,
-                    "direction": current["direction"]
+            # 9. Determine remediation recommendations
+            cleanup_recommendations, priority_score, window_critical = self._generate_remediation_recommendations(
+                pollutant_type,
+                hours,
+                severity,
+                environmental_score,
+                surface_fraction,
+                cleanup_methods
+            )
+            
+            # 10. Calculate confidence (decreases with time)
+            base_confidence = 0.95
+            time_decay = 0.005 * hours  # Lose 0.5% confidence per hour
+            confidence = max(0.5, base_confidence - time_decay)
+            
+            # 11. Create prediction object
+            prediction_time = timestamp + (hours * 3600 * 1000)  # hours to milliseconds
+            
+            prediction = {
+                "hours_ahead": hours,
+                "prediction_time": prediction_time,
+                "location": {
+                    "lat": new_lat,
+                    "lon": new_lon,
+                    "radius_km": new_radius_km
                 },
-                "wind_effect": {
-                    "distance_km": wind_distance,
-                    "direction": wind["direction"],
-                    "surface_influence": wind_influence
+                "area_km2": new_area_km2,
+                "concentration": {
+                    "surface": surface_fraction,
+                    "dissolved": dissolved_fraction,
+                    "evaporated": evaporated_fraction
                 },
-                "diffusion": {
-                    "growth_km": diffusion_growth_km,
-                    "viscosity_factor": viscosity_factor
+                "impact": {
+                    "environmental_score": environmental_score,
+                    "severity": "high" if environmental_score > 0.7 else 
+                              "medium" if environmental_score > 0.4 else "low"
                 },
-                "degradation": {
-                    "factor": degradation_factor,
-                    "rate_per_day": degradation_rate
+                "remediation": {
+                    "priority_score": priority_score,
+                    "recommended_methods": cleanup_recommendations,
+                    "window_critical": window_critical,
+                    "time_sensitive": hours <= 24
+                },
+                "confidence": confidence,
+                "transport_factors": {
+                    "current_effect": {
+                        "distance_km": current_distance,
+                        "direction": current["direction"]
+                    },
+                    "wind_effect": {
+                        "distance_km": wind_distance,
+                        "direction": wind["direction"],
+                        "surface_influence": wind_influence
+                    },
+                    "diffusion": {
+                        "growth_km": diffusion_growth_km,
+                        "viscosity_factor": viscosity_factor
+                    },
+                    "degradation": {
+                        "factor": degradation_factor,
+                        "rate_per_day": degradation_rate
+                    }
                 }
             }
-        }
+            
+            return prediction
+            
+        except Exception as e:
+            logger.error(f"Error generating prediction: {e}")
+            # Return a minimal prediction to avoid breaking the pipeline
+            return {
+                "hours_ahead": hours,
+                "prediction_time": timestamp + (hours * 3600 * 1000),
+                "location": {"lat": lat, "lon": lon, "radius_km": radius_km},
+                "confidence": 0.5,
+                "error": str(e)
+            }
     
-    def _get_current_pattern(self, lat, lon):
+    def _calculate_environmental_impact(self, pollutant_type, risk_score, area_km2, 
+                                      surface_fraction, hours, ecosystem_types):
+        """Calculate environmental impact score based on multiple factors"""
+        # Base impact based on size and risk
+        base_impact = risk_score * (area_km2 / 10)  # Normalize by area (10 km² = moderate)
+        base_impact = min(1.0, base_impact)  # Cap at 1.0
+        
+        # Adjust for pollutant toxicity
+        toxicity_factors = {
+            "oil_spill": 0.9,
+            "chemical_discharge": 1.0,
+            "sewage": 0.7,
+            "agricultural_runoff": 0.6,
+            "algal_bloom": 0.8,
+            "plastic_pollution": 0.5,
+            "unknown": 0.7
+        }
+        
+        toxicity_factor = toxicity_factors.get(pollutant_type, 0.7)
+        
+        # Adjust for concentration (surface has higher immediate impact)
+        concentration_impact = surface_fraction * 0.8 + (1 - surface_fraction) * 0.4
+        
+        # Adjust for ecosystem sensitivity
+        ecosystem_impact = 0.0
+        total_weight = 0.0
+        
+        for ecosystem, weight in ecosystem_types.items():
+            sensitivity = ECOSYSTEM_SENSITIVITY.get(ecosystem, {}).get("sensitivity", 0.5)
+            ecosystem_impact += sensitivity * weight
+            total_weight += weight
+        
+        if total_weight > 0:
+            ecosystem_impact /= total_weight
+        else:
+            ecosystem_impact = 0.5  # Default medium impact
+        
+        # Combine factors
+        impact_score = base_impact * toxicity_factor * concentration_impact * (0.5 + ecosystem_impact/2)
+        
+        # Decrease impact with time due to natural recovery
+        time_factor = max(0.5, 1.0 - (hours / 200))  # Gradual decrease over time
+        
+        # Final impact score
+        final_impact = impact_score * time_factor
+        
+        # Ensure it's in the range 0-1
+        return min(1.0, max(0.0, final_impact))
+    
+    def _generate_remediation_recommendations(self, pollutant_type, hours, severity, 
+                                           environmental_score, surface_fraction,
+                                           available_methods):
+        """Generate recommendations for cleanup operations"""
+        # Filter methods based on time window
+        if hours <= 12:
+            # Early stage - focus on containment and immediate response
+            suitable_methods = [m for m in available_methods if m in 
+                               ["containment_boom", "skimmer", "dispersant", 
+                                "neutralization", "aeration"]]
+            window_critical = "high"
+        elif hours <= 24:
+            # Medium stage - balance between containment and treatment
+            suitable_methods = [m for m in available_methods if m not in 
+                               ["burning"]]  # Exclude most aggressive methods
+            window_critical = "medium"
+        else:
+            # Later stage - focus on treatment and recovery
+            suitable_methods = [m for m in available_methods if m in 
+                               ["biodegradation", "activated_carbon", "monitoring", 
+                                "wetland_filtration", "phytoremediation", 
+                                "nutrient_management"]]
+            window_critical = "low"
+        
+        # If no suitable methods, use all available
+        if not suitable_methods:
+            suitable_methods = available_methods
+        
+        # Calculate priority score
+        # Higher for high severity, high environmental impact, high surface fraction
+        priority_base = 0.0
+        if severity == "high":
+            priority_base = 0.8
+        elif severity == "medium":
+            priority_base = 0.5
+        else:
+            priority_base = 0.3
+        
+        # Adjust by environmental impact and surface visibility
+        priority_score = priority_base * (environmental_score * 0.7 + surface_fraction * 0.3)
+        
+        # Adjust by time criticality
+        if hours <= 12:
+            priority_score *= 1.2  # Increase priority for immediate response
+        elif hours > 36:
+            priority_score *= 0.8  # Decrease priority for delayed response
+        
+        # Cap at 1.0
+        priority_score = min(1.0, priority_score)
+        
+        # Select top 2-3 methods based on conditions
+        num_methods = 3 if priority_score > 0.7 else 2
+        recommended_methods = suitable_methods[:min(num_methods, len(suitable_methods))]
+        
+        return recommended_methods, priority_score, window_critical
+    
+    def _identify_ecosystem_types(self, lat, lon, radius_km):
+        """
+        Identify ecosystem types in the affected area
+        This is a simplified version - in production would use GIS data
+        """
+        # Simple rule-based identification based on location
+        # In a real system, this would query a GIS database
+        
+        # Create a map of ecosystem type to weight (0.0-1.0)
+        ecosystems = {}
+        
+        # Chesapeake Bay latitude ranges
+        # Upper Bay: 39.0-39.7
+        # Mid Bay: 38.0-39.0
+        # Lower Bay: 37.0-38.0
+        # Bay Mouth: 36.9-37.3
+        
+        # Latitude-based ecosystem estimation
+        if 36.9 <= lat <= 37.3:
+            # Bay mouth - mix of open water and beaches
+            ecosystems["open_water"] = 0.6
+            ecosystems["beach"] = 0.4
+        elif 37.0 <= lat <= 38.0:
+            # Lower bay - more open water, some wetlands and oyster beds
+            ecosystems["open_water"] = 0.7
+            ecosystems["oyster_bed"] = 0.2
+            ecosystems["wetland"] = 0.1
+        elif 38.0 <= lat <= 39.0:
+            # Mid bay - mix of open water and estuaries
+            ecosystems["open_water"] = 0.5
+            ecosystems["estuary"] = 0.5
+        elif 39.0 <= lat <= 39.7:
+            # Upper bay - more wetlands and estuaries
+            ecosystems["estuary"] = 0.6
+            ecosystems["wetland"] = 0.3
+            ecosystems["open_water"] = 0.1
+        else:
+            # Default to open water if outside Bay
+            ecosystems["open_water"] = 1.0
+        
+        # Longitude-based adjustments
+        # Eastern shore: -76.2 to -75.5 (more wetlands)
+        # Western shore: -77.0 to -76.2 (more developed, beaches)
+        
+        if -76.2 <= lon <= -75.5:
+            # Eastern shore - increase wetlands
+            if "wetland" in ecosystems:
+                ecosystems["wetland"] *= 1.5
+                # Normalize
+                total = sum(ecosystems.values())
+                ecosystems = {k: v/total for k, v in ecosystems.items()}
+        elif -77.0 <= lon <= -76.2:
+            # Western shore - increase beaches
+            if "beach" not in ecosystems:
+                ecosystems["beach"] = 0.2
+                # Reduce others proportionally
+                others_sum = sum(ecosystems.values())
+                ecosystems = {k: v * 0.8 for k, v in ecosystems.items()}
+                # Normalize
+                total = sum(ecosystems.values()) + 0.2
+                ecosystems = {k: v/total for k, v in ecosystems.items()}
+                ecosystems["beach"] = 0.2 / total
+        
+        return ecosystems
+    
+    def _get_current_pattern(self, lat, lon, region_id=None):
         """Determine the current pattern for a location"""
         # Find which region contains the point
         for name, pattern in CURRENT_PATTERNS.items():
@@ -678,7 +752,7 @@ class PollutionSpreadPredictor(KeyedProcessFunction):
             "speed": default_pattern["speed"][tide_type]
         }
     
-    def _get_wind_pattern(self):
+    def _get_wind_pattern(self, region_id=None):
         """Get current wind pattern based on season"""
         # Determine current season
         month = datetime.now().month
@@ -713,7 +787,7 @@ class PollutionSpreadPredictor(KeyedProcessFunction):
 
 def wait_for_services():
     """Wait for Kafka to be available"""
-    logger.info("Checking Kafka availability...")
+    logger.info("Waiting for Kafka and MinIO...")
     
     # Check Kafka
     kafka_ready = False
@@ -723,25 +797,23 @@ def wait_for_services():
             admin_client = KafkaAdminClient(bootstrap_servers=KAFKA_SERVERS)
             admin_client.list_topics()
             kafka_ready = True
-            logger.info("✅ Kafka is ready")
+            logger.info("Kafka is ready")
             break
         except Exception:
-            logger.info(f"⏳ Kafka not ready, attempt {i+1}/10")
+            logger.info(f"Waiting for Kafka... ({i+1}/10)")
             time.sleep(5)
     
     if not kafka_ready:
-        logger.error("❌ Kafka not available after multiple attempts")
+        logger.error("Kafka not available after multiple attempts")
     
     return kafka_ready
 
 def main():
     """Main function to set up and run the Flink job"""
-    logger.info("Starting ML Prediction Engine Job")
-    
-    # Wait for Kafka to be ready
+    # Wait for services to be ready
     wait_for_services()
     
-    # Create Flink execution environment
+    # Set up the execution environment
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
     env.set_parallelism(1)  # Set parallelism to 1 for simplicity
@@ -755,15 +827,9 @@ def main():
         'group.id': 'ml_prediction_group'
     }
     
-    # Create Kafka consumers for source topics
-    sensor_consumer = FlinkKafkaConsumer(
-        topics=ANALYZED_SENSOR_TOPIC,
-        deserialization_schema=SimpleStringSchema(),
-        properties=properties
-    )
-    
-    imagery_consumer = FlinkKafkaConsumer(
-        topics=PROCESSED_IMAGERY_TOPIC,
+    # Create Kafka consumer for hotspots
+    hotspots_consumer = FlinkKafkaConsumer(
+        topics=HOTSPOTS_TOPIC,
         deserialization_schema=SimpleStringSchema(),
         properties=properties
     )
@@ -775,32 +841,23 @@ def main():
         producer_config=properties
     )
     
-    # Define processing pipeline for sensor data
-    sensor_stream = env.add_source(sensor_consumer)
-    detected_sensor = sensor_stream \
-        .map(PollutionEventDetector(), output_type=Types.STRING()) \
-        .name("Detect_Sensor_Pollution_Events")
+    # Define the processing pipeline
     
-    # Define processing pipeline for imagery data
-    imagery_stream = env.add_source(imagery_consumer)
-    detected_imagery = imagery_stream \
-        .map(PollutionEventDetector(), output_type=Types.STRING()) \
-        .name("Detect_Imagery_Pollution_Events")
+    # 1. Read hotspots from Kafka
+    hotspots_stream = env.add_source(hotspots_consumer)
     
-    # Merge detected events
-    all_events = detected_sensor.union(detected_imagery)
+    # 2. Process hotspots and generate predictions
+    predictions = hotspots_stream \
+        .map(PollutionSpreadPredictor(), output_type=Types.STRING()) \
+        .filter(lambda x: x is not None) \
+        .name("Generate_Pollution_Predictions")
     
-    # Predict pollution spread for detected events
-    predictions = all_events \
-        .key_by(lambda x: "global_key") \
-        .process(PollutionSpreadPredictor(), output_type=Types.STRING()) \
-        .name("Predict_Pollution_Spread")
+    # 3. Send predictions to Kafka
+    predictions.add_sink(predictions_producer) \
+        .name("Publish_Predictions")
     
-    # Send predictions to Kafka
-    predictions.add_sink(predictions_producer).name("Publish_Predictions")
-    
-    # Execute the Flink job
-    logger.info("Executing ML Prediction Engine Job")
+    # Execute the job
+    logger.info("Starting ML Prediction Engine Job")
     env.execute("Marine_Pollution_ML_Prediction")
 
 if __name__ == "__main__":

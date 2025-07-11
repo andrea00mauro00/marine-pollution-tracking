@@ -67,7 +67,7 @@ PARAMETER_RANGES = {
         "min_winter": 3, "max_winter": 12,
         "min_summer": 18, "max_summer": 32
     },
-    "microplastics_concentration": {  # particles/m³
+    "microplastics": {  # particles/m³
         "excellent": 1, "good": 3, "fair": 8, "poor": 15
     }
 }
@@ -95,7 +95,7 @@ POLLUTION_SIGNATURES = {
         "secondary": ["pH", "bi_dissolved_oxygen_saturation"]
     },
     "plastic_pollution": {
-        "primary": ["microplastics_concentration"],
+        "primary": ["microplastics"],
         "secondary": []
     }
 }
@@ -204,9 +204,9 @@ class SensorAnalyzer(MapFunction):
                     self._analyze_parameter(sensor_id, key, data[key], parameter_scores, anomalies)
             
             # Process microplastics
-            if "microplastics_concentration" in data:
-                self._analyze_parameter(sensor_id, "microplastics_concentration", 
-                                     data["microplastics_concentration"], parameter_scores, anomalies)
+            if "microplastics" in data:
+                self._analyze_parameter(sensor_id, "microplastics", 
+                                     data["microplastics"], parameter_scores, anomalies)
             
             # Try to detect anomalies using ML model
             anomaly_score = self._detect_anomalies_ml(data)
@@ -262,7 +262,7 @@ class SensorAnalyzer(MapFunction):
                     "turbidity": data.get("turbidity", 0.0),
                     "temperature": data.get("WTMP", 15.0),
                     "wave_height": data.get("WVHT", 0.0),
-                    "microplastics": data.get("microplastics_concentration", 0.0),
+                    "microplastics": data.get("microplastics", 0.0),
                     "water_quality_index": data.get("water_quality_index", 0.0)
                 },
                 "pollution_indicators": {
@@ -476,13 +476,13 @@ class SensorAnalyzer(MapFunction):
                     "threshold": "variable"  # Depends on specific indicator
                 }
         
-        elif param_name == "microplastics_concentration":
+        elif param_name == "microplastics":
             parameter_scores[param_name] = min(value / 15.0, 1.0)
             
             if parameter_scores[param_name] > 0.3:
                 anomalies[param_name] = {
                     "value": value,
-                    "threshold": PARAMETER_RANGES["microplastics_concentration"]["good"]
+                    "threshold": PARAMETER_RANGES["microplastics"]["good"]
                 }
         
         # For all parameters, also consider statistical anomaly (z-score)
@@ -610,7 +610,7 @@ class SensorAnalyzer(MapFunction):
                     "lead": "hm_lead_pb", 
                     "petroleum": "hc_total_petroleum_hydrocarbons",
                     "oxygen": "bi_dissolved_oxygen_saturation",
-                    "microplastics": "microplastics_concentration"
+                    "microplastics": "microplastics"
                 }
             
             # Extract features
@@ -723,7 +723,7 @@ class SensorAnalyzer(MapFunction):
             "bi_": 0.6,  # Biological indicators
             
             # Special case
-            "microplastics_concentration": 0.7,
+            "microplastics": 0.7,
             
             # ML anomaly detection
             "ml_anomaly": 0.9  # High weight for ML-detected anomalies
