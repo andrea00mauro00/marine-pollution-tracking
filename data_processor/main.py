@@ -82,7 +82,7 @@ class BuoyDataProcessor(ProcessFunction):
                     "wind_direction": data.get("WDIR")
                 },
                 "pollution_metrics": {
-                    "microplastics": data.get("microplastics"),
+                    "microplastics_concentration": data.get("microplastics_concentration"),
                     "water_quality_index": data.get("water_quality_index"),
                     "pollution_level": data.get("pollution_level")
                 },

@@ -128,7 +128,7 @@ def simulate_pollution_parameters(buoy_id: str, lat: float, lon: float) -> dict:
     # Base parameters with realistic variations
     pollution_data = {
         # Microplastics (particles per m³)
-        "microplastics": round(rng.uniform(0.1, 15.0), 2),
+        "microplastics_concentration": round(rng.uniform(0.1, 15.0), 2),
         
         # Heavy metals (mg/L)
         "hm_mercury_hg": round(rng.uniform(0.001, 0.05), 4),
@@ -165,7 +165,7 @@ def simulate_pollution_parameters(buoy_id: str, lat: float, lon: float) -> dict:
     # Adjustments based on location (simulation of hotspots)
     # Coastal zones tend to have more pollution
     if abs(lat) < 60:  # More populated zones
-        pollution_data["microplastics"] *= rng.uniform(1.2, 2.0)
+        pollution_data["microplastics_concentration"] *= rng.uniform(1.2, 2.0)
         pollution_data["water_quality_index"] *= rng.uniform(0.8, 0.95)
     
     # Simulate occasional pollution events
@@ -305,7 +305,7 @@ def main():
             logger.info(f"  📊 Environmental: pH={buoy.get('pH', 'N/A')}, Temp={buoy.get('WTMP', 'N/A')}°C, Wind={buoy.get('WSPD', 'N/A')}kt")
             logger.info(f"  🌊 Sea: Waves={buoy.get('WVHT', 'N/A')}m, Pressure={buoy.get('PRES', 'N/A')}hPa")
             logger.info(f"  🔬 Pollution: WQI={buoy.get('water_quality_index')}, Level={buoy.get('pollution_level')}")
-            logger.info(f"  🧪 Microplastics={buoy.get('microplastics', 'N/A')} part/m³")
+            logger.info(f"  🧪 Microplastics={buoy.get('microplastics_concentration', 'N/A')} part/m³")
             logger.info(f"  ⚗️ Metals: Hg={buoy.get('hm_mercury_hg', 'N/A')}mg/L, Pb={buoy.get('hm_lead_pb', 'N/A')}mg/L")
             logger.info(f"  🛢️ Hydrocarbons: TPH={buoy.get('hc_total_petroleum_hydrocarbons', 'N/A')}mg/L")
             logger.info(f"  🌱 Nutrients: NO3={buoy.get('nt_nitrates_no3', 'N/A')}mg/L, PO4={buoy.get('nt_phosphates_po4', 'N/A')}mg/L")

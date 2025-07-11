@@ -16,9 +16,12 @@ import json
 import time
 import uuid
 import math
+import pickle
+import boto3
 from datetime import datetime
 from typing import Dict, List, Any
 from collections import deque
+from botocore.exceptions import ClientError
 
 # PyFlink imports
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
@@ -26,14 +29,6 @@ from pyflink.datastream.connectors import FlinkKafkaConsumer, FlinkKafkaProducer
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream.functions import MapFunction
 from pyflink.common import Types
-
-# Import ML infrastructure
-import sys
-import os
-
-# Add the common directory to the Python path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from common.ml_infrastructure import ModelManager, ErrorHandler
 
 # Configure logging
 logging.basicConfig(
@@ -47,6 +42,12 @@ logger = logging.getLogger(__name__)
 KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 BUOY_TOPIC = os.environ.get("BUOY_TOPIC", "buoy_data")
 ANALYZED_SENSOR_TOPIC = os.environ.get("ANALYZED_SENSOR_TOPIC", "analyzed_sensor_data")
+
+# MinIO configuration
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+MINIO_MODELS_BUCKET = os.environ.get("MINIO_MODELS_BUCKET", "models")
 
 # Reference ranges for water quality parameters
 PARAMETER_RANGES = {
@@ -67,7 +68,7 @@ PARAMETER_RANGES = {
         "min_winter": 3, "max_winter": 12,
         "min_summer": 18, "max_summer": 32
     },
-    "microplastics": {  # particles/m³
+    "microplastics_concentration": {  # particles/m³
         "excellent": 1, "good": 3, "fair": 8, "poor": 15
     }
 }
@@ -94,11 +95,203 @@ POLLUTION_SIGNATURES = {
         "primary": ["bi_chlorophyll_a", "nt_nitrates_no3", "nt_phosphates_po4"],
         "secondary": ["pH", "bi_dissolved_oxygen_saturation"]
     },
-    "plastic_pollution": {
-        "primary": ["microplastics"],
+    "microplastic_contamination": {
+        "primary": ["microplastics_concentration"],
         "secondary": []
     }
 }
+
+class DirectModelManager:
+    """Custom model manager to load ML models directly from MinIO"""
+    
+    def __init__(self, job_name):
+        """
+        Initialize the model manager for a specific job.
+        
+        Args:
+            job_name (str): Name of the job (sensor_analyzer, etc.)
+        """
+        self.job_name = job_name
+        self.models = {}
+        self.model_metadata = {}
+        self.config = {}
+        self.s3_client = None
+        
+        # Default configuration
+        self.config = {
+            "fallback": {
+                "enabled": True,
+                "prefer_ml_above_confidence": 0.7
+            },
+            "feature_mapping": {
+                "pH": "pH",
+                "turbidity": "turbidity",
+                "temperature": "WTMP",
+                "mercury": "hm_mercury_hg",
+                "lead": "hm_lead_pb", 
+                "petroleum": "hc_total_petroleum_hydrocarbons",
+                "oxygen": "bi_dissolved_oxygen_saturation",
+                "microplastics": "microplastics_concentration"
+            }
+        }
+        
+        # Connect to MinIO and load models
+        self._initialize_minio_client()
+        self._load_models()
+    
+    def _initialize_minio_client(self):
+        """Initialize MinIO client"""
+        try:
+            self.s3_client = boto3.client(
+                's3',
+                endpoint_url=f"http://{MINIO_ENDPOINT}",
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY,
+                region_name='us-east-1'  # Default region
+            )
+            logger.info(f"Connected to MinIO at {MINIO_ENDPOINT}")
+        except Exception as e:
+            logger.error(f"Failed to connect to MinIO: {e}")
+            self.s3_client = None
+    
+    def _load_models(self):
+        """Load ML models from MinIO"""
+        if not self.s3_client:
+            logger.warning("MinIO client not initialized, cannot load models")
+            return
+        
+        try:
+            # Load model config
+            config_key = f"{self.job_name}/config.json"
+            try:
+                response = self.s3_client.get_object(
+                    Bucket=MINIO_MODELS_BUCKET,
+                    Key=config_key
+                )
+                config_data = json.loads(response['Body'].read().decode('utf-8'))
+                self.config.update(config_data)
+                logger.info(f"Loaded model config for {self.job_name}")
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    logger.warning(f"No config found at {config_key}, using defaults")
+                else:
+                    logger.error(f"Error loading config: {e}")
+            
+            # Load pollutant classifier model
+            model_key = f"{self.job_name}/pollutant_classifier.pkl"
+            try:
+                response = self.s3_client.get_object(
+                    Bucket=MINIO_MODELS_BUCKET,
+                    Key=model_key
+                )
+                model_data = pickle.loads(response['Body'].read())
+                self.models["pollutant_classifier"] = model_data
+                logger.info("Loaded pollutant classifier model")
+                
+                # Load metadata if available
+                try:
+                    metadata_key = f"{self.job_name}/pollutant_classifier_metadata.json"
+                    meta_response = self.s3_client.get_object(
+                        Bucket=MINIO_MODELS_BUCKET,
+                        Key=metadata_key
+                    )
+                    metadata = json.loads(meta_response['Body'].read().decode('utf-8'))
+                    self.model_metadata["pollutant_classifier"] = metadata
+                except ClientError:
+                    self.model_metadata["pollutant_classifier"] = {"features": list(self.config["feature_mapping"].keys())}
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    logger.warning(f"No model found at {model_key}")
+                else:
+                    logger.error(f"Error loading model: {e}")
+            
+            # Load anomaly detector model
+            model_key = f"{self.job_name}/anomaly_detector.pkl"
+            try:
+                response = self.s3_client.get_object(
+                    Bucket=MINIO_MODELS_BUCKET,
+                    Key=model_key
+                )
+                model_data = pickle.loads(response['Body'].read())
+                self.models["anomaly_detector"] = model_data
+                logger.info("Loaded anomaly detector model")
+                
+                # Load metadata if available
+                try:
+                    metadata_key = f"{self.job_name}/anomaly_detector_metadata.json"
+                    meta_response = self.s3_client.get_object(
+                        Bucket=MINIO_MODELS_BUCKET,
+                        Key=metadata_key
+                    )
+                    metadata = json.loads(meta_response['Body'].read().decode('utf-8'))
+                    self.model_metadata["anomaly_detector"] = metadata
+                except ClientError:
+                    self.model_metadata["anomaly_detector"] = {"features": list(self.config["feature_mapping"].keys())}
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    logger.warning(f"No model found at {model_key}")
+                else:
+                    logger.error(f"Error loading model: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+    
+    def get_model(self, model_name):
+        """Get a loaded ML model by name"""
+        return self.models.get(model_name)
+    
+    def get_model_metadata(self, model_name):
+        """Get metadata for a model"""
+        return self.model_metadata.get(model_name, {})
+    
+    def get_config_value(self, path, default=None):
+        """
+        Get a configuration value using dot notation path
+        
+        Args:
+            path (str): Path to the config value (e.g., "fallback.enabled")
+            default: Default value if path not found
+            
+        Returns:
+            The config value or default
+        """
+        parts = path.split('.')
+        current = self.config
+        
+        for part in parts:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return default
+        
+        return current
+
+class ErrorHandler:
+    """Simple error handler to log errors and manage fallbacks"""
+    
+    def __init__(self, job_name):
+        """Initialize the error handler"""
+        self.job_name = job_name
+        self.error_counts = {}
+    
+    def handle_error(self, error, context):
+        """
+        Handle an error in a specific context
+        
+        Args:
+            error (Exception): The error that occurred
+            context (str): Context where the error occurred
+        """
+        if context not in self.error_counts:
+            self.error_counts[context] = 0
+        
+        self.error_counts[context] += 1
+        
+        logger.error(f"Error in {context} ({self.error_counts[context]} occurrences): {error}")
+        
+        # Log more details for debugging
+        if self.error_counts[context] <= 3:  # Limit detailed logging
+            logger.error(f"Error details: {str(error)}")
 
 class SensorAnalyzer(MapFunction):
     """
@@ -115,15 +308,14 @@ class SensorAnalyzer(MapFunction):
         self.current_month = datetime.now().month
         self.is_summer = 5 <= self.current_month <= 9
         
-        # IMPORTANTE: NON inizializzare ModelManager ed ErrorHandler qui
-        # Saranno inizializzati nel metodo open()
+        # Will be initialized in open()
         self.model_manager = None
         self.error_handler = None
     
     def open(self, runtime_context):
-        """Inizializza le risorse non serializzabili quando il worker viene avviato"""
-        # Inizializza ModelManager ed ErrorHandler qui
-        self.model_manager = ModelManager("sensor_analyzer")
+        """Initialize resources when the worker starts"""
+        # Initialize ModelManager and ErrorHandler
+        self.model_manager = DirectModelManager("sensor_analyzer")
         self.error_handler = ErrorHandler("sensor_analyzer")
         
         # Log ML availability status
@@ -141,8 +333,8 @@ class SensorAnalyzer(MapFunction):
             logger.warning("Anomaly detector ML model not available, will use statistical anomaly detection")
     
     def close(self):
-        """Pulisce le risorse quando il worker viene chiuso"""
-        # Pulizia delle risorse se necessario
+        """Clean up resources when the worker is closed"""
+        # Clean up resources if needed
         self.model_manager = None
         self.error_handler = None
     
@@ -204,9 +396,9 @@ class SensorAnalyzer(MapFunction):
                     self._analyze_parameter(sensor_id, key, data[key], parameter_scores, anomalies)
             
             # Process microplastics
-            if "microplastics" in data:
-                self._analyze_parameter(sensor_id, "microplastics", 
-                                     data["microplastics"], parameter_scores, anomalies)
+            if "microplastics_concentration" in data:
+                self._analyze_parameter(sensor_id, "microplastics_concentration", 
+                                     data["microplastics_concentration"], parameter_scores, anomalies)
             
             # Try to detect anomalies using ML model
             anomaly_score = self._detect_anomalies_ml(data)
@@ -262,7 +454,7 @@ class SensorAnalyzer(MapFunction):
                     "turbidity": data.get("turbidity", 0.0),
                     "temperature": data.get("WTMP", 15.0),
                     "wave_height": data.get("WVHT", 0.0),
-                    "microplastics": data.get("microplastics", 0.0),
+                    "microplastics": data.get("microplastics_concentration", 0.0),
                     "water_quality_index": data.get("water_quality_index", 0.0)
                 },
                 "pollution_indicators": {
@@ -281,12 +473,14 @@ class SensorAnalyzer(MapFunction):
             return json.dumps(analyzed_data)
             
         except Exception as e:
-            logger.error(f"Error processing buoy data: {e}")
+            if self.error_handler:
+                self.error_handler.handle_error(e, "process_data")
+            else:
+                logger.error(f"Error processing buoy data: {e}")
             return value
     
     def _analyze_core_parameters(self, sensor_id, data, parameter_scores, anomalies):
         """Analyze core water quality parameters (pH, turbidity, temperature)"""
-        # Original implementation remains unchanged
         # Extract parameters
         ph = data.get("pH")
         turbidity = data.get("turbidity")
@@ -476,13 +670,13 @@ class SensorAnalyzer(MapFunction):
                     "threshold": "variable"  # Depends on specific indicator
                 }
         
-        elif param_name == "microplastics":
+        elif param_name == "microplastics_concentration":
             parameter_scores[param_name] = min(value / 15.0, 1.0)
             
             if parameter_scores[param_name] > 0.3:
                 anomalies[param_name] = {
                     "value": value,
-                    "threshold": PARAMETER_RANGES["microplastics"]["good"]
+                    "threshold": PARAMETER_RANGES["microplastics_concentration"]["good"]
                 }
         
         # For all parameters, also consider statistical anomaly (z-score)
@@ -514,6 +708,9 @@ class SensorAnalyzer(MapFunction):
             float or None: Anomaly score if ML model is available, None otherwise
         """
         try:
+            if not self.model_manager:
+                return None
+                
             # Get the anomaly detector model
             anomaly_detector = self.model_manager.get_model("anomaly_detector")
             if not anomaly_detector:
@@ -525,16 +722,15 @@ class SensorAnalyzer(MapFunction):
                 logger.warning("Could not extract features for anomaly detection")
                 return None
             
-            # Get feature names from model metadata
-            feature_names = self.model_manager.get_model_metadata("anomaly_detector").get("features", [])
-            
             # Detect anomalies
             anomaly_score = anomaly_detector.decision_function([features])[0]
             return anomaly_score
             
         except Exception as e:
-            # Log error and fallback to traditional methods
-            self.error_handler.handle_error(e, "anomaly_detection")
+            if self.error_handler:
+                self.error_handler.handle_error(e, "anomaly_detection")
+            else:
+                logger.error(f"Error in anomaly detection: {e}")
             return None
     
     def _classify_pollution_type(self, parameter_scores, data):
@@ -550,6 +746,9 @@ class SensorAnalyzer(MapFunction):
         """
         # Try ML classification first
         try:
+            if not self.model_manager:
+                return self._classify_pollution_type_rule_based(parameter_scores)
+                
             # Get the pollutant classifier model
             pollutant_classifier = self.model_manager.get_model("pollutant_classifier")
             
@@ -582,8 +781,10 @@ class SensorAnalyzer(MapFunction):
             return self._classify_pollution_type_rule_based(parameter_scores)
             
         except Exception as e:
-            # Log error and fallback to rule-based approach
-            self.error_handler.handle_error(e, "pollution_classification")
+            if self.error_handler:
+                self.error_handler.handle_error(e, "pollution_classification")
+            else:
+                logger.error(f"Error in pollution classification: {e}")
             return self._classify_pollution_type_rule_based(parameter_scores)
     
     def _extract_ml_features(self, data):
@@ -597,6 +798,9 @@ class SensorAnalyzer(MapFunction):
             list or None: Feature vector for ML models
         """
         try:
+            if not self.model_manager:
+                return None
+                
             # Get feature mapping from configuration
             feature_mapping = self.model_manager.get_config_value("feature_mapping", {})
             
@@ -610,7 +814,7 @@ class SensorAnalyzer(MapFunction):
                     "lead": "hm_lead_pb", 
                     "petroleum": "hc_total_petroleum_hydrocarbons",
                     "oxygen": "bi_dissolved_oxygen_saturation",
-                    "microplastics": "microplastics"
+                    "microplastics": "microplastics_concentration"
                 }
             
             # Extract features
@@ -623,7 +827,10 @@ class SensorAnalyzer(MapFunction):
             return features
             
         except Exception as e:
-            logger.error(f"Error extracting ML features: {e}")
+            if self.error_handler:
+                self.error_handler.handle_error(e, "feature_extraction")
+            else:
+                logger.error(f"Error extracting ML features: {e}")
             return None
     
     def _classify_pollution_type_rule_based(self, parameter_scores):
@@ -723,7 +930,7 @@ class SensorAnalyzer(MapFunction):
             "bi_": 0.6,  # Biological indicators
             
             # Special case
-            "microplastics": 0.7,
+            "microplastics_concentration": 0.7,
             
             # ML anomaly detection
             "ml_anomaly": 0.9  # High weight for ML-detected anomalies
@@ -783,6 +990,34 @@ def wait_for_services():
     
     if not kafka_ready:
         logger.error("❌ Kafka not available after multiple attempts")
+    
+    # Check MinIO
+    minio_ready = False
+    for i in range(5):
+        try:
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=f"http://{MINIO_ENDPOINT}",
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY
+            )
+            buckets = s3_client.list_buckets()
+            bucket_names = [b['Name'] for b in buckets.get('Buckets', [])]
+            minio_ready = True
+            logger.info(f"✅ MinIO is ready, available buckets: {bucket_names}")
+            
+            # Ensure required buckets exist
+            if MINIO_MODELS_BUCKET not in bucket_names:
+                logger.info(f"Creating bucket '{MINIO_MODELS_BUCKET}'")
+                s3_client.create_bucket(Bucket=MINIO_MODELS_BUCKET)
+            
+            break
+        except Exception as e:
+            logger.info(f"⏳ MinIO not ready, attempt {i+1}/5: {e}")
+            time.sleep(5)
+    
+    if not minio_ready:
+        logger.warning("⚠️ MinIO not available, will operate with fallback rules")
     
     return kafka_ready
 

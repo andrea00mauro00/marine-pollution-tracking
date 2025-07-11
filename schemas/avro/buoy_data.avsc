@@ -15,7 +15,7 @@
     {"name": "ATMP", "type": ["null", "double"], "default": null},
     {"name": "pH", "type": ["null", "double"], "default": null},
     {"name": "turbidity", "type": ["null", "double"], "default": null},
-    {"name": "microplastics", "type": ["null", "double"], "default": null},
+    {"name": "microplastics_concentration", "type": ["null", "double"], "default": null},
     {"name": "water_quality_index", "type": ["null", "double"], "default": null},
     {"name": "pollution_level", "type": ["null", "string"], "default": null},
     {"name": "hm_mercury_hg", "type": ["null", "double"], "default": null},

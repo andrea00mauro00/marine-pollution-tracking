@@ -587,7 +587,7 @@ def create_and_upload_configs(s3):
             "lead": "hm_lead_pb",
             "petroleum": "hc_total_petroleum_hydrocarbons",
             "oxygen": "bi_dissolved_oxygen_saturation",
-            "microplastics": "microplastics"
+            "microplastics": "microplastics_concentration"
         },
         "fallback": {
             "enabled": True,

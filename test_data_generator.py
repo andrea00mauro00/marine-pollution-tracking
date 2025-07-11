@@ -47,7 +47,7 @@ def generate_buoy_data(producer, topic, count, pollution_level="normal", polluti
             "ph": 7.8,
             "turbidity": 5.0,
             "water_quality_index": 85.0,
-            "microplastics": 0.5,
+            "microplastics_concentration": 0.5,
             "hm_mercury_hg": 0.002,
             "hm_lead_pb": 0.003,
             "hm_cadmium_cd": 0.0009,
@@ -69,7 +69,7 @@ def generate_buoy_data(producer, topic, count, pollution_level="normal", polluti
             "ph": 6.2,
             "turbidity": 20.0,
             "water_quality_index": 65.0,
-            "microplastics": 5.0,
+            "microplastics_concentration": 5.0,
             "hm_mercury_hg": 0.02,
             "hm_lead_pb": 0.04,
             "hm_cadmium_cd": 0.01,
@@ -91,7 +91,7 @@ def generate_buoy_data(producer, topic, count, pollution_level="normal", polluti
             "ph": 5.0,
             "turbidity": 50.0,
             "water_quality_index": 35.0,
-            "microplastics": 12.0,
+            "microplastics_concentration": 12.0,
             "hm_mercury_hg": 0.04,
             "hm_lead_pb": 0.08,
             "hm_cadmium_cd": 0.015,
@@ -139,7 +139,7 @@ def generate_buoy_data(producer, topic, count, pollution_level="normal", polluti
             "bi_dissolved_oxygen_saturation": lambda x: x * 0.6
         },
         "plastic_pollution": {
-            "microplastics": lambda x: x * 10.0
+            "microplastics_concentration": lambda x: x * 10.0
         }
     }
     
