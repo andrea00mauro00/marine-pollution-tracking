@@ -26,7 +26,7 @@ from Utils.imgfetch_utils import (
     true_color_image_request_processing,
     process_image,
 )
-from satellite_producer.utils.buoy_utils import fetch_buoy_positions, bbox_around
+from Utils.buoy_utils import fetch_buoy_positions, bbox_around
 
 # ---- env-var ---------------------------------------------------------------
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "satellite_imagery")
@@ -107,17 +107,8 @@ def create_schema_registry_producer(schema_path):
             with open(schema_path, 'r') as f:
                 schema_str = f.read()
         except FileNotFoundError:
-            logger.warning(f"Schema file {schema_path} not found, creating simple schema")
-            # Create a simple schema if file doesn't exist
-            schema_str = json.dumps({
-                "type": "record",
-                "name": "SatelliteImagery",
-                "namespace": "com.marine.pollution",
-                "fields": [
-                    {"name": "image_pointer", "type": "string"},
-                    {"name": "metadata", "type": ["null", "string"], "default": null}
-                ]
-            })
+            logger.error(f"Schema file {schema_path} not found, cannot proceed with Schema Registry")
+            raise FileNotFoundError(f"Required schema file {schema_path} not found")
         
         # Create Avro serializer
         avro_serializer = AvroSerializer(
@@ -246,15 +237,18 @@ def main() -> None:
                     try:
                         # Handle different producer types
                         if isinstance(producer, SerializingProducer):
-                            # Prepare payload for Avro - convert nested JSON to string
+                            # Prepare payload for Avro schema
                             if isinstance(payload, str):
-                                # Already a string
-                                avro_payload = {"image_pointer": json.loads(payload).get("image_pointer", ""), 
-                                               "metadata": payload}
+                                # Parse JSON string to dict
+                                payload_dict = json.loads(payload)
                             else:
-                                # Convert dict to string for metadata field
-                                avro_payload = {"image_pointer": payload.get("image_pointer", ""),
-                                               "metadata": json.dumps(payload)}
+                                payload_dict = payload
+                            
+                            # Create Avro-compliant payload
+                            avro_payload = {
+                                "image_pointer": payload_dict.get("image_pointer", ""),
+                                "metadata": payload_dict  # Use the entire dict as metadata
+                            }
                                 
                             # Use SerializingProducer's produce method
                             producer.produce(

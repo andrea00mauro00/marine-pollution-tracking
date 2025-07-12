@@ -55,12 +55,12 @@ MIN_POINTS = 2               # Minimum points to form a cluster
 GRID_SIZE_DEG = 0.05         # Grid size for spatial indexing
 
 # Confidence estimation parameters
-CONFIDENCE_THRESHOLD = 0.05  # ABBASSATO: Minimum confidence for validated hotspots
+CONFIDENCE_THRESHOLD = 0.7  # RESTORED: Minimum confidence for validated hotspots
 
 # Risk thresholds
-HIGH_RISK_THRESHOLD = 0.6    # ABBASSATO: Threshold for high severity (was 0.7)
-MEDIUM_RISK_THRESHOLD = 0.3  # ABBASSATO: Threshold for medium severity (was 0.4)
-DETECTION_THRESHOLD = 0.3    # ABBASSATO: Minimum risk to consider (was 0.4)
+HIGH_RISK_THRESHOLD = 0.7    # RESTORED: Threshold for high severity
+MEDIUM_RISK_THRESHOLD = 0.4  # RESTORED: Threshold for medium severity
+DETECTION_THRESHOLD = 0.4    # RESTORED: Minimum risk to consider
 
 # Timer parameters
 CLUSTERING_INTERVAL_MS = 60000  # Run clustering every 1 minute
@@ -92,22 +92,16 @@ class PollutionEventDetector(MapFunction):
             data = json.loads(value)
             source_type = data.get("source_type", "unknown")
             
-            logger.info(f"[DEBUG] Processing data from source: {source_type}")
-            
             # Extract location
             location = None
             if source_type == "buoy":
                 location = data.get("location")
-                logger.info(f"[DEBUG] Buoy location: {location}")
             elif source_type == "satellite":
                 # Check different location fields for satellite data
-                logger.info(f"[DEBUG] Satellite data keys: {list(data.keys())}")
                 if "center_location" in data:
                     location = data.get("center_location")
-                    logger.info(f"[DEBUG] Using center_location: {location}")
                 elif "location" in data:
                     location = data.get("location")
-                    logger.info(f"[DEBUG] Using location: {location}")
                 elif "metadata" in data and isinstance(data["metadata"], dict):
                     metadata = data["metadata"]
                     if "latitude" in metadata and "longitude" in metadata:
@@ -115,13 +109,11 @@ class PollutionEventDetector(MapFunction):
                             "latitude": metadata["latitude"], 
                             "longitude": metadata["longitude"]
                         }
-                        logger.info(f"[DEBUG] Using metadata location: {location}")
                     elif "lat" in metadata and "lon" in metadata:
                         location = {
                             "latitude": metadata["lat"], 
                             "longitude": metadata["lon"]
                         }
-                        logger.info(f"[DEBUG] Using metadata location: {location}")
                 elif "pollution_detection" in data and "spectral_analysis" in data:
                     if "processed_bands" in data["spectral_analysis"]:
                         bands = data["spectral_analysis"]["processed_bands"]
@@ -130,25 +122,19 @@ class PollutionEventDetector(MapFunction):
                                 "latitude": bands[0]["lat"],
                                 "longitude": bands[0]["lon"]
                             }
-                            logger.info(f"[DEBUG] Using processed_bands location: {location}")
             
             # Extract pollution analysis
             pollution_analysis = None
             if source_type == "buoy":
                 pollution_analysis = data.get("pollution_analysis")
-                logger.info(f"[DEBUG] Buoy pollution_analysis: {pollution_analysis}")
             elif source_type == "satellite":
                 # Try multiple possible field names
-                logger.info(f"[DEBUG] Looking for satellite pollution data")
                 if "detected_pollution" in data:
                     pollution_analysis = data.get("detected_pollution")
-                    logger.info(f"[DEBUG] Using detected_pollution: {pollution_analysis}")
                 elif "pollution_detection" in data:
                     pollution_analysis = data.get("pollution_detection")
-                    logger.info(f"[DEBUG] Using pollution_detection: {pollution_analysis}")
             
             if not pollution_analysis:
-                logger.info(f"[DEBUG] No pollution analysis found for {source_type}")
                 return value
             
             # Standardize pollution analysis format
@@ -161,12 +147,8 @@ class PollutionEventDetector(MapFunction):
                 pollutant_type = pollution_analysis.get("pollutant_type", "unknown")
                 risk_score = pollution_analysis.get("risk_score", 0.0)
                 severity = pollution_analysis.get("level", "low")
-                logger.info(f"[DEBUG] Buoy data - pollutant: {pollutant_type}, risk: {risk_score}, severity: {severity}")
             elif source_type == "satellite":
-                # Handle satellite data explicitly to debug potential issues
-                logger.info(f"[DEBUG] Handling satellite data: {json.dumps(pollution_analysis)}")
-                
-                # Check different field names
+                # Handle satellite data
                 if isinstance(pollution_analysis, dict):
                     # Try multiple field names for risk score
                     if "risk_score" in pollution_analysis:
@@ -182,12 +164,10 @@ class PollutionEventDetector(MapFunction):
                     
                     # For satellite data, calculate severity based on risk score
                     severity = "high" if risk_score > HIGH_RISK_THRESHOLD else "medium" if risk_score > MEDIUM_RISK_THRESHOLD else "low"
-                    
-                    logger.info(f"[DEBUG] Satellite data - pollutant: {pollutant_type}, risk: {risk_score}, severity: {severity}")
             
             # Skip if location info is insufficient
             if not location:
-                logger.warning(f"[DEBUG] Missing location info for {source_type}")
+                logger.warning(f"Missing location info for {source_type}")
                 return value
             
             # Normalize location format
@@ -207,11 +187,8 @@ class PollutionEventDetector(MapFunction):
                 longitude = location.get("lon")
             
             if latitude is None or longitude is None:
-                logger.warning(f"[DEBUG] Invalid location coordinates for {source_type}: {location}")
+                logger.warning(f"Invalid location coordinates for {source_type}: {location}")
                 return value
-            
-            # Check for pollution event
-            logger.info(f"[DEBUG] Risk score for {source_type}: {risk_score}, threshold: {self.risk_threshold}")
             
             # If risk score exceeds threshold, create event data
             if risk_score >= self.risk_threshold:
@@ -244,12 +221,9 @@ class PollutionEventDetector(MapFunction):
                 data["pollution_event_detection"] = event_data
                 logger.info(f"[EVENT DETECTED] {source_type} pollution event at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
                 
-                # Force severity to high for testing if risk_score is sufficient
+                # Ensure severity is properly set based on risk score
                 if risk_score >= HIGH_RISK_THRESHOLD and severity != "high":
-                    logger.info(f"[DEBUG] Forcing severity to HIGH for testing (risk_score: {risk_score})")
                     data["pollution_event_detection"]["severity"] = "high"
-            else:
-                logger.info(f"[DEBUG] Risk score {risk_score} below threshold {self.risk_threshold}, skipping")
             
             return json.dumps(data)
             
@@ -301,7 +275,9 @@ class AlertExtractor(MapFunction):
                 latitude = location.get("latitude", "unknown")
                 longitude = location.get("longitude", "unknown")
                 
-                logger.info(f"[ALERT CHECK] Checking event: severity={severity}, risk={risk_score}, source={source_type}")
+                # Log only significant events
+                if severity in ["medium", "high"]:
+                    logger.info(f"[ALERT CHECK] Checking event: severity={severity}, risk={risk_score}, source={source_type}")
                 
                 # Check severity - if medium or high, this is an alert
                 if severity in ["medium", "high"]:
@@ -424,7 +400,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Initialize HotspotManager
         self.hotspot_manager = HotspotManager()
         
-        logger.info("[DEBUG] SpatialClusteringProcessor initialized with HotspotManager")
+        logger.info("SpatialClusteringProcessor initialized with HotspotManager")
     
     def process_element(self, value, ctx):
         try:
@@ -445,11 +421,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             source_type = event_detection["detection_source"]
             severity = event_detection["severity"]
             
-            logger.info(f"[DEBUG] Processing event: {event_id} from {source_type} with risk {risk_score}, severity: {severity}")
-            
             # Skip if already processed
             if self.processed_events.contains(event_id):
-                logger.info(f"[DEBUG] Event {event_id} already processed, skipping")
                 return
             
             # Mark as processed
@@ -471,7 +444,6 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             # Store point in state
             point_key = f"{event_id}"
             self.points_state.put(point_key, json.dumps(point_data))
-            logger.info(f"[DEBUG] Stored point: {point_key}")
             
             # Check if this is the first event - if so, schedule initial timer
             if self.first_event_processed.value() is None:
@@ -480,7 +452,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                 next_trigger = current_time + 10000  # 10 seconds from now
                 ctx.timer_service().register_processing_time_timer(next_trigger)
                 self.timer_state.update(next_trigger)
-                logger.info(f"[DEBUG] Scheduled initial clustering at {next_trigger}")
+                logger.info(f"Scheduled initial clustering at {next_trigger}")
                 
                 # Mark first event as processed
                 self.first_event_processed.update(True)
@@ -494,11 +466,12 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                     trigger_time = current_time + CLUSTERING_INTERVAL_MS
                     ctx.timer_service().register_processing_time_timer(trigger_time)
                     self.timer_state.update(trigger_time)
-                    logger.info(f"[DEBUG] Scheduled clustering at {trigger_time} (in {CLUSTERING_INTERVAL_MS/1000} seconds)")
+                    logger.info(f"Scheduled clustering at {trigger_time} (in {CLUSTERING_INTERVAL_MS/1000} seconds)")
             
-            # Debug: Count total points in state
+            # Count total points in state for monitoring
             point_count = sum(1 for _ in self.points_state.keys())
-            logger.info(f"[DEBUG] Total points in state: {point_count}")
+            if point_count % 10 == 0:  # Log every 10 points to avoid spam
+                logger.info(f"Total points in state: {point_count}")
         
         except Exception as e:
             logger.error(f"[ERROR] Error in spatial clustering processor: {e}")
