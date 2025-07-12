@@ -1,6 +1,6 @@
 -- Tabella per le previsioni
 CREATE TABLE IF NOT EXISTS pollution_predictions (
-  prediction_id TEXT PRIMARY KEY,
+  prediction_id TEXT,
   hotspot_id TEXT NOT NULL,
   prediction_set_id TEXT NOT NULL,
   hours_ahead INTEGER NOT NULL,
@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS pollution_predictions (
   confidence FLOAT,
   prediction_data JSONB,
   generated_at TIMESTAMPTZ NOT NULL,
-  creation_time TIMESTAMPTZ DEFAULT NOW()
+  creation_time TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (prediction_id, prediction_time)
 );
 
 -- Convertire in tabella hypertable

@@ -19,6 +19,7 @@ import math
 import traceback
 import random
 import numpy as np
+import redis
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 from collections import deque
@@ -44,6 +45,10 @@ logger = logging.getLogger(__name__)
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
 PREDICTIONS_TOPIC = os.environ.get("PREDICTIONS_TOPIC", "pollution_predictions")
+
+# Redis configuration
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 
 # Pollutant physical properties for diffusion modeling
 POLLUTANT_PROPERTIES = {
@@ -101,17 +106,6 @@ POLLUTANT_PROPERTIES = {
         "wind_influence": 0.2,   # Low wind influence
         "current_influence": 0.7,# High current influence
         "cleanup_methods": ["wetland_filtration", "buffer_zones", "phytoremediation"]
-    },
-    "sediment": {
-        "density": 1200,         # kg/m³
-        "viscosity": 15,         # cSt
-        "evaporation_rate": 0.0, # fraction per day
-        "diffusion_coef": 0.2,   # m²/s
-        "degradation_rate": 0.01,# fraction per day
-        "water_solubility": 5,   # g/L
-        "wind_influence": 0.1,   # Low wind influence
-        "current_influence": 0.8,# High current influence
-        "cleanup_methods": ["dredging", "sedimentation_basin", "erosion_control"]
     },
     "unknown": {
         "density": 1000,         # kg/m³
@@ -213,23 +207,6 @@ CURRENT_PATTERNS = {
             "lon_min": -76.3,
             "lon_max": -75.9
         }
-    },
-    # Default region
-    "default_region": {
-        "direction": {
-            "flood_tide": 0,     # North (degrees)
-            "ebb_tide": 180      # South (degrees)
-        },
-        "speed": {
-            "flood_tide": 0.4,   # m/s
-            "ebb_tide": 0.5      # m/s
-        },
-        "bounds": {
-            "lat_min": 36.0,
-            "lat_max": 40.0,
-            "lon_min": -77.0,
-            "lon_max": -75.0
-        }
     }
 }
 
@@ -302,6 +279,12 @@ class PollutionSpreadPredictor(MapFunction):
     
     def __init__(self):
         self.prediction_intervals = [6, 12, 24, 48]  # Hours to predict ahead
+        self.redis_client = None
+        
+    def open(self, runtime_context):
+        # Initialize Redis client
+        self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+        logger.info("Connected to Redis")
         
     def map(self, value):
         try:
@@ -315,6 +298,35 @@ class PollutionSpreadPredictor(MapFunction):
             severity = hotspot.get("severity", "low")
             risk_score = hotspot.get("avg_risk_score", 0.5)
             timestamp = hotspot.get("detected_at", int(time.time() * 1000))
+            
+            # Check if this is an update to an existing hotspot
+            is_update = hotspot.get("is_update", False)
+            is_significant = hotspot.get("is_significant_change", False)
+            severity_changed = hotspot.get("severity_changed", False)
+            
+            # Skip insignificant updates
+            if is_update and not (is_significant or severity_changed):
+                # Retrieve last prediction time from Redis
+                last_prediction_key = f"prediction:last_time:{hotspot_id}"
+                last_prediction_time = self.redis_client.get(last_prediction_key)
+                
+                if last_prediction_time:
+                    last_time = int(last_prediction_time.decode('utf-8'))
+                    current_time = int(time.time() * 1000)
+                    
+                    # Load minimum interval from Redis configuration or use default (30 minutes)
+                    min_interval_minutes = 30
+                    try:
+                        config_val = self.redis_client.get("config:prediction:min_interval_minutes")
+                        if config_val:
+                            min_interval_minutes = int(config_val.decode('utf-8'))
+                    except Exception as e:
+                        logger.warning(f"Error loading config from Redis: {e}")
+                    
+                    # If we've done a prediction recently, skip
+                    if (current_time - last_time) < min_interval_minutes * 60 * 1000:
+                        logger.info(f"Skipping prediction for recently updated hotspot {hotspot_id} without significant changes")
+                        return None
             
             # Skip invalid hotspots
             if not hotspot_id or not location:
@@ -380,6 +392,11 @@ class PollutionSpreadPredictor(MapFunction):
                 },
                 "predictions": predictions
             }
+            
+            # Store prediction timestamp in Redis
+            if self.redis_client:
+                self.redis_client.set(f"prediction:last_time:{hotspot_id}", int(time.time() * 1000))
+                logger.info(f"Updated prediction timestamp for hotspot {hotspot_id}")
             
             logger.info(f"Generated prediction {prediction_set_id} for hotspot {hotspot_id}")
             
@@ -591,7 +608,7 @@ class PollutionSpreadPredictor(MapFunction):
             "sewage": 0.7,
             "agricultural_runoff": 0.6,
             "algal_bloom": 0.8,
-            "sediment": 0.5,
+            "plastic_pollution": 0.5,
             "unknown": 0.7
         }
         
@@ -749,30 +766,14 @@ class PollutionSpreadPredictor(MapFunction):
     
     def _get_current_pattern(self, latitude, longitude, region_id=None):
         """Determine the current pattern for a location"""
-        # First try to use the region_id if provided
-        if region_id in CURRENT_PATTERNS:
-            region_pattern = CURRENT_PATTERNS[region_id]
-            
-            # Determine if we're in flood or ebb tide (simplified, alternating every 6 hours)
-            # In a real system, this would use actual tide data
-            current_hour = datetime.now().hour
-            is_flood = (current_hour % 12) < 6
-            
-            tide_type = "flood_tide" if is_flood else "ebb_tide"
-            
-            return {
-                "name": region_id,
-                "direction": region_pattern["direction"][tide_type],
-                "speed": region_pattern["speed"][tide_type]
-            }
-        
-        # Otherwise try to find which region contains the point
+        # Find which region contains the point
         for name, pattern in CURRENT_PATTERNS.items():
             bounds = pattern["bounds"]
             if (bounds["lat_min"] <= latitude <= bounds["lat_max"] and
                 bounds["lon_min"] <= longitude <= bounds["lon_max"]):
                 
                 # Determine if we're in flood or ebb tide (simplified, alternating every 6 hours)
+                # In a real system, this would use actual tide data
                 current_hour = datetime.now().hour
                 is_flood = (current_hour % 12) < 6
                 
@@ -785,13 +786,13 @@ class PollutionSpreadPredictor(MapFunction):
                 }
         
         # Default to main channel if not in any region
-        default_pattern = CURRENT_PATTERNS["default_region"]
+        default_pattern = CURRENT_PATTERNS["main_channel"]
         current_hour = datetime.now().hour
         is_flood = (current_hour % 12) < 6
         tide_type = "flood_tide" if is_flood else "ebb_tide"
         
         return {
-            "name": "default_region",
+            "name": "main_channel",
             "direction": default_pattern["direction"][tide_type],
             "speed": default_pattern["speed"][tide_type]
         }
@@ -831,7 +832,7 @@ class PollutionSpreadPredictor(MapFunction):
 
 def wait_for_services():
     """Wait for Kafka to be available"""
-    logger.info("Waiting for Kafka and MinIO...")
+    logger.info("Waiting for Kafka and Redis...")
     
     # Check Kafka
     kafka_ready = False
@@ -849,8 +850,24 @@ def wait_for_services():
     
     if not kafka_ready:
         logger.error("Kafka not available after multiple attempts")
+        
+    # Check Redis
+    redis_ready = False
+    for i in range(10):
+        try:
+            r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+            r.ping()
+            redis_ready = True
+            logger.info("Redis is ready")
+            break
+        except Exception:
+            logger.info(f"Waiting for Redis... ({i+1}/10)")
+            time.sleep(5)
     
-    return kafka_ready
+    if not redis_ready:
+        logger.error("Redis not available after multiple attempts")
+    
+    return kafka_ready and redis_ready
 
 def main():
     """Main function to set up and run the Flink job"""

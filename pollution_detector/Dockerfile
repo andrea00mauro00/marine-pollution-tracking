@@ -18,7 +18,7 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 # 4. PyFlink and useful libraries
 RUN pip3 install \
       apache-flink==1.17.0 \
-      boto3 pandas \
+      boto3 pandas psycopg2-binary \
       redis kafka-python loguru python-dotenv
 
 # 5. Copy code and Kafka JAR files
@@ -26,6 +26,12 @@ COPY main.py /opt/main.py
 COPY data_templates.py /opt/data_templates.py
 COPY flink-connector-kafka-1.17.0.jar /opt/flink/lib/
 COPY kafka-clients-3.3.2.jar /opt/flink/lib/
+
+# Copia la directory services con il gestore degli hotspot
+COPY services/ /opt/services/
+
+# Assicura che services sia un pacchetto Python valido
+RUN touch /opt/services/__init__.py
 
 # 6. Entrypoint
 RUN printf '#!/bin/bash\n\
