@@ -125,12 +125,19 @@ def connect_to_timescaledb():
                 raise
 
 def get_minio_client():
-    """Crea e restituisce un client MinIO"""
+    """Crea e restituisce un client MinIO con timeout configurato"""
+    from botocore.config import Config
+    
     return boto3.client(
         's3',
         endpoint_url=f"http://{MINIO_ENDPOINT}",
         aws_access_key_id=MINIO_ACCESS_KEY,
-        aws_secret_access_key=MINIO_SECRET_KEY
+        aws_secret_access_key=MINIO_SECRET_KEY,
+        config=Config(
+            connect_timeout=10,
+            read_timeout=30,
+            retries={'max_attempts': 3}
+        )
     )
 
 def ensure_minio_buckets(s3_client):
@@ -148,60 +155,31 @@ def ensure_minio_buckets(s3_client):
             except Exception as e:
                 logger.error(f"Errore nella creazione del bucket '{bucket}': {e}")
 
-def create_tables(conn_timescale):
-    """Crea tabelle necessarie in TimescaleDB se non esistono"""
+def verify_tables(conn_timescale):
+    """Verifica che le tabelle necessarie esistano in TimescaleDB"""
     with conn_timescale.cursor() as cur:
-        # Estensione per TimescaleDB
-        cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
-        
-        # Tabella per misurazioni sensori con nomi variabili standardizzati
+        # Verifica che le tabelle esistano (dovrebbero essere state create dal setup)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS sensor_measurements (
-            time TIMESTAMPTZ NOT NULL,
-            source_type TEXT NOT NULL,
-            source_id TEXT NOT NULL,
-            latitude DOUBLE PRECISION,
-            longitude DOUBLE PRECISION,
-            temperature DOUBLE PRECISION,
-            ph DOUBLE PRECISION,
-            turbidity DOUBLE PRECISION,
-            wave_height DOUBLE PRECISION,
-            microplastics DOUBLE PRECISION,
-            water_quality_index DOUBLE PRECISION,
-            risk_score DOUBLE PRECISION,
-            pollution_level TEXT,
-            pollutant_type TEXT
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_name = 'sensor_measurements'
         );
         """)
+        if not cur.fetchone()[0]:
+            logger.error("Table 'sensor_measurements' not found! Database setup may have failed.")
+            raise Exception("Required tables not found in TimescaleDB")
         
-        # Converti in hypertable se non lo è già
-        cur.execute("SELECT create_hypertable('sensor_measurements', 'time', if_not_exists => TRUE);")
-        
-        # Tabella per metriche di inquinamento aggregate
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS pollution_metrics (
-            time TIMESTAMPTZ NOT NULL,
-            region TEXT NOT NULL,
-            avg_risk_score DOUBLE PRECISION,
-            max_risk_score DOUBLE PRECISION,
-            pollutant_types JSONB,
-            affected_area_km2 DOUBLE PRECISION,
-            sensor_count INTEGER
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_name = 'pollution_metrics'
         );
         """)
+        if not cur.fetchone()[0]:
+            logger.error("Table 'pollution_metrics' not found! Database setup may have failed.")
+            raise Exception("Required tables not found in TimescaleDB")
         
-        # Converti in hypertable se non lo è già
-        cur.execute("SELECT create_hypertable('pollution_metrics', 'time', if_not_exists => TRUE);")
-        
-        # NUOVO: Aggiungi indici per query comuni
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_sensor_measurements_source_id ON sensor_measurements(source_id);
-        CREATE INDEX IF NOT EXISTS idx_sensor_measurements_pollution_level ON sensor_measurements(pollution_level);
-        CREATE INDEX IF NOT EXISTS idx_pollution_metrics_region ON pollution_metrics(region);
-        """)
-        
-        conn_timescale.commit()
-        logger.info("Tabelle TimescaleDB create/verificate con indici")
+        logger.info("TimescaleDB tables verified successfully")
 
 def process_raw_buoy_data(s3_client, data):
     """Processa dati grezzi della boa e li archivia nel livello Bronze"""
@@ -372,8 +350,21 @@ def process_analyzed_sensor_data(s3_client, conn_timescale, data):
             logger.info(f"Salvati dati in TimescaleDB: sensor_measurements per sensore {location.get('sensor_id')}")
         
         return True
+    except psycopg2.OperationalError as e:
+        logger.error(f"Database connection error in sensor data processing: {e}")
+        if conn_timescale:
+            conn_timescale.rollback()
+        return False
+    except psycopg2.ProgrammingError as e:
+        logger.error(f"SQL programming error in sensor data processing: {e}")
+        if conn_timescale:
+            conn_timescale.rollback()
+        return False
+    except ClientError as e:
+        logger.error(f"MinIO S3 error in sensor data processing: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Errore nel processare i dati sensore analizzati: {e}")
+        logger.error(f"Unexpected error in sensor data processing: {e}")
         if conn_timescale:
             conn_timescale.rollback()
         return False
@@ -555,11 +546,12 @@ def main():
         logger.error(f"Errore nella configurazione di MinIO: {e}")
         return
     
-    # Crea tabelle
+    # Verifica tabelle (dovrebbero essere state create dal setup_database)
     try:
-        create_tables(conn_timescale)
+        verify_tables(conn_timescale)
     except Exception as e:
-        logger.error(f"Errore nella creazione delle tabelle: {e}")
+        logger.error(f"Errore nella verifica delle tabelle: {e}")
+        logger.error("Assicurati che il servizio setup_database sia stato eseguito correttamente")
         return
     
     # Crea consumer Kafka
