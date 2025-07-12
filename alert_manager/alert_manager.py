@@ -102,8 +102,8 @@ class AlertManager:
             self.redis_client.ping()  # Test connection
             logger.info("Connected to Redis")
             
-            # Initialize database schema if needed
-            self._ensure_tables_exist()
+            # Verify database schema exists
+            self._verify_tables_exist()
             
         except Exception as e:
             logger.error(f"Error initializing connections: {e}")
@@ -111,54 +111,33 @@ class AlertManager:
                 self.conn.close()
                 self.conn = None
     
-    def _ensure_tables_exist(self):
-        """Ensure necessary tables exist in the database"""
+    def _verify_tables_exist(self):
+        """Verify necessary tables exist in the database (should be created by setup_database)"""
         try:
             with self.conn.cursor() as cur:
-                # Check if our tables exist, create if they don't
+                # Verify pollution_alerts table exists
                 cur.execute("SELECT to_regclass('public.pollution_alerts')")
                 if cur.fetchone()[0] is None:
-                    logger.info("Creating pollution_alerts table")
-                    cur.execute("""
-                        CREATE TABLE pollution_alerts (
-                            alert_id TEXT PRIMARY KEY,
-                            source_id TEXT NOT NULL,
-                            source_type TEXT NOT NULL,
-                            alert_type TEXT NOT NULL,
-                            alert_time TIMESTAMPTZ NOT NULL,
-                            severity TEXT NOT NULL,
-                            latitude FLOAT NOT NULL,
-                            longitude FLOAT NOT NULL,
-                            pollutant_type TEXT NOT NULL,
-                            risk_score FLOAT NOT NULL,
-                            message TEXT NOT NULL,
-                            details JSONB,
-                            processed BOOLEAN DEFAULT FALSE,
-                            notifications_sent JSONB DEFAULT '{}',
-                            creation_time TIMESTAMPTZ DEFAULT NOW()
-                        )
-                    """)
+                    logger.error("Table 'pollution_alerts' not found! Database setup may have failed.")
+                    raise Exception("Required table 'pollution_alerts' not found in database")
                 
+                # Verify alert_notification_config table exists  
+                cur.execute("SELECT to_regclass('public.alert_notification_config')")
+                if cur.fetchone()[0] is None:
+                    logger.error("Table 'alert_notification_config' not found! Database setup may have failed.")
+                    raise Exception("Required table 'alert_notification_config' not found in database")
+                
+                # Verify alert_notifications table exists  
                 cur.execute("SELECT to_regclass('public.alert_notifications')")
                 if cur.fetchone()[0] is None:
-                    logger.info("Creating alert_notifications table")
-                    cur.execute("""
-                        CREATE TABLE alert_notifications (
-                            notification_id SERIAL PRIMARY KEY,
-                            alert_id TEXT REFERENCES pollution_alerts(alert_id),
-                            notification_type TEXT NOT NULL,
-                            recipients JSONB NOT NULL,
-                            sent_at TIMESTAMPTZ DEFAULT NOW(),
-                            status TEXT NOT NULL,
-                            response_data JSONB
-                        )
-                    """)
+                    logger.error("Table 'alert_notifications' not found! Database setup may have failed.")
+                    raise Exception("Required table 'alert_notifications' not found in database")
                 
-                self.conn.commit()
-                logger.info("Database tables verified")
+                logger.info("All required database tables verified successfully")
         except Exception as e:
-            logger.error(f"Error ensuring tables exist: {e}")
-            self.conn.rollback()
+            logger.error(f"Error verifying tables exist: {e}")
+            logger.error("Make sure the setup_database service has run correctly")
+            raise
     
     def process_alert(self, alert_data):
         """Process an incoming alert"""

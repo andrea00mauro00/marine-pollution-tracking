@@ -38,3 +38,19 @@ CREATE TABLE IF NOT EXISTS alert_notification_config (
 
 CREATE INDEX IF NOT EXISTS idx_alert_notification_config_region ON alert_notification_config(region_id);
 CREATE INDEX IF NOT EXISTS idx_alert_notification_config_severity ON alert_notification_config(severity_level);
+
+-- Tabella per tracking notifiche inviate (usata dall'alert_manager)
+CREATE TABLE IF NOT EXISTS alert_notifications (
+  notification_id SERIAL PRIMARY KEY,
+  alert_id TEXT REFERENCES pollution_alerts(alert_id),
+  notification_type TEXT NOT NULL,   -- "email", "sms", "webhook"
+  recipients JSONB NOT NULL,         -- Lista destinatari o endpoint
+  sent_at TIMESTAMPTZ DEFAULT NOW(),
+  status TEXT NOT NULL,              -- "sent", "failed", "pending"
+  response_data JSONB,               -- Dati di risposta dal servizio
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_notifications_alert_id ON alert_notifications(alert_id);
+CREATE INDEX IF NOT EXISTS idx_alert_notifications_status ON alert_notifications(status);
+CREATE INDEX IF NOT EXISTS idx_alert_notifications_sent_at ON alert_notifications(sent_at);
