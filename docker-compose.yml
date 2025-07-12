@@ -315,6 +315,7 @@ services:
 
   timescaledb:
     image: timescale/timescaledb-ha:pg14-latest
+    platform: linux/amd64 
     container_name: timescaledb
     ports:
       - "5433:5432"

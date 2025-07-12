@@ -1,9 +1,6 @@
 import time, json, requests, random, sys, os, yaml
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
-from confluent_kafka import SerializingProducer
-from confluent_kafka.schema_registry import SchemaRegistryClient
-from confluent_kafka.schema_registry.avro import AvroSerializer
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -14,45 +11,14 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "buoy_data")
 POLL_INTERVAL_SEC = int(os.getenv("GENERATE_INTERVAL_SECONDS", 30))
 DLQ_TOPIC = os.getenv("DLQ_TOPIC", "buoy_data_dlq")  # Dead Letter Queue
-SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 
 # Logger setup
 logger.remove()
 logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
 
-def schema_registry_producer():
-    """Creates a Kafka producer with Schema Registry integration"""
-    try:
-        # Create Schema Registry client
-        schema_registry_conf = {'url': SCHEMA_REGISTRY_URL}
-        schema_registry_client = SchemaRegistryClient(schema_registry_conf)
-        
-        # Get the Avro schema
-        with open('schemas/avro/buoy_data.avsc', 'r') as f:
-            schema_str = f.read()
-        
-        # Create Avro serializer
-        avro_serializer = AvroSerializer(
-            schema_registry_client, 
-            schema_str, 
-            lambda x, ctx: x  # Value to dict conversion function
-        )
-        
-        # Configure Kafka producer with Avro serializer
-        producer_conf = {
-            'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
-            'value.serializer': avro_serializer,
-            'error.cb': on_delivery_error
-        }
-        
-        return SerializingProducer(producer_conf)
-    except Exception as e:
-        logger.error(f"Failed to create Schema Registry producer: {e}")
-        return fallback_producer()
-
-def fallback_producer():
-    """Fallback to regular JSON producer if Schema Registry fails"""
-    logger.warning("Using fallback JSON producer without Schema Registry")
+def create_kafka_producer():
+    """Creates a regular JSON producer"""
+    logger.info("Creating Kafka JSON producer")
     for _ in range(5):
         try:
             return KafkaProducer(
@@ -353,14 +319,9 @@ def validate_sensor_data(data):
 def main():
     locs = yaml.safe_load(open("locations.yml"))
     
-    # Try to use Schema Registry producer first
-    try:
-        prod = schema_registry_producer()
-        logger.success("✅ Connected to Kafka with Schema Registry")
-    except Exception as e:
-        logger.error(f"Schema Registry error: {e}")
-        prod = fallback_producer()
-        logger.success("✅ Connected to Kafka using fallback producer")
+    # Create Kafka producer
+    prod = create_kafka_producer()
+    logger.success("✅ Connected to Kafka")
     
     logger.info("🔄 Mode: External APIs + fallback to simulated data")
 
@@ -413,20 +374,9 @@ def main():
             # Calculate Water Quality Index
             buoy["water_quality_index"] = calculate_water_quality_index(buoy)
             
-            # Validate message before sending
+            # Send data to Kafka
             try:
-                # Use SerializingProducer's produce method
-                if isinstance(prod, SerializingProducer):
-                    prod.produce(
-                        topic=KAFKA_TOPIC,
-                        value=buoy,
-                        on_delivery=lambda err, msg: logger.error(f"Message delivery failed: {err}") if err else None
-                    )
-                    # Manual flush after each message to handle errors properly
-                    prod.flush()
-                else:
-                    # Fallback to standard KafkaProducer
-                    prod.send(KAFKA_TOPIC, value=buoy)
+                prod.send(KAFKA_TOPIC, value=buoy)
             except Exception as e:
                 logger.error(f"Error sending data for {loc['id']}: {e}")
                 # Send to DLQ
@@ -461,9 +411,8 @@ def main():
             logger.info(f"  🦠 Biological: Coliform={buoy.get('coliform_bacteria', 'N/A')}, Chlorophyll={buoy.get('chlorophyll_a', 'N/A')}μg/L")
             logger.info("  " + "-"*80)
 
-        # Standard producer flush
-        if isinstance(prod, KafkaProducer):
-            prod.flush()
+        # Flush producer
+        prod.flush()
             
         logger.info(f"Sleep {POLL_INTERVAL_SEC} seconds\n")
         time.sleep(POLL_INTERVAL_SEC)

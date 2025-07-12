@@ -170,13 +170,15 @@ def init_redis():
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
         
-        # Pulisci tutte le chiavi esistenti legate agli hotspot
-        existing_keys = r.keys("hotspot:*") + r.keys("spatial:*") + r.keys("config:hotspot:*")
+        # Pulisci tutte le chiavi esistenti
+        existing_keys = r.keys("hotspot:*") + r.keys("spatial:*") + r.keys("config:*") + \
+                        r.keys("counters:*") + r.keys("cache:*") + r.keys("dashboard:*") + \
+                        r.keys("alert:*")
         if existing_keys:
             r.delete(*existing_keys)
             logger.info(f"Rimosse {len(existing_keys)} chiavi Redis esistenti")
         
-        # Configurazione sistema
+        # Configurazione sistema (esistente)
         r.set("config:hotspot:spatial_bin_size", "0.05")     # Dimensione griglia spaziale in gradi (~5km)
         r.set("config:hotspot:ttl_hours", "72")              # Tempo di vita massimo hotspot attivi
         r.set("config:alert:cooldown_minutes:low", "60")     # Cooldown per alert a bassa priorità
@@ -184,19 +186,37 @@ def init_redis():
         r.set("config:alert:cooldown_minutes:high", "15")    # Cooldown per alert ad alta priorità
         r.set("config:prediction:min_interval_minutes", "30") # Intervallo minimo tra previsioni
         
-        # Inizializza contatori
+        # Nuove configurazioni per cache e dashboard
+        r.set("config:cache:dashboard_refresh_seconds", "60")  # Intervallo aggiornamento dashboard
+        r.set("config:cache:alerts_ttl", "3600")             # TTL per cache alert (1 ora)
+        r.set("config:cache:sensor_data_ttl", "1800")        # TTL per dati sensori (30 minuti)
+        r.set("config:cache:predictions_ttl", "7200")        # TTL per previsioni (2 ore)
+        r.set("config:dashboard:max_items", "50")            # Numero massimo elementi in liste dashboard
+        
+        # Inizializza contatori (esistenti)
         r.set("counters:hotspots:total", "0")
         r.set("counters:alerts:total", "0")
         r.set("counters:predictions:total", "0")
         
-        # Crea strutture di base per tracciamento spaziale
+        # Nuovi contatori per dashboard e alert
+        r.set("counters:alerts:active", "0")                # Alert attivi
+        r.set("counters:alerts:by_severity:high", "0")      # Alert per severità
+        r.set("counters:alerts:by_severity:medium", "0")
+        r.set("counters:alerts:by_severity:low", "0")
+        r.set("counters:hotspots:active", "0")              # Hotspot attivi
+        
+        # Crea strutture di base per tracciamento spaziale (esistente)
         r.sadd("hotspot:indices", "spatial")
         
-        # Impostazione TTL per cache hotspot
+        # Strutture per dashboard
+        r.sadd("dashboard:indices", "hotspots", "alerts", "predictions")
+        
+        # Impostazione TTL (esistente)
         r.set("config:cache:hotspot_metadata_ttl", "86400")  # 24 ore
         
         # Verifica configurazione
         logger.info(f"✅ Configurazioni impostate: {r.keys('config:*')}")
+        logger.info(f"✅ Contatori inizializzati: {r.keys('counters:*')}")
         
         logger.info("✅ Strutture Redis inizializzate con successo")
         

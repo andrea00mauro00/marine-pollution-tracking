@@ -24,7 +24,6 @@ from io import BytesIO
 import numpy as np
 import pickle
 from PIL import Image, ImageEnhance, ImageFilter
-from botocore.config import Config
 
 # PyFlink imports
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
@@ -171,12 +170,7 @@ class ImageStandardizer(ProcessFunction):
                 's3',
                 endpoint_url=f"http://{MINIO_ENDPOINT}",
                 aws_access_key_id=MINIO_ACCESS_KEY,
-                aws_secret_access_key=MINIO_SECRET_KEY,
-                config=Config(
-                    connect_timeout=10,
-                    read_timeout=30,
-                    retries={'max_attempts': 3}
-                )
+                aws_secret_access_key=MINIO_SECRET_KEY
             )
             
             # Retrieve image from Bronze layer with error handling and retry

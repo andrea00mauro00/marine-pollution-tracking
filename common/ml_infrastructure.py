@@ -5,7 +5,6 @@ import logging
 import time
 import boto3
 from botocore.exceptions import ClientError
-from botocore.config import Config
 
 # Configure logging
 logging.basicConfig(
@@ -62,12 +61,7 @@ class ModelManager:
                     's3',
                     endpoint_url=f'http://{minio_endpoint}',
                     aws_access_key_id=access_key,
-                    aws_secret_access_key=secret_key,
-                    config=Config(
-                        connect_timeout=10,
-                        read_timeout=30,
-                        retries={'max_attempts': 3}
-                    )
+                    aws_secret_access_key=secret_key
                 )
                 # Test connection
                 self.s3_client.list_buckets()

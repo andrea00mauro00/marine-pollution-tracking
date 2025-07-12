@@ -55,12 +55,12 @@ MIN_POINTS = 2               # Minimum points to form a cluster
 GRID_SIZE_DEG = 0.05         # Grid size for spatial indexing
 
 # Confidence estimation parameters
-CONFIDENCE_THRESHOLD = 0.7  # RESTORED: Minimum confidence for validated hotspots
+CONFIDENCE_THRESHOLD = 0.05  # ABBASSATO: Minimum confidence for validated hotspots
 
 # Risk thresholds
-HIGH_RISK_THRESHOLD = 0.7    # RESTORED: Threshold for high severity
-MEDIUM_RISK_THRESHOLD = 0.4  # RESTORED: Threshold for medium severity
-DETECTION_THRESHOLD = 0.4    # RESTORED: Minimum risk to consider
+HIGH_RISK_THRESHOLD = 0.6    # ABBASSATO: Threshold for high severity (was 0.7)
+MEDIUM_RISK_THRESHOLD = 0.3  # ABBASSATO: Threshold for medium severity (was 0.4)
+DETECTION_THRESHOLD = 0.3    # ABBASSATO: Minimum risk to consider (was 0.4)
 
 # Timer parameters
 CLUSTERING_INTERVAL_MS = 60000  # Run clustering every 1 minute
@@ -92,117 +92,38 @@ class PollutionEventDetector(MapFunction):
             data = json.loads(value)
             source_type = data.get("source_type", "unknown")
             
-            # Extract location
-            location = None
-            if source_type == "buoy":
-                location = data.get("location")
-            elif source_type == "satellite":
-                # Check different location fields for satellite data
-                if "center_location" in data:
-                    location = data.get("center_location")
-                elif "location" in data:
-                    location = data.get("location")
-                elif "metadata" in data and isinstance(data["metadata"], dict):
-                    metadata = data["metadata"]
-                    if "latitude" in metadata and "longitude" in metadata:
-                        location = {
-                            "latitude": metadata["latitude"], 
-                            "longitude": metadata["longitude"]
-                        }
-                    elif "lat" in metadata and "lon" in metadata:
-                        location = {
-                            "latitude": metadata["lat"], 
-                            "longitude": metadata["lon"]
-                        }
-                elif "pollution_detection" in data and "spectral_analysis" in data:
-                    if "processed_bands" in data["spectral_analysis"]:
-                        bands = data["spectral_analysis"]["processed_bands"]
-                        if bands and "lat" in bands[0] and "lon" in bands[0]:
-                            location = {
-                                "latitude": bands[0]["lat"],
-                                "longitude": bands[0]["lon"]
-                            }
+            logger.info(f"[DEBUG] Processing data from source: {source_type}")
             
-            # Extract pollution analysis
-            pollution_analysis = None
-            if source_type == "buoy":
-                pollution_analysis = data.get("pollution_analysis")
-            elif source_type == "satellite":
-                # Try multiple possible field names
-                if "detected_pollution" in data:
-                    pollution_analysis = data.get("detected_pollution")
-                elif "pollution_detection" in data:
-                    pollution_analysis = data.get("pollution_detection")
+            # Extract location - NORMALIZZATO per compatibilità con Image Standardizer
+            location = self._extract_location(data)
+            if not location:
+                logger.warning(f"[DEBUG] Missing location info for {source_type}")
+                return value
             
+            # Estrai pollution analysis - NORMALIZZATO per compatibilità con Image Standardizer
+            pollution_analysis = self._extract_pollution_analysis(data, source_type)
             if not pollution_analysis:
+                logger.info(f"[DEBUG] No pollution analysis found for {source_type}")
                 return value
             
             # Standardize pollution analysis format
-            risk_score = 0.0
-            pollutant_type = "unknown"
-            severity = "low"
+            risk_score, pollutant_type, severity = self._normalize_pollution_data(pollution_analysis, source_type)
             
-            if source_type == "buoy":
-                # Format for buoy data
-                pollutant_type = pollution_analysis.get("pollutant_type", "unknown")
-                risk_score = pollution_analysis.get("risk_score", 0.0)
-                severity = pollution_analysis.get("level", "low")
-            elif source_type == "satellite":
-                # Handle satellite data
-                if isinstance(pollution_analysis, dict):
-                    # Try multiple field names for risk score
-                    if "risk_score" in pollution_analysis:
-                        risk_score = pollution_analysis["risk_score"]
-                    elif "confidence" in pollution_analysis:
-                        risk_score = pollution_analysis["confidence"]
-                    
-                    # Try multiple field names for pollutant type
-                    if "pollutant_type" in pollution_analysis:
-                        pollutant_type = pollution_analysis["pollutant_type"]
-                    elif "type" in pollution_analysis:
-                        pollutant_type = pollution_analysis["type"]
-                    
-                    # For satellite data, calculate severity based on risk score
-                    severity = "high" if risk_score > HIGH_RISK_THRESHOLD else "medium" if risk_score > MEDIUM_RISK_THRESHOLD else "low"
-            
-            # Skip if location info is insufficient
-            if not location:
-                logger.warning(f"Missing location info for {source_type}")
-                return value
-            
-            # Normalize location format
-            latitude = None
-            longitude = None
-            if "latitude" in location:
-                latitude = location.get("latitude")
-                longitude = location.get("longitude")
-            elif "center_latitude" in location:
-                latitude = location.get("center_latitude")
-                longitude = location.get("center_longitude")
-            elif "center_lat" in location:
-                latitude = location.get("center_lat")
-                longitude = location.get("center_lon")
-            elif "lat" in location:
-                latitude = location.get("lat")
-                longitude = location.get("lon")
-            
-            if latitude is None or longitude is None:
-                logger.warning(f"Invalid location coordinates for {source_type}: {location}")
-                return value
+            logger.info(f"[DEBUG] Risk score for {source_type}: {risk_score}, threshold: {self.risk_threshold}")
             
             # If risk score exceeds threshold, create event data
             if risk_score >= self.risk_threshold:
                 event_id = str(uuid.uuid4())
                 
                 # Find environmental region
-                region_id = self._get_environmental_region(latitude, longitude)
+                region_id = self._get_environmental_region(location["latitude"], location["longitude"])
                 
                 event_data = {
                     "event_id": event_id,
                     "timestamp": data.get("timestamp", int(time.time() * 1000)),
                     "location": {
-                        "latitude": latitude,
-                        "longitude": longitude
+                        "latitude": location["latitude"],
+                        "longitude": location["longitude"]
                     },
                     "pollutant_type": pollutant_type,
                     "severity": severity,
@@ -219,11 +140,14 @@ class PollutionEventDetector(MapFunction):
                 
                 # Add event info to original data
                 data["pollution_event_detection"] = event_data
-                logger.info(f"[EVENT DETECTED] {source_type} pollution event at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
+                logger.info(f"[EVENT DETECTED] {source_type} pollution event at ({location['latitude']}, {location['longitude']}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
                 
-                # Ensure severity is properly set based on risk score
+                # Force severity to high for testing if risk_score is sufficient
                 if risk_score >= HIGH_RISK_THRESHOLD and severity != "high":
+                    logger.info(f"[DEBUG] Forcing severity to HIGH for testing (risk_score: {risk_score})")
                     data["pollution_event_detection"]["severity"] = "high"
+            else:
+                logger.info(f"[DEBUG] Risk score {risk_score} below threshold {self.risk_threshold}, skipping")
             
             return json.dumps(data)
             
@@ -231,6 +155,95 @@ class PollutionEventDetector(MapFunction):
             logger.error(f"[ERROR] Error in pollution event detection: {e}")
             traceback.print_exc()
             return value
+    
+    def _extract_location(self, data):
+        """Estrae e normalizza le informazioni di location da diverse strutture possibili"""
+        # Prima controlla il campo location standard dell'Image Standardizer
+        if "location" in data:
+            location = data["location"]
+            result = {}
+            
+            # Gestisci sia latitude/longitude che center_latitude/center_longitude
+            if "latitude" in location and "longitude" in location:
+                result["latitude"] = location["latitude"]
+                result["longitude"] = location["longitude"]
+                return result
+            elif "center_latitude" in location and "center_longitude" in location:
+                result["latitude"] = location["center_latitude"]
+                result["longitude"] = location["center_longitude"]
+                return result
+        
+        # Controlla in pollution_detection per i dati satellitari
+        if "pollution_detection" in data and isinstance(data["pollution_detection"], dict):
+            if "location" in data["pollution_detection"]:
+                loc = data["pollution_detection"]["location"]
+                if "latitude" in loc and "longitude" in loc:
+                    return {"latitude": loc["latitude"], "longitude": loc["longitude"]}
+        
+        # Controlla nei metadati
+        if "metadata" in data and isinstance(data["metadata"], dict):
+            metadata = data["metadata"]
+            if "latitude" in metadata and "longitude" in metadata:
+                return {"latitude": metadata["latitude"], "longitude": metadata["longitude"]}
+            elif "lat" in metadata and "lon" in metadata:
+                return {"latitude": metadata["lat"], "longitude": metadata["lon"]}
+        
+        # Controlla l'analisi spettrale
+        if "spectral_analysis" in data and "processed_bands" in data["spectral_analysis"]:
+            bands = data["spectral_analysis"]["processed_bands"]
+            if bands and isinstance(bands, list) and len(bands) > 0:
+                if "lat" in bands[0] and "lon" in bands[0]:
+                    return {"latitude": bands[0]["lat"], "longitude": bands[0]["lon"]}
+        
+        return None
+    
+    def _extract_pollution_analysis(self, data, source_type):
+        """Estrae l'analisi dell'inquinamento dalla struttura dati"""
+        # Per dati satellitari, usa pollution_detection (formato Image Standardizer)
+        if source_type == "satellite" and "pollution_detection" in data:
+            return data["pollution_detection"]
+        
+        # Per dati da boe, usa il campo standard pollution_analysis
+        if source_type == "buoy" and "pollution_analysis" in data:
+            return data["pollution_analysis"]
+        
+        # Fallback: cerca anche detected_pollution per compatibilità
+        if "detected_pollution" in data:
+            return data["detected_pollution"]
+        
+        return None
+    
+    def _normalize_pollution_data(self, pollution_analysis, source_type):
+        """Normalizza i dati di inquinamento in un formato standard"""
+        risk_score = 0.0
+        pollutant_type = "unknown"
+        severity = "low"
+        
+        if source_type == "buoy":
+            # Format for buoy data
+            pollutant_type = pollution_analysis.get("pollutant_type", "unknown")
+            risk_score = pollution_analysis.get("risk_score", 0.0)
+            severity = pollution_analysis.get("level", "low")
+        elif source_type == "satellite":
+            # Per satellite, gestisci sia format type/confidence (Image Standardizer)
+            # che pollutant_type/risk_score (format legacy)
+            
+            # Risk score - prova entrambi i campi
+            if "confidence" in pollution_analysis:
+                risk_score = pollution_analysis["confidence"]
+            elif "risk_score" in pollution_analysis:
+                risk_score = pollution_analysis["risk_score"]
+            
+            # Pollutant type - prova entrambi i campi
+            if "type" in pollution_analysis:
+                pollutant_type = pollution_analysis["type"]
+            elif "pollutant_type" in pollution_analysis:
+                pollutant_type = pollution_analysis["pollutant_type"]
+            
+            # Calcola severity basata su risk score
+            severity = "high" if risk_score > HIGH_RISK_THRESHOLD else "medium" if risk_score > MEDIUM_RISK_THRESHOLD else "low"
+        
+        return risk_score, pollutant_type, severity
     
     def _get_environmental_region(self, latitude, longitude):
         """Determine which environmental region contains the coordinates"""
@@ -245,7 +258,7 @@ class PollutionEventDetector(MapFunction):
 
 class AlertExtractor(MapFunction):
     """
-    Extracts alert events based on severity
+    Extracts alert events based on severity - modified to only handle hotspots
     """
     def __init__(self):
         self.redis_client = None
@@ -262,47 +275,8 @@ class AlertExtractor(MapFunction):
         try:
             data = json.loads(value)
             
-            # Check if this is an event with pollution_event_detection
-            event_detection = data.get("pollution_event_detection")
-            if event_detection:
-                severity = event_detection.get("severity")
-                risk_score = event_detection.get("risk_score", 0.0)
-                source_type = event_detection.get("detection_source", "unknown")
-                pollutant_type = event_detection.get("pollutant_type", "unknown")
-                
-                # Extract location for logging
-                location = event_detection.get("location", {})
-                latitude = location.get("latitude", "unknown")
-                longitude = location.get("longitude", "unknown")
-                
-                # Log only significant events
-                if severity in ["medium", "high"]:
-                    logger.info(f"[ALERT CHECK] Checking event: severity={severity}, risk={risk_score}, source={source_type}")
-                
-                # Check severity - if medium or high, this is an alert
-                if severity in ["medium", "high"]:
-                    # Check for cooldown if Redis is available
-                    if self.redis_client:
-                        event_id = event_detection.get("event_id", "unknown")
-                        cooldown_key = f"alert:cooldown:event:{event_id}"
-                        
-                        # Skip if in cooldown
-                        if self.redis_client.exists(cooldown_key):
-                            logger.info(f"[ALERT FILTERED] Event {event_id} is in cooldown period, skipping")
-                            return None
-                        
-                        # Set cooldown (30 min for medium, 15 min for high)
-                        cooldown_seconds = 1800 if severity == "medium" else 900
-                        self.redis_client.setex(cooldown_key, cooldown_seconds, "1")
-                    
-                    logger.info(f"[ALERT GENERATED] {source_type} alert at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
-                    return value
-                else:
-                    logger.info(f"[ALERT FILTERED] Event severity '{severity}' not high enough for alert")
-                    return None
-            
-            # Check if this is a hotspot
-            elif "hotspot_id" in data:
+            # Check only for hotspots
+            if "hotspot_id" in data:
                 hotspot_id = data.get("hotspot_id")
                 severity = data.get("severity")
                 avg_risk = data.get("avg_risk_score", 0.0)
@@ -313,8 +287,8 @@ class AlertExtractor(MapFunction):
                 
                 # Extract location for logging
                 location = data.get("location", {})
-                latitude = location.get("center_latitude", location.get("center_lat", "unknown"))
-                longitude = location.get("center_longitude", location.get("center_lon", "unknown"))
+                latitude = location.get("center_latitude", location.get("latitude", "unknown"))
+                longitude = location.get("center_longitude", location.get("longitude", "unknown"))
                 
                 logger.info(f"[ALERT CHECK] Checking hotspot: severity={severity}, avg_risk={avg_risk}, is_update={is_update}")
                 
@@ -357,7 +331,7 @@ class AlertExtractor(MapFunction):
                     logger.info(f"[ALERT FILTERED] Hotspot severity '{severity}' not high enough for alert")
                     return None
             
-            # Not an event or hotspot
+            # Not a hotspot
             return None
             
         except Exception as e:
@@ -400,7 +374,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Initialize HotspotManager
         self.hotspot_manager = HotspotManager()
         
-        logger.info("SpatialClusteringProcessor initialized with HotspotManager")
+        logger.info("[DEBUG] SpatialClusteringProcessor initialized with HotspotManager")
     
     def process_element(self, value, ctx):
         try:
@@ -421,8 +395,11 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             source_type = event_detection["detection_source"]
             severity = event_detection["severity"]
             
+            logger.info(f"[DEBUG] Processing event: {event_id} from {source_type} with risk {risk_score}, severity: {severity}")
+            
             # Skip if already processed
             if self.processed_events.contains(event_id):
+                logger.info(f"[DEBUG] Event {event_id} already processed, skipping")
                 return
             
             # Mark as processed
@@ -444,6 +421,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             # Store point in state
             point_key = f"{event_id}"
             self.points_state.put(point_key, json.dumps(point_data))
+            logger.info(f"[DEBUG] Stored point: {point_key}")
             
             # Check if this is the first event - if so, schedule initial timer
             if self.first_event_processed.value() is None:
@@ -452,7 +430,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                 next_trigger = current_time + 10000  # 10 seconds from now
                 ctx.timer_service().register_processing_time_timer(next_trigger)
                 self.timer_state.update(next_trigger)
-                logger.info(f"Scheduled initial clustering at {next_trigger}")
+                logger.info(f"[DEBUG] Scheduled initial clustering at {next_trigger}")
                 
                 # Mark first event as processed
                 self.first_event_processed.update(True)
@@ -466,12 +444,11 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                     trigger_time = current_time + CLUSTERING_INTERVAL_MS
                     ctx.timer_service().register_processing_time_timer(trigger_time)
                     self.timer_state.update(trigger_time)
-                    logger.info(f"Scheduled clustering at {trigger_time} (in {CLUSTERING_INTERVAL_MS/1000} seconds)")
+                    logger.info(f"[DEBUG] Scheduled clustering at {trigger_time} (in {CLUSTERING_INTERVAL_MS/1000} seconds)")
             
-            # Count total points in state for monitoring
+            # Debug: Count total points in state
             point_count = sum(1 for _ in self.points_state.keys())
-            if point_count % 10 == 0:  # Log every 10 points to avoid spam
-                logger.info(f"Total points in state: {point_count}")
+            logger.info(f"[DEBUG] Total points in state: {point_count}")
         
         except Exception as e:
             logger.error(f"[ERROR] Error in spatial clustering processor: {e}")
@@ -718,7 +695,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Determine severity
         severity = "high" if avg_risk > HIGH_RISK_THRESHOLD else "medium" if avg_risk > MEDIUM_RISK_THRESHOLD else "low"
         
-        # Create hotspot data
+        # Create hotspot data - CORRETTO per usare center_latitude/center_longitude
         hotspot = {
             "hotspot_id": f"hotspot-{uuid.uuid4()}",
             "cluster_id": cluster_id,
@@ -914,14 +891,7 @@ def main():
     # 4. Send all events to analyzed_data topic
     all_events.add_sink(analyzed_producer).name("Publish_All_Analyzed_Data")
     
-    # 5. Extract alerts from events using proper deserialization
-    event_alerts = all_events \
-        .map(AlertExtractor(), output_type=Types.STRING()) \
-        .filter(lambda x: x is not None) \
-        .name("Extract_Event_Alerts")
-    
-    # 6. Send alerts to alert topic
-    event_alerts.add_sink(alert_producer).name("Publish_Event_Alerts")
+
     
     # 7. Perform spatial clustering
     hotspots = all_events \
