@@ -115,6 +115,8 @@ class SensorAnalyzer(MapFunction):
         self.parameter_history = {}
         # Window size for moving average and deviation calculations
         self.window_size = 10
+        # Maximum number of sensors to keep in history (prevent memory leak)
+        self.max_sensors = 1000
         
         # IMPORTANTE: NON inizializzare ModelManager ed ErrorHandler qui
         # Saranno inizializzati nel metodo open()
@@ -160,6 +162,13 @@ class SensorAnalyzer(MapFunction):
             
             # Initialize sensor history if needed
             if sensor_id not in self.parameter_history:
+                # Check if we've exceeded max sensors limit
+                if len(self.parameter_history) >= self.max_sensors:
+                    # Remove the oldest sensor (simple FIFO cleanup)
+                    oldest_sensor = next(iter(self.parameter_history))
+                    del self.parameter_history[oldest_sensor]
+                    logger.info(f"Removed history for sensor {oldest_sensor} to prevent memory leak")
+                
                 self.parameter_history[sensor_id] = {}
             
             # Determine season for temperature analysis
