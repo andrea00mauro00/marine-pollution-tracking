@@ -33,3 +33,33 @@ CREATE INDEX IF NOT EXISTS idx_pollution_predictions_ahead ON pollution_predicti
 CREATE INDEX IF NOT EXISTS idx_pollution_predictions_location ON pollution_predictions USING gist (
   ST_SetSRID(ST_MakePoint(center_longitude, center_latitude), 4326)
 );
+
+-- Composite indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_pollution_predictions_hotspot_time 
+    ON pollution_predictions(hotspot_id, hours_ahead, prediction_time DESC);
+CREATE INDEX IF NOT EXISTS idx_pollution_predictions_location_time 
+    ON pollution_predictions(center_latitude, center_longitude, prediction_time DESC);
+CREATE INDEX IF NOT EXISTS idx_pollution_predictions_severity_confidence 
+    ON pollution_predictions(severity, confidence DESC) WHERE confidence > 0.7;
+CREATE INDEX IF NOT EXISTS idx_pollution_predictions_set_time 
+    ON pollution_predictions(prediction_set_id, prediction_time DESC);
+CREATE INDEX IF NOT EXISTS idx_pollution_predictions_pollutant_confidence 
+    ON pollution_predictions(pollutant_type, confidence DESC, prediction_time DESC) WHERE confidence > 0.5;
+
+-- Add validation constraints for pollution_predictions
+ALTER TABLE pollution_predictions 
+ADD CONSTRAINT check_pollution_predictions_coordinates 
+    CHECK (center_latitude >= -90 AND center_latitude <= 90 AND 
+           center_longitude >= -180 AND center_longitude <= 180),
+ADD CONSTRAINT check_pollution_predictions_radius_positive 
+    CHECK (radius_km > 0 AND area_km2 > 0),
+ADD CONSTRAINT check_pollution_predictions_hours_ahead 
+    CHECK (hours_ahead >= 0 AND hours_ahead <= 168), -- Max 1 week ahead
+ADD CONSTRAINT check_pollution_predictions_severity 
+    CHECK (severity IN ('low', 'medium', 'high')),
+ADD CONSTRAINT check_pollution_predictions_concentrations 
+    CHECK (surface_concentration >= 0 AND dissolved_concentration >= 0 AND evaporated_concentration >= 0),
+ADD CONSTRAINT check_pollution_predictions_scores 
+    CHECK (environmental_score >= 0 AND environmental_score <= 1 AND
+           priority_score >= 0 AND priority_score <= 1 AND
+           confidence >= 0 AND confidence <= 1);

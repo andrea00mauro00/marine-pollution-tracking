@@ -12,6 +12,15 @@ CREATE TABLE IF NOT EXISTS hotspot_correlations (
 CREATE INDEX IF NOT EXISTS idx_hotspot_correlations_source ON hotspot_correlations(source_hotspot_id);
 CREATE INDEX IF NOT EXISTS idx_hotspot_correlations_target ON hotspot_correlations(target_hotspot_id);
 
+-- Add validation constraints for hotspot_correlations
+ALTER TABLE hotspot_correlations 
+ADD CONSTRAINT check_hotspot_correlations_type 
+    CHECK (correlation_type IN ('same', 'split', 'merge', 'related')),
+ADD CONSTRAINT check_hotspot_correlations_score 
+    CHECK (correlation_score >= 0 AND correlation_score <= 1),
+ADD CONSTRAINT check_hotspot_correlations_different_ids 
+    CHECK (source_hotspot_id != target_hotspot_id);
+
 -- Tabella per tracciare l'evoluzione degli hotspot nel tempo
 CREATE TABLE IF NOT EXISTS hotspot_evolution (
   evolution_id SERIAL PRIMARY KEY,
@@ -29,3 +38,17 @@ CREATE TABLE IF NOT EXISTS hotspot_evolution (
 CREATE INDEX IF NOT EXISTS idx_hotspot_evolution_hotspot ON hotspot_evolution(hotspot_id);
 CREATE INDEX IF NOT EXISTS idx_hotspot_evolution_time ON hotspot_evolution(timestamp);
 CREATE INDEX IF NOT EXISTS idx_hotspot_evolution_event ON hotspot_evolution(event_type);
+
+-- Add validation constraints for hotspot_evolution
+ALTER TABLE hotspot_evolution 
+ADD CONSTRAINT check_hotspot_evolution_event_type 
+    CHECK (event_type IN ('created', 'updated', 'merged', 'split', 'archived')),
+ADD CONSTRAINT check_hotspot_evolution_coordinates 
+    CHECK (center_latitude >= -90 AND center_latitude <= 90 AND 
+           center_longitude >= -180 AND center_longitude <= 180),
+ADD CONSTRAINT check_hotspot_evolution_radius_positive 
+    CHECK (radius_km > 0),
+ADD CONSTRAINT check_hotspot_evolution_severity 
+    CHECK (severity IN ('low', 'medium', 'high')),
+ADD CONSTRAINT check_hotspot_evolution_risk_score 
+    CHECK (risk_score >= 0 AND risk_score <= 1);

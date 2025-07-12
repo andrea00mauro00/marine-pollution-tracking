@@ -85,34 +85,24 @@ def connect_to_redis():
                 logger.error(f"Failed to connect to Redis after {max_retries} attempts: {e}")
                 raise
 
-def create_tables(conn):
-    """Creates necessary tables in PostgreSQL if they don't exist"""
+def verify_tables(conn):
+    """Verifies that DLQ tables exist (should be created by setup_database)"""
     with conn.cursor() as cur:
-        # Table for DLQ records
+        # Check if dlq_records table exists
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS dlq_records (
-            id SERIAL PRIMARY KEY,
-            error_id TEXT NOT NULL,
-            original_topic TEXT NOT NULL,
-            dlq_topic TEXT NOT NULL,
-            error_message TEXT NOT NULL,
-            timestamp TIMESTAMPTZ NOT NULL,
-            data JSONB,
-            processed BOOLEAN DEFAULT FALSE,
-            resolution TEXT,
-            created_at TIMESTAMPTZ DEFAULT NOW()
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = 'dlq_records'
         )
         """)
         
-        # Index for faster queries
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_dlq_original_topic ON dlq_records(original_topic);
-        CREATE INDEX IF NOT EXISTS idx_dlq_timestamp ON dlq_records(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_dlq_processed ON dlq_records(processed);
-        """)
+        table_exists = cur.fetchone()[0]
+        if not table_exists:
+            logger.error("DLQ tables not found! Please run setup_database first.")
+            raise Exception("Database schema not initialized. Run setup_database.")
         
-        conn.commit()
-        logger.info("DLQ tables created/verified")
+        logger.info("DLQ tables verified successfully")
 
 def update_redis_metrics(redis_client, dlq_topic, original_topic, error_type):
     """Update error metrics in Redis for monitoring"""
@@ -226,9 +216,9 @@ def main():
     # Connect to PostgreSQL
     try:
         conn = connect_to_postgres()
-        create_tables(conn)
+        verify_tables(conn)
     except Exception as e:
-        logger.error(f"Error connecting to PostgreSQL: {e}")
+        logger.error(f"Error connecting to PostgreSQL or verifying schema: {e}")
         return
     
     # Connect to Redis
