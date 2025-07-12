@@ -5,7 +5,7 @@ Marine Pollution Monitoring System - Pollution Detector
 This job:
 1. Consumes analyzed sensor data and processed imagery from Kafka
 2. Performs spatial clustering to identify pollution hotspots
-3. Evaluates confidence levels for detected events
+3. Evaluates confidence levels for detected events using ML models
 4. Publishes detected pollution events for prediction and alerting
 """
 
@@ -16,6 +16,8 @@ import time
 import uuid
 import math
 import traceback
+import pickle
+import numpy as np
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict, deque
@@ -47,6 +49,11 @@ PROCESSED_IMAGERY_TOPIC = os.environ.get("PROCESSED_IMAGERY_TOPIC", "processed_i
 HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
 ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
 ANALYZED_DATA_TOPIC = os.environ.get("ANALYZED_DATA_TOPIC", "analyzed_data")
+
+# MinIO configuration
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
 # Spatial clustering parameters
 DISTANCE_THRESHOLD_KM = 5.0  # Cluster points within 5km
@@ -349,6 +356,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         self.timer_state = None
         self.first_event_processed = None
         self.hotspot_manager = None
+        self.confidence_model = None
         
     def open(self, runtime_context):
         # State to store pollution points
@@ -374,7 +382,39 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Initialize HotspotManager
         self.hotspot_manager = HotspotManager()
         
-        logger.info("[DEBUG] SpatialClusteringProcessor initialized with HotspotManager")
+        # Load ML model from MinIO
+        self._load_confidence_model()
+        
+        logger.info("[DEBUG] SpatialClusteringProcessor initialized with HotspotManager and ML Model")
+    
+    def _load_confidence_model(self):
+        """Load the confidence estimation model from MinIO"""
+        try:
+            import boto3
+            
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=f'http://{MINIO_ENDPOINT}',
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY
+            )
+            
+            # Load confidence estimation model
+            model_key = "pollution_detection/confidence_estimator_v1.pkl"
+            
+            try:
+                logger.info(f"Loading confidence estimation model from models/{model_key}")
+                response = s3_client.get_object(Bucket="models", Key=model_key)
+                model_bytes = response['Body'].read()
+                self.confidence_model = pickle.loads(model_bytes)
+                logger.info("Confidence estimation model loaded successfully")
+            except Exception as e:
+                logger.error(f"Error loading confidence estimation model: {e}")
+                logger.info("Will use heuristic confidence estimation instead")
+                self.confidence_model = None
+        except Exception as e:
+            logger.error(f"Error in model loading: {e}")
+            self.confidence_model = None
     
     def process_element(self, value, ctx):
         try:
@@ -512,8 +552,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                 # Calculate cluster characteristics
                 hotspot = self._analyze_cluster(cluster_id, cluster_points)
                 
-                # Estimate confidence
-                confidence = self._estimate_confidence(cluster_points)
+                # Estimate confidence using ML model or fallback to heuristic
+                confidence = self._estimate_confidence_ml(cluster_points)
                 hotspot["confidence_score"] = confidence
                 
                 logger.info(f"[DEBUG] Cluster {cluster_id}: {len(cluster_points)} points, confidence {confidence:.2f}")
@@ -718,25 +758,62 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         
         return hotspot
     
-    def _estimate_confidence(self, points):
-        """Estimate confidence level of a cluster using heuristic model"""
-        # Simple heuristic-based confidence estimation
-        # In a real implementation, this would use the trained Random Forest model
-        
-        # Calculate features
-        num_points = len(points)
-        risks = [p["risk_score"] for p in points]
-        avg_risk = sum(risks) / len(risks)
-        max_risk = max(risks)
-        
-        # Count unique sources
-        sources = set(p["source_type"] for p in points)
-        source_diversity = len(sources)
-        
-        # Time span
-        timestamps = [p["timestamp"] for p in points]
-        time_span_hours = (max(timestamps) - min(timestamps)) / (1000 * 60 * 60)
-        
+    def _estimate_confidence_ml(self, points):
+        """
+        Estimate confidence level of a cluster using the ML model.
+        Falls back to heuristic method if model is not available.
+        """
+        try:
+            # Calculate features
+            num_points = len(points)
+            risks = [p["risk_score"] for p in points]
+            avg_risk = sum(risks) / len(risks)
+            max_risk = max(risks)
+            
+            # Count unique sources
+            sources = set(p["source_type"] for p in points)
+            source_diversity = len(sources) / 2.0  # Normalize to 0-1 range (assuming max 2 sources)
+            
+            # Time span
+            timestamps = [p["timestamp"] for p in points]
+            time_span_hours = (max(timestamps) - min(timestamps)) / (1000 * 60 * 60)
+            
+            # Check if ML model is available
+            if self.confidence_model is not None:
+                # Prepare features for the model
+                features = np.array([[
+                    num_points,
+                    avg_risk,
+                    max_risk,
+                    source_diversity,
+                    time_span_hours
+                ]])
+                
+                # Make prediction
+                confidence = self.confidence_model.predict(features)[0]
+                logger.info(f"[ML] Confidence estimated using ML model: {confidence:.2f}")
+                
+                # Ensure confidence is between 0 and 1
+                confidence = max(0, min(1, confidence))
+                
+                return confidence
+            else:
+                # Fall back to heuristic method
+                logger.info(f"[ML] Using heuristic confidence estimation (model not available)")
+                return self._estimate_confidence_heuristic(num_points, avg_risk, source_diversity, time_span_hours)
+                
+        except Exception as e:
+            logger.error(f"Error in ML confidence estimation: {e}")
+            logger.error(traceback.format_exc())
+            
+            # Fall back to heuristic method
+            return self._estimate_confidence_heuristic(len(points), 
+                                                      sum([p["risk_score"] for p in points]) / len(points),
+                                                      len(set(p["source_type"] for p in points)) / 2.0,
+                                                      (max([p["timestamp"] for p in points]) - min([p["timestamp"] for p in points])) / (1000 * 60 * 60))
+    
+    def _estimate_confidence_heuristic(self, num_points, avg_risk, source_diversity, time_span_hours):
+        """Heuristic-based confidence estimation as fallback"""
         # Base confidence starts at 0.3
         confidence = 0.3
         
@@ -814,7 +891,30 @@ def wait_for_services():
     if not kafka_ready:
         logger.error("Kafka not available after multiple attempts")
     
-    return kafka_ready
+    # Check MinIO
+    minio_ready = False
+    for i in range(10):
+        try:
+            import boto3
+            s3 = boto3.client(
+                's3',
+                endpoint_url=f"http://{MINIO_ENDPOINT}",
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY
+            )
+            buckets = s3.list_buckets()
+            bucket_names = [b['Name'] for b in buckets.get('Buckets', [])]
+            minio_ready = True
+            logger.info(f"MinIO is ready, available buckets: {bucket_names}")
+            break
+        except Exception:
+            logger.info(f"Waiting for MinIO... ({i+1}/10)")
+            time.sleep(5)
+    
+    if not minio_ready:
+        logger.error("MinIO not available after multiple attempts")
+    
+    return kafka_ready and minio_ready
 
 def main():
     """Main entry point for the Pollution Detector job"""
@@ -890,8 +990,6 @@ def main():
     
     # 4. Send all events to analyzed_data topic
     all_events.add_sink(analyzed_producer).name("Publish_All_Analyzed_Data")
-    
-
     
     # 7. Perform spatial clustering
     hotspots = all_events \

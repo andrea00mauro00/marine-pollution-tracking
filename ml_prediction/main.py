@@ -4,7 +4,7 @@ Marine Pollution Monitoring System - ML Prediction Engine
 ==============================================================================
 This job:
 1. Consumes pollution hotspots from Kafka
-2. Applies fluid dynamics models to predict pollution spread
+2. Applies ML models to predict pollution spread
 3. Evaluates environmental impact and transformation over time
 4. Generates 6/12/24/48-hour forecasts with cleanup recommendations
 5. Publishes comprehensive predictions to pollution_predictions topic
@@ -19,6 +19,7 @@ import math
 import traceback
 import random
 import numpy as np
+import pickle
 import redis
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional
@@ -49,6 +50,11 @@ PREDICTIONS_TOPIC = os.environ.get("PREDICTIONS_TOPIC", "pollution_predictions")
 # Redis configuration
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+
+# MinIO configuration
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
 # Pollutant physical properties for diffusion modeling
 POLLUTANT_PROPERTIES = {
@@ -273,18 +279,78 @@ ECOSYSTEM_SENSITIVITY = {
 
 class PollutionSpreadPredictor(MapFunction):
     """
-    Predicts the spread of detected pollution hotspots using fluid dynamics models
+    Predicts the spread of detected pollution hotspots using ML models
     and provides impact assessment and cleanup recommendations
     """
     
     def __init__(self):
         self.prediction_intervals = [6, 12, 24, 48]  # Hours to predict ahead
         self.redis_client = None
+        self.oil_spill_model = None
+        self.chemical_model = None
+        self.default_model = None
         
     def open(self, runtime_context):
         # Initialize Redis client
         self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
         logger.info("Connected to Redis")
+        
+        # Load ML models from MinIO
+        self._load_diffusion_models()
+        
+    def _load_diffusion_models(self):
+        """Load diffusion prediction models from MinIO"""
+        try:
+            import boto3
+            
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=f'http://{MINIO_ENDPOINT}',
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY
+            )
+            
+            # Load oil spill diffusion model
+            oil_model_key = "diffusion_prediction/oil_spill_model_v1.pkl"
+            try:
+                logger.info(f"Loading oil spill diffusion model from models/{oil_model_key}")
+                response = s3_client.get_object(Bucket="models", Key=oil_model_key)
+                model_bytes = response['Body'].read()
+                self.oil_spill_model = pickle.loads(model_bytes)
+                logger.info("Oil spill diffusion model loaded successfully")
+            except Exception as e:
+                logger.error(f"Error loading oil spill model: {e}")
+                logger.info("Will use physics-based model for oil spill diffusion")
+                self.oil_spill_model = None
+            
+            # Load chemical discharge diffusion model
+            chemical_model_key = "diffusion_prediction/chemical_model_v1.pkl"
+            try:
+                logger.info(f"Loading chemical discharge model from models/{chemical_model_key}")
+                response = s3_client.get_object(Bucket="models", Key=chemical_model_key)
+                model_bytes = response['Body'].read()
+                self.chemical_model = pickle.loads(model_bytes)
+                logger.info("Chemical discharge model loaded successfully")
+            except Exception as e:
+                logger.error(f"Error loading chemical model: {e}")
+                logger.info("Will use physics-based model for chemical discharge")
+                self.chemical_model = None
+                
+            # Load configuration
+            try:
+                config_key = "ml_prediction/config.json"
+                response = s3_client.get_object(Bucket="configs", Key=config_key)
+                config_bytes = response['Body'].read()
+                self.config = json.loads(config_bytes)
+                logger.info("Loaded configuration from MinIO")
+            except Exception as e:
+                logger.error(f"Error loading configuration: {e}")
+                self.config = {}
+                
+        except Exception as e:
+            logger.error(f"Error in model loading: {e}")
+            self.oil_spill_model = None
+            self.chemical_model = None
         
     def map(self, value):
         try:
@@ -359,7 +425,7 @@ class PollutionSpreadPredictor(MapFunction):
             
             # Generate predictions for each time interval
             for hours in self.prediction_intervals:
-                prediction = self._generate_prediction(
+                prediction = self._generate_prediction_ml(
                     center_latitude, center_longitude, radius_km, pollutant_type,
                     risk_score, current_pattern, wind_pattern,
                     hours, timestamp, severity, ecosystem_types
@@ -407,11 +473,11 @@ class PollutionSpreadPredictor(MapFunction):
             logger.error(traceback.format_exc())
             return None
     
-    def _generate_prediction(self, latitude, longitude, radius_km, pollutant_type, 
-                            risk_score, current, wind, hours, timestamp, 
-                            severity, ecosystem_types):
+    def _generate_prediction_ml(self, latitude, longitude, radius_km, pollutant_type, 
+                              risk_score, current, wind, hours, timestamp, 
+                              severity, ecosystem_types):
         """
-        Generate a comprehensive prediction for a pollution event at a specific time interval
+        Generate a comprehensive prediction using ML models with physics-based fallback
         """
         try:
             # Get pollutant properties
@@ -428,64 +494,114 @@ class PollutionSpreadPredictor(MapFunction):
             water_solubility = props.get("water_solubility", 10)
             cleanup_methods = props.get("cleanup_methods", ["containment", "monitoring"])
             
-            # 1. Calculate movement due to current (advection)
-            # Convert direction to radians
-            current_dir_rad = math.radians(current["direction"])
+            # Try to use ML model for diffusion prediction if available
+            new_latitude = latitude
+            new_longitude = longitude
+            new_radius_km = radius_km
             
-            # Distance moved by current
-            current_speed_kmh = current["speed"] * 3.6  # Convert m/s to km/h
-            current_distance = current_speed_kmh * hours * current_influence
+            # Prepare features for ML model
+            features = np.array([[
+                latitude, 
+                longitude, 
+                radius_km, 
+                risk_score, 
+                wind["speed"], 
+                wind["direction"], 
+                current["speed"], 
+                current["direction"], 
+                hours
+            ]])
             
-            # Current-driven movement
-            lat_km_per_degree = 111.32
-            lon_km_per_degree = 111.32 * math.cos(math.radians(latitude))
+            # Select appropriate model based on pollutant type
+            ml_used = False
+            prediction_method = "physics"
             
-            current_lat_change = (current_distance * math.cos(current_dir_rad)) / lat_km_per_degree
-            current_lon_change = (current_distance * math.sin(current_dir_rad)) / lon_km_per_degree
+            if pollutant_type == "oil_spill" and self.oil_spill_model is not None:
+                logger.info(f"[ML] Using oil spill ML model for prediction")
+                try:
+                    # Make prediction
+                    prediction = self.oil_spill_model.predict(features)[0]
+                    new_latitude, new_longitude, new_radius_km = prediction
+                    ml_used = True
+                    prediction_method = "ml_oil"
+                except Exception as e:
+                    logger.error(f"Error using oil spill ML model: {e}")
+                    logger.info("Falling back to physics-based model")
             
-            # 2. Calculate movement due to wind (for surface pollution)
-            wind_dir_rad = math.radians(wind["direction"])
-            wind_speed_kmh = wind["speed"] * 3.6  # Convert m/s to km/h
+            elif pollutant_type == "chemical_discharge" and self.chemical_model is not None:
+                logger.info(f"[ML] Using chemical discharge ML model for prediction")
+                try:
+                    # Make prediction
+                    prediction = self.chemical_model.predict(features)[0]
+                    new_latitude, new_longitude, new_radius_km = prediction
+                    ml_used = True
+                    prediction_method = "ml_chemical"
+                except Exception as e:
+                    logger.error(f"Error using chemical ML model: {e}")
+                    logger.info("Falling back to physics-based model")
             
-            # Wind drift (typically 3% of wind speed for surface materials)
-            wind_drift_factor = 0.03 * wind_influence
-            wind_distance = wind_speed_kmh * hours * wind_drift_factor
+            # If ML model not used or failed, fall back to physics-based model
+            if not ml_used:
+                logger.info(f"[ML] Using physics-based model for {pollutant_type}")
+                
+                # Calculate movement due to current (advection)
+                # Convert direction to radians
+                current_dir_rad = math.radians(current["direction"])
+                
+                # Distance moved by current
+                current_speed_kmh = current["speed"] * 3.6  # Convert m/s to km/h
+                current_distance = current_speed_kmh * hours * current_influence
+                
+                # Current-driven movement
+                lat_km_per_degree = 111.32
+                lon_km_per_degree = 111.32 * math.cos(math.radians(latitude))
+                
+                current_lat_change = (current_distance * math.cos(current_dir_rad)) / lat_km_per_degree
+                current_lon_change = (current_distance * math.sin(current_dir_rad)) / lon_km_per_degree
+                
+                # Calculate movement due to wind (for surface pollution)
+                wind_dir_rad = math.radians(wind["direction"])
+                wind_speed_kmh = wind["speed"] * 3.6  # Convert m/s to km/h
+                
+                # Wind drift (typically 3% of wind speed for surface materials)
+                wind_drift_factor = 0.03 * wind_influence
+                wind_distance = wind_speed_kmh * hours * wind_drift_factor
+                
+                wind_lat_change = (wind_distance * math.cos(wind_dir_rad)) / lat_km_per_degree
+                wind_lon_change = (wind_distance * math.sin(wind_dir_rad)) / lon_km_per_degree
+                
+                # Combine movements for new position
+                new_latitude = latitude + current_lat_change + wind_lat_change
+                new_longitude = longitude + current_lon_change + wind_lon_change
+                
+                # Calculate radius growth due to diffusion
+                # Diffusion causes radial growth proportional to square root of time
+                diffusion_growth = diffusion_coef * math.sqrt(hours * 3600)  # m
+                diffusion_growth_km = diffusion_growth / 1000  # km
+                
+                # Apply viscosity factor (higher viscosity = slower spread)
+                viscosity_factor = 1.0 / (1.0 + (viscosity / 50.0))
+                
+                # Total new radius combining initial radius and diffusion
+                new_radius_km = radius_km + (diffusion_growth_km * viscosity_factor)
+                
+                # Apply degradation/growth to radius
+                if degradation_rate >= 0:
+                    # Degradation (shrinking)
+                    degradation_factor = 1.0 - (degradation_rate * hours / 24)
+                    degradation_factor = max(0.1, degradation_factor)  # Never shrink below 10%
+                else:
+                    # Growth (expansion) - for algal blooms
+                    growth_rate = abs(degradation_rate)
+                    degradation_factor = 1.0 + (growth_rate * hours / 24)
+                    degradation_factor = min(3.0, degradation_factor)  # Cap growth at 3x
+                
+                new_radius_km *= degradation_factor
             
-            wind_lat_change = (wind_distance * math.cos(wind_dir_rad)) / lat_km_per_degree
-            wind_lon_change = (wind_distance * math.sin(wind_dir_rad)) / lon_km_per_degree
-            
-            # 3. Combine movements for new position
-            new_latitude = latitude + current_lat_change + wind_lat_change
-            new_longitude = longitude + current_lon_change + wind_lon_change
-            
-            # 4. Calculate radius growth due to diffusion
-            # Diffusion causes radial growth proportional to square root of time
-            diffusion_growth = diffusion_coef * math.sqrt(hours * 3600)  # m
-            diffusion_growth_km = diffusion_growth / 1000  # km
-            
-            # Apply viscosity factor (higher viscosity = slower spread)
-            viscosity_factor = 1.0 / (1.0 + (viscosity / 50.0))
-            
-            # Total new radius combining initial radius and diffusion
-            new_radius_km = radius_km + (diffusion_growth_km * viscosity_factor)
-            
-            # 5. Apply degradation/growth to radius
-            if degradation_rate >= 0:
-                # Degradation (shrinking)
-                degradation_factor = 1.0 - (degradation_rate * hours / 24)
-                degradation_factor = max(0.1, degradation_factor)  # Never shrink below 10%
-            else:
-                # Growth (expansion) - for algal blooms
-                growth_rate = abs(degradation_rate)
-                degradation_factor = 1.0 + (growth_rate * hours / 24)
-                degradation_factor = min(3.0, degradation_factor)  # Cap growth at 3x
-            
-            new_radius_km *= degradation_factor
-            
-            # 6. Calculate new affected area
+            # Calculate new affected area
             new_area_km2 = math.pi * new_radius_km * new_radius_km
             
-            # 7. Calculate concentration changes
+            # Calculate concentration changes (same for ML and physics models)
             # Base concentration (100% at start)
             initial_concentration = 1.0
             
@@ -506,7 +622,7 @@ class PollutionSpreadPredictor(MapFunction):
                 # Normal pollutants divide between surface, evaporated, and dissolved
                 surface_fraction = max(0, 1.0 - evaporated_fraction - dissolved_fraction)
             
-            # 8. Calculate environmental impact
+            # Calculate environmental impact
             environmental_score = self._calculate_environmental_impact(
                 pollutant_type, 
                 risk_score,
@@ -516,7 +632,7 @@ class PollutionSpreadPredictor(MapFunction):
                 ecosystem_types
             )
             
-            # 9. Determine remediation recommendations
+            # Determine remediation recommendations
             cleanup_recommendations, priority_score, window_critical = self._generate_remediation_recommendations(
                 pollutant_type,
                 hours,
@@ -526,13 +642,71 @@ class PollutionSpreadPredictor(MapFunction):
                 cleanup_methods
             )
             
-            # 10. Calculate confidence (decreases with time)
+            # Calculate confidence (decreases with time)
             base_confidence = 0.95
             time_decay = 0.005 * hours  # Lose 0.5% confidence per hour
             confidence = max(0.5, base_confidence - time_decay)
             
-            # 11. Create prediction object
+            # If ML was used, adjust confidence
+            if ml_used:
+                confidence = min(0.98, confidence * 1.1)  # Increase confidence slightly
+            
+            # Create prediction object
             prediction_time = timestamp + (hours * 3600 * 1000)  # hours to milliseconds
+            
+            # Calculate transport factors for debugging/explanation
+            # These may be different based on whether ML or physics was used
+            if ml_used:
+                # For ML model, we don't have direct access to the intermediate calculations
+                # But we can estimate the components for context
+                lat_km_per_degree = 111.32
+                lon_km_per_degree = 111.32 * math.cos(math.radians(latitude))
+                
+                lat_change = new_latitude - latitude
+                lon_change = new_longitude - longitude
+                
+                total_distance_km = math.sqrt(
+                    (lat_change * lat_km_per_degree)**2 + 
+                    (lon_change * lon_km_per_degree)**2
+                )
+                
+                # Estimate direction
+                direction_rad = math.atan2(lon_change, lat_change)
+                direction_deg = math.degrees(direction_rad) % 360
+                
+                # Estimate radius growth
+                radius_growth = new_radius_km - radius_km
+                
+                transport_factors = {
+                    "method": prediction_method,
+                    "total_effect": {
+                        "distance_km": total_distance_km,
+                        "direction": direction_deg
+                    },
+                    "radius_growth_km": radius_growth
+                }
+            else:
+                # For physics model, we have all the intermediate values
+                transport_factors = {
+                    "method": prediction_method,
+                    "current_effect": {
+                        "distance_km": current_distance,
+                        "direction": current["direction"]
+                    },
+                    "wind_effect": {
+                        "distance_km": wind_distance,
+                        "direction": wind["direction"],
+                        "surface_influence": wind_influence
+                    },
+                    "diffusion": {
+                        "growth_km": diffusion_growth_km,
+                        "viscosity_factor": viscosity_factor
+                    },
+                    "degradation": {
+                        "factor": degradation_factor,
+                        "rate_per_day": degradation_rate
+                    }
+                }
             
             prediction = {
                 "hours_ahead": hours,
@@ -560,25 +734,7 @@ class PollutionSpreadPredictor(MapFunction):
                     "time_sensitive": hours <= 24
                 },
                 "confidence": confidence,
-                "transport_factors": {
-                    "current_effect": {
-                        "distance_km": current_distance,
-                        "direction": current["direction"]
-                    },
-                    "wind_effect": {
-                        "distance_km": wind_distance,
-                        "direction": wind["direction"],
-                        "surface_influence": wind_influence
-                    },
-                    "diffusion": {
-                        "growth_km": diffusion_growth_km,
-                        "viscosity_factor": viscosity_factor
-                    },
-                    "degradation": {
-                        "factor": degradation_factor,
-                        "rate_per_day": degradation_rate
-                    }
-                }
+                "transport_factors": transport_factors
             }
             
             return prediction
@@ -832,7 +988,7 @@ class PollutionSpreadPredictor(MapFunction):
 
 def wait_for_services():
     """Wait for Kafka to be available"""
-    logger.info("Waiting for Kafka and Redis...")
+    logger.info("Waiting for Kafka, Redis, and MinIO...")
     
     # Check Kafka
     kafka_ready = False
@@ -867,7 +1023,30 @@ def wait_for_services():
     if not redis_ready:
         logger.error("Redis not available after multiple attempts")
     
-    return kafka_ready and redis_ready
+    # Check MinIO
+    minio_ready = False
+    for i in range(10):
+        try:
+            import boto3
+            s3 = boto3.client(
+                's3',
+                endpoint_url=f"http://{MINIO_ENDPOINT}",
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY
+            )
+            buckets = s3.list_buckets()
+            bucket_names = [b['Name'] for b in buckets.get('Buckets', [])]
+            minio_ready = True
+            logger.info(f"MinIO is ready, available buckets: {bucket_names}")
+            break
+        except Exception:
+            logger.info(f"Waiting for MinIO... ({i+1}/10)")
+            time.sleep(5)
+    
+    if not minio_ready:
+        logger.error("MinIO not available after multiple attempts")
+    
+    return kafka_ready and redis_ready and minio_ready
 
 def main():
     """Main function to set up and run the Flink job"""
