@@ -96,72 +96,6 @@ def load_notification_config(postgres_conn):
         logger.error(f"Errore caricamento configurazioni notifica: {e}")
         return []
 
-import psycopg2
-from psycopg2 import sql, OperationalError
-import time
-
-def init_alert_tables():
-    for attempt in range(10):
-        try:
-            conn = psycopg2.connect(
-                host="postgres",
-                database="marine_pollution",
-                user="postgres",
-                password="postgres"
-            )
-            break
-        except OperationalError as e:
-            print(f"[alert_manager] Tentativo {attempt+1}/10 - PostgreSQL non pronto: {e}")
-            time.sleep(5)
-    else:
-        print("[alert_manager] Errore: impossibile connettersi a PostgreSQL dopo 10 tentativi")
-        return
-
-    cur = conn.cursor()
-
-    # Tabella principale alert
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pollution_alerts (
-      alert_id TEXT PRIMARY KEY,
-      source_id TEXT NOT NULL,
-      source_type TEXT NOT NULL,
-      alert_type TEXT NOT NULL,
-      alert_time TIMESTAMPTZ NOT NULL,
-      severity TEXT NOT NULL,
-      latitude FLOAT NOT NULL,
-      longitude FLOAT NOT NULL,
-      pollutant_type TEXT NOT NULL,
-      risk_score FLOAT NOT NULL,
-      message TEXT NOT NULL,
-      details JSONB,
-      processed BOOLEAN DEFAULT FALSE,
-      notifications_sent JSONB DEFAULT '{}',
-      creation_time TIMESTAMPTZ DEFAULT NOW()
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS alert_notification_config (
-      config_id SERIAL PRIMARY KEY,
-      region_id TEXT,
-      severity_level TEXT,
-      pollutant_type TEXT,
-      notification_type TEXT NOT NULL,
-      recipients JSONB NOT NULL,
-      cooldown_minutes INTEGER DEFAULT 30,
-      active BOOLEAN DEFAULT TRUE,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("[alert_manager] Tabelle verificate o create correttamente.")
-    
-
-
 def process_alert(data, postgres_conn, redis_conn, notification_configs):
     """Processa alert e invia notifiche"""
     try:
@@ -368,7 +302,6 @@ def main():
     # Connessioni
     postgres_conn = connect_postgres()
     redis_conn = connect_redis()
-    init_alert_tables()
     
     # Carica configurazioni notifica
     notification_configs = load_notification_config(postgres_conn)

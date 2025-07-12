@@ -73,61 +73,6 @@ def connect_postgres():
     except Exception as e:
         logger.error(f"Errore connessione a PostgreSQL: {e}")
         raise
-
-import psycopg2
-from psycopg2 import OperationalError
-import time
-
-def init_hotspot_tables():
-    for attempt in range(10):
-        try:
-            conn = psycopg2.connect(
-                host="timescaledb",
-                database="marine_pollution",
-                user="postgres",
-                password="postgres"
-            )
-            break
-        except OperationalError as e:
-            print(f"[storage_consumer] Tentativo {attempt+1}/10 - TimescaleDB non pronto: {e}")
-            time.sleep(5)
-    else:
-        print("[storage_consumer] Errore: impossibile connettersi a TimescaleDB dopo 10 tentativi")
-        return
-
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS hotspot_evolution (
-      evolution_id SERIAL PRIMARY KEY,
-      hotspot_id TEXT NOT NULL,
-      timestamp TIMESTAMPTZ NOT NULL,
-      event_type TEXT NOT NULL,
-      center_latitude FLOAT,
-      center_longitude FLOAT,
-      radius_km FLOAT,
-      severity TEXT,
-      risk_score FLOAT,
-      event_data JSONB
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS hotspot_correlations (
-      correlation_id SERIAL PRIMARY KEY,
-      source_hotspot_id TEXT NOT NULL,
-      target_hotspot_id TEXT NOT NULL,
-      correlation_type TEXT NOT NULL,
-      correlation_score FLOAT NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      correlation_data JSONB
-    );
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("[storage_consumer] Tabelle verificate o create correttamente.")
    
 
 
@@ -208,17 +153,20 @@ def process_analyzed_sensor_data(data, timescale_conn):
         timescale_conn.rollback()
         logger.error(f"Errore processamento dati sensore analizzati: {e}")
 
-def process_pollution_hotspots(data, timescale_conn):
+def process_pollution_hotspots(data, timescale_conn, postgres_conn):
     """Processa hotspot inquinamento"""
+    timescale_modified = False
+    postgres_modified = False
+    
     try:
-        with timescale_conn.cursor() as cur:  # Usa timescale_conn invece di postgres_conn
-            # Estrazione dati
-            hotspot_id = data['hotspot_id']
-            is_update = data.get('is_update', False)
-            
+        hotspot_id = data['hotspot_id']
+        is_update = data.get('is_update', False)
+        detected_at = datetime.fromtimestamp(data['detected_at'] / 1000)
+        
+        # --- TIMESCALE OPERATIONS (active_hotspots and hotspot_versions) ---
+        with timescale_conn.cursor() as timescale_cur:
             if not is_update:
-                # Nuovo hotspot
-                detected_at = datetime.fromtimestamp(data['detected_at'] / 1000)
+                # Nuovo hotspot in TimescaleDB
                 lat = data['location']['center_latitude']
                 lon = data['location']['center_longitude']
                 radius = data['location']['radius_km']
@@ -228,7 +176,7 @@ def process_pollution_hotspots(data, timescale_conn):
                 max_risk_score = data['max_risk_score']
                 spatial_hash = generate_spatial_hash(lat, lon)
 
-                cur.execute("""
+                timescale_cur.execute("""
                     INSERT INTO active_hotspots (
                         hotspot_id, center_latitude, center_longitude, radius_km,
                         pollutant_type, severity, first_detected_at, last_updated_at,
@@ -252,42 +200,22 @@ def process_pollution_hotspots(data, timescale_conn):
                     avg_risk_score, max_risk_score,
                     Json(data), spatial_hash
                 ))
-
-                
-                # Registra evento creazione
-                cur.execute("""
-                    INSERT INTO hotspot_evolution (
-                        hotspot_id, timestamp, event_type, center_latitude, center_longitude,
-                        radius_km, severity, risk_score, event_data
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    hotspot_id,
-                    detected_at,
-                    'created',
-                    data['location']['center_latitude'],
-                    data['location']['center_longitude'],
-                    data['location']['radius_km'],
-                    data['severity'],
-                    data['max_risk_score'],
-                    Json({'source': 'detection'})
-                ))
+                timescale_modified = True
                 
             else:
-                # Aggiornamento hotspot
-                # Prima archivia versione corrente
-                cur.execute("""
+                # Aggiornamento hotspot - Prima legge dati correnti
+                timescale_cur.execute("""
                     SELECT center_latitude, center_longitude, radius_km, severity, max_risk_score
                     FROM active_hotspots WHERE hotspot_id = %s
                 """, (hotspot_id,))
                 
-                old_data = cur.fetchone()
-                detected_at = datetime.fromtimestamp(data['detected_at'] / 1000)
+                old_data = timescale_cur.fetchone()
                 
                 if old_data:
                     old_lat, old_lon, old_radius, old_severity, old_risk = old_data
                     
-                    # Salva versione precedente
-                    cur.execute("""
+                    # Salva versione precedente in TimescaleDB
+                    timescale_cur.execute("""
                         INSERT INTO hotspot_versions (
                             hotspot_id, center_latitude, center_longitude, radius_km,
                             severity, risk_score, detected_at, is_significant_change
@@ -299,59 +227,76 @@ def process_pollution_hotspots(data, timescale_conn):
                         old_radius,
                         old_severity,
                         old_risk,
-                        detected_at - timedelta(minutes=5),  # Approssimazione
+                        detected_at - timedelta(minutes=5),
                         data.get('is_significant_change', False)
                     ))
-                
-                # Aggiorna hotspot
-                cur.execute("""
-                    UPDATE active_hotspots
-                    SET center_latitude = %s,
-                        center_longitude = %s,
-                        radius_km = %s,
-                        severity = %s,
-                        last_updated_at = %s,
-                        update_count = update_count + 1,
-                        avg_risk_score = %s,
-                        max_risk_score = %s,
-                        source_data = %s,
-                        spatial_hash = %s
-                    WHERE hotspot_id = %s
-                """, (
-                    data['location']['center_latitude'],
-                    data['location']['center_longitude'],
-                    data['location']['radius_km'],
-                    data['severity'],
-                    detected_at,
-                    data['avg_risk_score'],
-                    data['max_risk_score'],
-                    Json(data),
-                    generate_spatial_hash(data['location']['center_latitude'], data['location']['center_longitude']),
-                    hotspot_id
-                ))
-                
-                # Registra evento aggiornamento
-                cur.execute("""
-                    INSERT INTO hotspot_evolution (
-                        hotspot_id, timestamp, event_type, center_latitude, center_longitude,
-                        radius_km, severity, risk_score, event_data
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    hotspot_id,
-                    detected_at,
-                    'updated',
-                    data['location']['center_latitude'],
-                    data['location']['center_longitude'],
-                    data['location']['radius_km'],
-                    data['severity'],
-                    data['max_risk_score'],
-                    Json({'is_significant': data.get('is_significant_change', False)})
-                ))
+                    
+                    # Aggiorna hotspot in TimescaleDB
+                    timescale_cur.execute("""
+                        UPDATE active_hotspots
+                        SET center_latitude = %s,
+                            center_longitude = %s,
+                            radius_km = %s,
+                            severity = %s,
+                            last_updated_at = %s,
+                            update_count = update_count + 1,
+                            avg_risk_score = %s,
+                            max_risk_score = %s,
+                            source_data = %s,
+                            spatial_hash = %s
+                        WHERE hotspot_id = %s
+                    """, (
+                        data['location']['center_latitude'],
+                        data['location']['center_longitude'],
+                        data['location']['radius_km'],
+                        data['severity'],
+                        detected_at,
+                        data['avg_risk_score'],
+                        data['max_risk_score'],
+                        Json(data),
+                        generate_spatial_hash(data['location']['center_latitude'], data['location']['center_longitude']),
+                        hotspot_id
+                    ))
+                    timescale_modified = True
+        
+        # --- POSTGRES OPERATIONS (hotspot_evolution) ---
+        with postgres_conn.cursor() as postgres_cur:
+            # Inserisce evento creazione/aggiornamento in PostgreSQL
+            event_type = 'created' if not is_update else 'updated'
             
+            postgres_cur.execute("""
+                INSERT INTO hotspot_evolution (
+                    hotspot_id, timestamp, event_type, center_latitude, center_longitude,
+                    radius_km, severity, risk_score, event_data
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                hotspot_id,
+                detected_at,
+                event_type,
+                data['location']['center_latitude'],
+                data['location']['center_longitude'],
+                data['location']['radius_km'],
+                data['severity'],
+                data['max_risk_score'],
+                Json({'source': 'detection'} if not is_update else 
+                    {'is_significant': data.get('is_significant_change', False)})
+            ))
+            postgres_modified = True
+        
+        # Commit changes to both databases if needed
+        if timescale_modified:
             timescale_conn.commit()
-            logger.info(f"Salvato hotspot {hotspot_id} (update: {is_update})")
+        if postgres_modified:
+            postgres_conn.commit()
+            
+        logger.info(f"Salvato hotspot {hotspot_id} (update: {is_update})")
+        
     except Exception as e:
-        timescale_conn.rollback()
+        # Rollback both connections in case of error
+        if timescale_modified:
+            timescale_conn.rollback()
+        if postgres_modified:
+            postgres_conn.rollback()
         logger.error(f"Errore processamento hotspot: {e}")
 
 def process_pollution_predictions(data, timescale_conn):
@@ -491,7 +436,6 @@ def main():
     # Connessioni database
     timescale_conn = connect_timescaledb()
     postgres_conn = connect_postgres()
-    init_hotspot_tables()
     
     # Consumer Kafka
     consumer = KafkaConsumer(
@@ -528,7 +472,7 @@ def main():
                 elif topic == ANALYZED_SENSOR_TOPIC:
                     process_analyzed_sensor_data(data, timescale_conn)
                 elif topic == HOTSPOTS_TOPIC:
-                    process_pollution_hotspots(data, timescale_conn)
+                    process_pollution_hotspots(data, timescale_conn, postgres_conn)
                 elif topic == PREDICTIONS_TOPIC:
                     process_pollution_predictions(data, timescale_conn)
                 elif topic == ALERTS_TOPIC:

@@ -13,15 +13,24 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia tutti i file dell'applicazione
+# Copia il file di configurazione
+COPY config.py .
+
+# Copia il file principale
 COPY app.py .
-COPY pages/ ./pages/
+
+# Copia le cartelle dell'applicazione
 COPY utils/ ./utils/
 COPY components/ ./components/
+COPY assets/ ./assets/
+COPY pages/ ./pages/
 
 # Assicura presenza dei file __init__.py
+RUN mkdir -p utils/clients
 RUN touch utils/__init__.py
+RUN touch utils/clients/__init__.py
 RUN touch components/__init__.py
+RUN mkdir -p pages
 
 # Espone porta Streamlit
 EXPOSE 8501

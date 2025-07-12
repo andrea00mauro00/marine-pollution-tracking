@@ -240,20 +240,24 @@ def process_prediction(data, redis_conn):
             
             # Aggiungi a zone di rischio se è una previsione a 6 o 24 ore
             if hours_ahead in (6, 24):
-                key = f"dashboard:risk_zones:{hours_ahead}h"
-                member = f"{hotspot_id}_{hours_ahead}"
-                lon = prediction['location']['longitude']
-                lat = prediction['location']['latitude']
-
-                # Rimuovi prima l'eventuale elemento esistente
-                p.zrem(key, member)
-
-                # Aggiungi sempre la versione aggiornata
-                p.geoadd(key, values=[(lon, lat, member)])
-
-                # Reset TTL
-                p.expire(key, PREDICTIONS_TTL)
-
+                risk_id = f"{hotspot_id}_{hours_ahead}"
+                
+                # Usa hash standard invece di geo-index
+                p.hset(f"dashboard:risk_zone:{risk_id}", "id", risk_id)
+                p.hset(f"dashboard:risk_zone:{risk_id}", "hotspot_id", hotspot_id)
+                p.hset(f"dashboard:risk_zone:{risk_id}", "hours_ahead", hours_ahead)
+                p.hset(f"dashboard:risk_zone:{risk_id}", "longitude", prediction['location']['longitude'])
+                p.hset(f"dashboard:risk_zone:{risk_id}", "latitude", prediction['location']['latitude'])
+                p.hset(f"dashboard:risk_zone:{risk_id}", "radius_km", prediction['location']['radius_km'])
+                p.hset(f"dashboard:risk_zone:{risk_id}", "severity", prediction['impact']['severity'])
+                p.hset(f"dashboard:risk_zone:{risk_id}", "prediction_time", prediction['prediction_time'])
+                
+                # Aggiungi a set di zone di rischio per questo intervallo di tempo
+                p.sadd(f"dashboard:risk_zones:{hours_ahead}h", risk_id)
+                
+                # Imposta TTL per entrambi
+                p.expire(f"dashboard:risk_zone:{risk_id}", PREDICTIONS_TTL)
+                p.expire(f"dashboard:risk_zones:{hours_ahead}h", PREDICTIONS_TTL)
         
         # Imposta TTL per la lista delle previsioni
         p.expire(f"dashboard:predictions:for_hotspot:{hotspot_id}", PREDICTIONS_TTL)
