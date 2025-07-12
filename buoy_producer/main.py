@@ -153,30 +153,23 @@ def simulate_pollution_parameters(buoy_id: str, lat: float, lon: float) -> dict:
         # Biological indicators
         "coliform_bacteria": int(rng.uniform(1, 1000)),
         "chlorophyll_a": round(rng.uniform(0.5, 50.0), 2),
-        "dissolved_oxygen": round(rng.uniform(70.0, 120.0), 1),
-        
-        # Water quality index (0-100, where 100 = excellent)
-        "water_quality_index": round(rng.uniform(45.0, 95.0), 1),
-        
-        # Estimated pollution level
-        "pollution_level": random.choice(["low", "moderate", "high"])
+        "dissolved_oxygen": round(rng.uniform(70.0, 120.0), 1)
     }
     
     # Adjustments based on location (simulation of hotspots)
     # Coastal zones tend to have more pollution
     if abs(lat) < 60:  # More populated zones
         pollution_data["microplastics"] *= rng.uniform(1.2, 2.0)
-        pollution_data["water_quality_index"] *= rng.uniform(0.8, 0.95)
     
-    # Simulate occasional pollution events
-    if random.random() < 0.05:  # 5% chance of pollution event
-        pollution_data["pollution_event"] = {
-            "type": random.choice(["oil_spill", "chemical_discharge", "algal_bloom", "plastic_debris"]),
-            "severity": random.choice(["minor", "moderate", "major"]),
-            "detected_at": int(time.time() * 1000)
-        }
-        pollution_data["pollution_level"] = "high"
-        pollution_data["water_quality_index"] *= 0.6
+    # Add realistic correlations between parameters
+    # High nitrates and phosphates correlate with high chlorophyll_a (algal growth)
+    if pollution_data["nitrates"] > 15 or pollution_data["phosphates"] > 2:
+        pollution_data["chlorophyll_a"] = min(100, pollution_data["chlorophyll_a"] * 1.5)
+        pollution_data["dissolved_oxygen"] = max(30, pollution_data["dissolved_oxygen"] * 0.85)
+    
+    # High petroleum correlates with low dissolved oxygen
+    if pollution_data["petroleum_hydrocarbons"] > 1.0:
+        pollution_data["dissolved_oxygen"] = max(30, pollution_data["dissolved_oxygen"] * 0.7)
     
     return pollution_data
 
@@ -186,7 +179,7 @@ def simulate_basic_environmental_data(buoy_id: str, lat: float, lon: float) -> d
     base_seed = hash(buoy_id) % 1000 + int(time.time()) % 100
     rng = random.Random(base_seed)
     
-    return {
+    data = {
         "wind_direction": round(rng.uniform(0, 360), 1),  # Wind direction
         "wind_speed": round(rng.uniform(2, 25), 1),   # Wind speed
         "temperature": round(rng.uniform(8, 28), 1),   # Water temperature
@@ -196,6 +189,165 @@ def simulate_basic_environmental_data(buoy_id: str, lat: float, lon: float) -> d
         "ph": round(rng.uniform(7.8, 8.2), 2),  # Water pH
         "turbidity": round(rng.uniform(1, 15), 1)  # Turbidity
     }
+    
+    # Add realistic correlations
+    # High temperature typically lowers pH slightly
+    if data["temperature"] > 25:
+        data["ph"] = max(6.5, data["ph"] - (data["temperature"] - 25) * 0.03)
+    
+    # High turbidity reduces dissolved oxygen
+    if data["turbidity"] > 10:
+        data["dissolved_oxygen"] = round(rng.uniform(70, 85), 1)
+    else:
+        data["dissolved_oxygen"] = round(rng.uniform(85, 120), 1)
+    
+    return data
+
+def calculate_water_quality_index(data):
+    """Calculates a realistic Water Quality Index from sensor parameters"""
+    # Define parameter weights
+    weights = {
+        "ph": 0.15,
+        "dissolved_oxygen": 0.2,
+        "turbidity": 0.1,
+        "temperature": 0.1,
+        "microplastics": 0.05,
+        "nitrates": 0.1,
+        "phosphates": 0.1,
+        "mercury": 0.05,
+        "lead": 0.05,
+        "petroleum_hydrocarbons": 0.1
+    }
+    
+    # Calculate parameter scores (0-100, where 100 is excellent quality)
+    scores = {}
+    
+    # pH: optimal around 7.5-8.1 for marine environments
+    if "ph" in data:
+        ph = data["ph"]
+        if 7.5 <= ph <= 8.1:
+            scores["ph"] = 100
+        elif 7.0 <= ph < 7.5 or 8.1 < ph <= 8.5:
+            scores["ph"] = 80
+        elif 6.5 <= ph < 7.0 or 8.5 < ph <= 9.0:
+            scores["ph"] = 60
+        else:
+            scores["ph"] = 30
+    
+    # Dissolved oxygen: higher is better
+    if "dissolved_oxygen" in data:
+        do = data["dissolved_oxygen"]
+        if do >= 90:
+            scores["dissolved_oxygen"] = 100
+        elif 80 <= do < 90:
+            scores["dissolved_oxygen"] = 80
+        elif 70 <= do < 80:
+            scores["dissolved_oxygen"] = 60
+        else:
+            scores["dissolved_oxygen"] = max(0, do)
+    
+    # Turbidity: lower is better
+    if "turbidity" in data:
+        turbidity = data["turbidity"]
+        if turbidity <= 5:
+            scores["turbidity"] = 100
+        elif 5 < turbidity <= 10:
+            scores["turbidity"] = 80
+        elif 10 < turbidity <= 20:
+            scores["turbidity"] = 60
+        else:
+            scores["turbidity"] = max(0, 100 - (turbidity * 2))
+    
+    # Temperature: depends on season and location, using simplified approach
+    if "temperature" in data:
+        temp = data["temperature"]
+        if 15 <= temp <= 25:
+            scores["temperature"] = 100
+        elif 10 <= temp < 15 or 25 < temp <= 30:
+            scores["temperature"] = 80
+        else:
+            scores["temperature"] = 60
+    
+    # Microplastics: lower is better
+    if "microplastics" in data:
+        mp = data["microplastics"]
+        scores["microplastics"] = max(0, 100 - (mp * 7))
+    
+    # Nitrates: lower is better
+    if "nitrates" in data:
+        nitrates = data["nitrates"]
+        if nitrates <= 5:
+            scores["nitrates"] = 100
+        elif 5 < nitrates <= 10:
+            scores["nitrates"] = 80
+        elif 10 < nitrates <= 20:
+            scores["nitrates"] = 60
+        else:
+            scores["nitrates"] = max(0, 100 - (nitrates * 2))
+    
+    # Phosphates: lower is better
+    if "phosphates" in data:
+        phosphates = data["phosphates"]
+        scores["phosphates"] = max(0, 100 - (phosphates * 30))
+    
+    # Heavy metals: lower is better
+    if "mercury" in data:
+        mercury = data["mercury"]
+        scores["mercury"] = max(0, 100 - (mercury * 2000))
+    
+    if "lead" in data:
+        lead = data["lead"]
+        scores["lead"] = max(0, 100 - (lead * 1000))
+    
+    # Petroleum hydrocarbons: lower is better
+    if "petroleum_hydrocarbons" in data:
+        petroleum = data["petroleum_hydrocarbons"]
+        scores["petroleum_hydrocarbons"] = max(0, 100 - (petroleum * 50))
+    
+    # Calculate weighted average
+    total_weight = sum(weights.get(param, 0) for param in scores.keys())
+    if total_weight == 0:
+        return 75  # Default if no parameters available
+    
+    weighted_sum = sum(scores[param] * weights.get(param, 0) for param in scores.keys())
+    wqi = weighted_sum / total_weight
+    
+    return round(wqi, 1)
+
+def validate_sensor_data(data):
+    """Validates sensor data to ensure values are within realistic ranges"""
+    # Define valid ranges for parameters
+    valid_ranges = {
+        "ph": (6.0, 9.0),
+        "temperature": (0, 40),
+        "turbidity": (0, 50),
+        "wave_height": (0, 10),
+        "wind_speed": (0, 50),
+        "wind_direction": (0, 360),
+        "pressure": (950, 1050),
+        "air_temp": (-10, 45),
+        "mercury": (0, 0.1),
+        "lead": (0, 0.2),
+        "cadmium": (0, 0.05),
+        "chromium": (0, 0.3),
+        "petroleum_hydrocarbons": (0, 5),
+        "polycyclic_aromatic": (0, 1),
+        "nitrates": (0, 50),
+        "phosphates": (0, 10),
+        "ammonia": (0, 5),
+        "chlorophyll_a": (0, 100),
+        "dissolved_oxygen": (0, 130),
+        "microplastics": (0, 30),
+        "coliform_bacteria": (0, 5000)
+    }
+    
+    # Validate each parameter
+    for param, (min_val, max_val) in valid_ranges.items():
+        if param in data and data[param] is not None:
+            # Ensure value is within range
+            data[param] = max(min_val, min(max_val, data[param]))
+    
+    return data
 
 # Main loop
 def main():
@@ -252,7 +404,14 @@ def main():
             if "pH" in buoy:
                 buoy["ph"] = buoy.pop("pH")
 
+            # Timestamp in milliseconds
             buoy["timestamp"] = int(time.time()*1000)
+            
+            # Validate data to ensure realistic values
+            buoy = validate_sensor_data(buoy)
+            
+            # Calculate Water Quality Index
+            buoy["water_quality_index"] = calculate_water_quality_index(buoy)
             
             # Validate message before sending
             try:
@@ -294,14 +453,12 @@ def main():
             logger.debug(f"📄 Complete JSON: {json.dumps(buoy, indent=2)}")
             logger.info(f"  📊 Environmental: pH={buoy.get('ph', 'N/A')}, Temp={buoy.get('temperature', 'N/A')}°C, Wind={buoy.get('wind_speed', 'N/A')}kt")
             logger.info(f"  🌊 Sea: Waves={buoy.get('wave_height', 'N/A')}m, Pressure={buoy.get('pressure', 'N/A')}hPa")
-            logger.info(f"  🔬 Pollution: WQI={buoy.get('water_quality_index')}, Level={buoy.get('pollution_level')}")
+            logger.info(f"  🔬 WQI={buoy.get('water_quality_index', 'N/A')}")
             logger.info(f"  🧪 Microplastics={buoy.get('microplastics', 'N/A')} part/m³")
             logger.info(f"  ⚗️ Metals: Hg={buoy.get('mercury', 'N/A')}mg/L, Pb={buoy.get('lead', 'N/A')}mg/L")
             logger.info(f"  🛢️ Hydrocarbons: TPH={buoy.get('petroleum_hydrocarbons', 'N/A')}mg/L")
             logger.info(f"  🌱 Nutrients: NO3={buoy.get('nitrates', 'N/A')}mg/L, PO4={buoy.get('phosphates', 'N/A')}mg/L")
             logger.info(f"  🦠 Biological: Coliform={buoy.get('coliform_bacteria', 'N/A')}, Chlorophyll={buoy.get('chlorophyll_a', 'N/A')}μg/L")
-            if buoy.get('pollution_event'):
-                logger.warning(f"  🚨 POLLUTION EVENT: {buoy['pollution_event']['type']} - {buoy['pollution_event']['severity']}")
             logger.info("  " + "-"*80)
 
         # Standard producer flush

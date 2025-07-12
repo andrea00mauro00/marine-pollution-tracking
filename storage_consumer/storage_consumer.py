@@ -1,11 +1,11 @@
 """
-Marine Pollution Monitoring System - Storage Consumer
-This component:
-1. Consumes data from all Kafka topics
-2. Stores raw data in Bronze layer
-3. Stores processed data in Silver layer
-4. Stores business insights in Gold layer
-5. Manages time-series data in TimescaleDB
+Marine Pollution Monitoring System - Storage Consumer (Ristrutturato)
+Questo componente:
+1. Consuma dati da tutti i topic Kafka
+2. Archivia dati grezzi nel livello Bronze
+3. Archivia dati processati nel livello Silver
+4. Archivia insight di business nel livello Gold
+5. Gestisce dati time-series in TimescaleDB
 """
 
 import os
@@ -13,10 +13,9 @@ import logging
 import json
 import time
 import sys
-import uuid  # Added missing import
+import uuid
 from datetime import datetime
 from kafka import KafkaConsumer
-import redis
 import boto3
 from botocore.exceptions import ClientError
 import psycopg2
@@ -27,38 +26,85 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Configure logging
+# Configurazione logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Configuration
+# Configurazione
 KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 TIMESCALE_HOST = os.environ.get("TIMESCALE_HOST", "timescaledb")
 TIMESCALE_DB = os.environ.get("TIMESCALE_DB", "marine_pollution")
 TIMESCALE_USER = os.environ.get("TIMESCALE_USER", "postgres")
 TIMESCALE_PASSWORD = os.environ.get("TIMESCALE_PASSWORD", "postgres")
-POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "postgres")
-POSTGRES_DB = os.environ.get("POSTGRES_DB", "marine_pollution")
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "postgres")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
 MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", os.environ.get("MINIO_ACCESS_KEY", "minioadmin"))
 MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", os.environ.get("MINIO_SECRET_KEY", "minioadmin"))
 
-# Kafka topics to monitor
+# Topic Kafka da monitorare
 TOPICS = [
-    "buoy_data", "satellite_imagery",                # Raw data
-    "processed_imagery", "analyzed_sensor_data",     # Processed data
-    "analyzed_data", "pollution_hotspots",           # Analysis results
-    "pollution_predictions", "sensor_alerts"         # Predictions and alerts
+    "buoy_data", "satellite_imagery",                # Dati grezzi
+    "processed_imagery", "analyzed_sensor_data",     # Dati processati
+    "analyzed_data", "pollution_hotspots",           # Risultati analisi
+    "pollution_predictions", "sensor_alerts"         # Predizioni e allarmi
 ]
 
+# Funzione per standardizzare i nomi delle variabili - NUOVA
+def standardize_data(data, data_type):
+    """Standardizza i nomi delle variabili nei dati"""
+    standardized = data.copy()
+    
+    # Standardizzazione delle coordinate
+    if "location" in standardized:
+        loc = standardized["location"]
+        if "lat" in loc and "latitude" not in loc:
+            loc["latitude"] = loc.pop("lat")
+        if "lon" in loc and "longitude" not in loc:
+            loc["longitude"] = loc.pop("lon")
+        if "center_lat" in loc and "center_latitude" not in loc:
+            loc["center_latitude"] = loc.pop("center_lat")
+        if "center_lon" in loc and "center_longitude" not in loc:
+            loc["center_longitude"] = loc.pop("center_lon")
+    else:
+        # Coordinate dirette nell'oggetto principale
+        if "LAT" in standardized and "latitude" not in standardized:
+            standardized["latitude"] = standardized.pop("LAT")
+        if "LON" in standardized and "longitude" not in standardized:
+            standardized["longitude"] = standardized.pop("LON")
+        if "lat" in standardized and "latitude" not in standardized:
+            standardized["latitude"] = standardized.pop("lat")
+        if "lon" in standardized and "longitude" not in standardized:
+            standardized["longitude"] = standardized.pop("lon")
+    
+    # Standardizzazione delle misurazioni
+    if "measurements" in standardized:
+        meas = standardized["measurements"]
+        if "WTMP" in meas and "temperature" not in meas:
+            meas["temperature"] = meas.pop("WTMP")
+        if "pH" in meas and "ph" not in meas:
+            meas["ph"] = meas.pop("pH")
+        if "WVHT" in meas and "wave_height" not in meas:
+            meas["wave_height"] = meas.pop("WVHT")
+        if "microplastics_concentration" in meas and "microplastics" not in meas:
+            meas["microplastics"] = meas.pop("microplastics_concentration")
+    
+    # Standardizzazione dell'analisi di inquinamento
+    if "pollution_analysis" in standardized:
+        poll = standardized["pollution_analysis"]
+        if "level" in poll and "pollution_level" not in poll:
+            poll["pollution_level"] = poll.pop("level")
+    
+    # Standardizzazione del riepilogo di inquinamento
+    if "pollution_summary" in standardized:
+        summ = standardized["pollution_summary"]
+        if "level" in summ and "pollution_level" not in summ:
+            summ["pollution_level"] = summ.pop("level")
+    
+    return standardized
+
 def connect_to_timescaledb():
-    """Establishes connection to TimescaleDB with retry logic"""
+    """Stabilisce connessione a TimescaleDB con logica di retry"""
     max_retries = 5
-    retry_interval = 10  # seconds
+    retry_interval = 10  # secondi
     
     for attempt in range(max_retries):
         try:
@@ -78,31 +124,8 @@ def connect_to_timescaledb():
                 logger.error(f"Impossibile connettersi a TimescaleDB dopo {max_retries} tentativi: {e}")
                 raise
 
-def connect_to_postgres():
-    """Establishes connection to PostgreSQL with retry logic"""
-    max_retries = 5
-    retry_interval = 10  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            conn = psycopg2.connect(
-                host=POSTGRES_HOST,
-                database=POSTGRES_DB,
-                user=POSTGRES_USER,
-                password=POSTGRES_PASSWORD
-            )
-            logger.info("Connesso a PostgreSQL")
-            return conn
-        except psycopg2.OperationalError as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Tentativo {attempt+1}/{max_retries} fallito: {e}. Riprovo tra {retry_interval} secondi...")
-                time.sleep(retry_interval)
-            else:
-                logger.error(f"Impossibile connettersi a PostgreSQL dopo {max_retries} tentativi: {e}")
-                raise
-
 def get_minio_client():
-    """Creates and returns a MinIO client"""
+    """Crea e restituisce un client MinIO"""
     return boto3.client(
         's3',
         endpoint_url=f"http://{MINIO_ENDPOINT}",
@@ -111,7 +134,7 @@ def get_minio_client():
     )
 
 def ensure_minio_buckets(s3_client):
-    """Ensures that the necessary buckets exist in MinIO"""
+    """Assicura che i bucket necessari esistano in MinIO"""
     buckets = ["bronze", "silver", "gold"]
     
     for bucket in buckets:
@@ -125,14 +148,13 @@ def ensure_minio_buckets(s3_client):
             except Exception as e:
                 logger.error(f"Errore nella creazione del bucket '{bucket}': {e}")
 
-def create_tables(conn_timescale, conn_postgres):
-    """Creates necessary tables in TimescaleDB and PostgreSQL if they don't exist"""
-    # TimescaleDB tables
+def create_tables(conn_timescale):
+    """Crea tabelle necessarie in TimescaleDB se non esistono"""
     with conn_timescale.cursor() as cur:
-        # Extension for TimescaleDB
+        # Estensione per TimescaleDB
         cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
         
-        # Table for sensor measurements with standardized variable names
+        # Tabella per misurazioni sensori con nomi variabili standardizzati
         cur.execute("""
         CREATE TABLE IF NOT EXISTS sensor_measurements (
             time TIMESTAMPTZ NOT NULL,
@@ -147,15 +169,15 @@ def create_tables(conn_timescale, conn_postgres):
             microplastics DOUBLE PRECISION,
             water_quality_index DOUBLE PRECISION,
             risk_score DOUBLE PRECISION,
-            pollution_level TEXT
+            pollution_level TEXT,
+            pollutant_type TEXT
         );
         """)
-
         
-        # Convert to hypertable if not already
+        # Converti in hypertable se non lo è già
         cur.execute("SELECT create_hypertable('sensor_measurements', 'time', if_not_exists => TRUE);")
         
-        # Table for aggregated pollution metrics with standardized variable names
+        # Tabella per metriche di inquinamento aggregate
         cur.execute("""
         CREATE TABLE IF NOT EXISTS pollution_metrics (
             time TIMESTAMPTZ NOT NULL,
@@ -168,78 +190,36 @@ def create_tables(conn_timescale, conn_postgres):
         );
         """)
         
-        # Convert to hypertable if not already
+        # Converti in hypertable se non lo è già
         cur.execute("SELECT create_hypertable('pollution_metrics', 'time', if_not_exists => TRUE);")
         
+        # NUOVO: Aggiungi indici per query comuni
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sensor_measurements_source_id ON sensor_measurements(source_id);
+        CREATE INDEX IF NOT EXISTS idx_sensor_measurements_pollution_level ON sensor_measurements(pollution_level);
+        CREATE INDEX IF NOT EXISTS idx_pollution_metrics_region ON pollution_metrics(region);
+        """)
+        
         conn_timescale.commit()
-        logger.info("Tabelle TimescaleDB create/verificate")
-    
-    # PostgreSQL tables
-    with conn_postgres.cursor() as cur:
-        # Table for pollution events with standardized variable names
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS pollution_events (
-            event_id SERIAL PRIMARY KEY,
-            start_time TIMESTAMPTZ NOT NULL,
-            end_time TIMESTAMPTZ,
-            region TEXT NOT NULL,
-            center_latitude DOUBLE PRECISION,
-            center_longitude DOUBLE PRECISION,
-            radius_km DOUBLE PRECISION,
-            pollution_level TEXT NOT NULL,
-            pollutant_type TEXT,
-            risk_score DOUBLE PRECISION,
-            affected_area_km2 DOUBLE PRECISION,
-            status TEXT NOT NULL
-        );
-        """)
-        
-        # Table for alerts
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS alerts (
-            alert_id SERIAL PRIMARY KEY,
-            event_id INTEGER REFERENCES pollution_events(event_id),
-            created_at TIMESTAMPTZ NOT NULL,
-            severity TEXT NOT NULL,
-            message TEXT NOT NULL,
-            recommended_actions TEXT[],
-            status TEXT NOT NULL,
-            resolved_at TIMESTAMPTZ,
-            resolved_by TEXT
-        );
-        """)
-        
-        # Table for notifications
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS notifications (
-            notification_id SERIAL PRIMARY KEY,
-            alert_id INTEGER REFERENCES alerts(alert_id),
-            created_at TIMESTAMPTZ NOT NULL,
-            type TEXT NOT NULL,
-            recipients TEXT[],
-            subject TEXT,
-            message TEXT,
-            status TEXT NOT NULL
-        );
-        """)
-        
-        conn_postgres.commit()
-        logger.info("Tabelle PostgreSQL create/verificate")
+        logger.info("Tabelle TimescaleDB create/verificate con indici")
 
 def process_raw_buoy_data(s3_client, data):
-    """Processes raw buoy data and stores it in the Bronze layer"""
+    """Processa dati grezzi della boa e li archivia nel livello Bronze"""
     try:
-        # Extract timestamp and sensor info
+        # Standardizza i dati
+        data = standardize_data(data, "buoy")
+        
+        # Estrai timestamp e info sensore
         timestamp = data.get("timestamp", int(time.time() * 1000))
         sensor_id = data.get("sensor_id", "unknown")
         
-        # Get date parts for partitioning
+        # Ottieni parti della data per partizionamento
         dt = datetime.fromtimestamp(timestamp / 1000)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save in Bronze layer
+        # Salva nel livello Bronze
         key = f"buoy_data/year={year}/month={month}/day={day}/buoy_{sensor_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="bronze",
@@ -255,25 +235,28 @@ def process_raw_buoy_data(s3_client, data):
         return False
 
 def process_raw_satellite_data(s3_client, data):
-    """Processes satellite imagery metadata and stores it in the Bronze layer"""
+    """Processa metadati immagini satellitari e li archivia nel livello Bronze"""
     try:
-        # Verify that there is an image_path (pointer to the image already saved)
+        # Standardizza i dati
+        data = standardize_data(data, "satellite")
+        
+        # Verifica che ci sia un image_path (puntatore all'immagine già salvata)
         image_path = data.get("image_pointer")
         if not image_path:
             logger.warning("Dati satellite senza image_path, impossibile processare")
             return False
             
-        # Extract timestamp and metadata
+        # Estrai timestamp e metadata
         timestamp = data.get("timestamp", int(time.time() * 1000))
         metadata = data.get("metadata", {})
         
-        # Convert timestamp to date for partitioning
+        # Converti timestamp in data per partizionamento
         dt = datetime.fromtimestamp(timestamp / 1000)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save metadata in the Bronze layer (next to the image)
+        # Salva metadata nel livello Bronze (vicino all'immagine)
         unique_id = str(uuid.uuid4())[:8]
         metadata_key = f"satellite_imagery/sentinel2/year={year}/month={month}/day={day}/metadata_{unique_id}_{timestamp}.json"
         s3_client.put_object(
@@ -290,9 +273,12 @@ def process_raw_satellite_data(s3_client, data):
         return False
 
 def process_processed_imagery(s3_client, data):
-    """Processes processed imagery data and stores it in the Silver layer"""
+    """Processa dati immagini processate e li archivia nel livello Silver"""
     try:
-        # Extract data
+        # Standardizza i dati
+        data = standardize_data(data, "processed_imagery")
+        
+        # Estrai dati
         image_id = data.get("image_id", "unknown")
         timestamp = data.get("timestamp", int(time.time() * 1000))
         spectral_analysis = data.get("spectral_analysis", {})
@@ -303,13 +289,13 @@ def process_processed_imagery(s3_client, data):
             logger.warning("Dati immagine processata senza original_image_path, impossibile processare")
             return False
         
-        # Convert timestamp to date for partitioning
+        # Converti timestamp in data per partizionamento
         dt = datetime.fromtimestamp(timestamp / 1000)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save processed data to Silver layer
+        # Salva dati processati nel livello Silver
         processed_key = f"analyzed_data/satellite/year={year}/month={month}/day={day}/analyzed_{image_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="silver",
@@ -325,20 +311,23 @@ def process_processed_imagery(s3_client, data):
         return False
 
 def process_analyzed_sensor_data(s3_client, conn_timescale, data):
-    """Processes analyzed sensor data and stores it in the Silver layer and TimescaleDB"""
+    """Processa dati sensore analizzati e li archivia nel livello Silver e TimescaleDB"""
     try:
-        # Extract data - with standardized variable names
+        # Standardizza i dati
+        data = standardize_data(data, "analyzed_sensor")
+        
+        # Estrai dati - con nomi variabili standardizzati
         timestamp = data.get("timestamp", int(time.time() * 1000))
         location = data.get("location", {})
         source_id = location.get("sensor_id", "unknown")
         
-        # Convert timestamp to date for partitioning
+        # Converti timestamp in data per partizionamento
         dt = datetime.fromtimestamp(timestamp / 1000)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save in Silver layer
+        # Salva nel livello Silver
         key = f"analyzed_data/buoy/year={year}/month={month}/day={day}/analyzed_{source_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="silver",
@@ -348,17 +337,53 @@ def process_analyzed_sensor_data(s3_client, conn_timescale, data):
         )
         logger.info(f"Dati sensore analizzati salvati in Silver: silver/{key}")
         
-        # Save in TimescaleDB
-        save_to_timescaledb(conn_timescale, "sensor_analysis", data)
+        # Salva in TimescaleDB
+        with conn_timescale.cursor() as cur:
+            # Estrai dati standardizzati
+            timestamp_dt = datetime.fromtimestamp(data.get("timestamp", 0) / 1000)
+            measurements = data.get("measurements", {})
+            pollution_analysis = data.get("pollution_analysis", {})
+
+            # Inserisci nella tabella sensor_measurements
+            cur.execute("""
+                INSERT INTO sensor_measurements (
+                    time, source_type, source_id, latitude, longitude,
+                    temperature, ph, turbidity, wave_height, microplastics,
+                    water_quality_index, risk_score, pollution_level, pollutant_type
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                timestamp_dt,
+                data.get("source_type", "buoy"),
+                location.get("sensor_id", "unknown"),
+                location.get("latitude"),
+                location.get("longitude"),
+                measurements.get("temperature"),
+                measurements.get("ph"),
+                measurements.get("turbidity"),
+                measurements.get("wave_height"),
+                measurements.get("microplastics", 0),
+                measurements.get("water_quality_index", 0),
+                pollution_analysis.get("risk_score"),
+                pollution_analysis.get("pollution_level"),
+                pollution_analysis.get("pollutant_type", "unknown")
+            ))
+            conn_timescale.commit()
+            logger.info(f"Salvati dati in TimescaleDB: sensor_measurements per sensore {location.get('sensor_id')}")
         
         return True
     except Exception as e:
         logger.error(f"Errore nel processare i dati sensore analizzati: {e}")
+        if conn_timescale:
+            conn_timescale.rollback()
         return False
 
 def process_analyzed_data(s3_client, conn_timescale, data):
-    """Processes analyzed data from all sources"""
+    """Processa dati analizzati da tutte le fonti"""
     try:
+        # Standardizza i dati
+        data = standardize_data(data, "analyzed_data")
+        
         source_type = data.get("source_type")
         
         if source_type == "buoy":
@@ -373,18 +398,23 @@ def process_analyzed_data(s3_client, conn_timescale, data):
         return False
 
 def process_hotspot_data(s3_client, conn_timescale, data):
-    """Processes hotspot data and stores it in the Gold layer, TimescaleDB, and Redis"""
+    """Processa dati hotspot e li archivia nel livello Gold e TimescaleDB"""
     try:
+        # Standardizza i dati
+        data = standardize_data(data, "hotspot")
+        
         hotspot_id = data.get("hotspot_id", "unknown")
         timestamp = data.get("timestamp", int(time.time() * 1000))
+        location = data.get("location", {})
+        pollution_summary = data.get("pollution_summary", {})
 
-        # Partitioning path
+        # Path di partizionamento
         dt = datetime.fromtimestamp(timestamp / 1000)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
         day = dt.strftime("%d")
 
-        # Save on MinIO Gold
+        # Salva su MinIO Gold
         key = f"hotspots/year={year}/month={month}/day={day}/hotspot_{hotspot_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
@@ -394,35 +424,73 @@ def process_hotspot_data(s3_client, conn_timescale, data):
         )
         logger.info(f"Hotspot salvato in Gold: gold/{key}")
 
-        # Save on TimescaleDB
-        save_to_timescaledb(conn_timescale, "hotspots", data)
+        # Salva su TimescaleDB
+        with conn_timescale.cursor() as cur:
+            # Estrai dati standardizzati
+            timestamp_dt = datetime.fromtimestamp(timestamp / 1000)
+            region = determine_region(location.get("center_latitude"), location.get("center_longitude"))
 
-        # ✅ Save on Redis
-        redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-        redis_client.hset(f"hotspot:{hotspot_id}", mapping=data)
-        redis_client.sadd("active_hotspots", hotspot_id)
-        logger.info(f"Hotspot {hotspot_id} salvato in Redis")
+            # Inserisci nella tabella pollution_metrics
+            cur.execute("""
+                INSERT INTO pollution_metrics (
+                    time, region, avg_risk_score, max_risk_score,
+                    pollutant_types, affected_area_km2, sensor_count
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                timestamp_dt,
+                region,
+                pollution_summary.get("risk_score"),
+                pollution_summary.get("risk_score"),  # Stesso valore per max
+                json.dumps({pollution_summary.get("pollutant_type", "unknown"): 1}),
+                pollution_summary.get("affected_area_km2"),
+                pollution_summary.get("measurement_count", 1)
+            ))
+            conn_timescale.commit()
+            logger.info(f"Salvati dati in TimescaleDB: pollution_metrics per hotspot {hotspot_id}")
 
         return True
     except Exception as e:
         logger.error(f"Errore nel processare i dati hotspot: {e}")
+        if conn_timescale:
+            conn_timescale.rollback()
         return False
 
+def determine_region(latitude, longitude):
+    """Determina la regione in base alle coordinate"""
+    if not latitude or not longitude:
+        return "unknown"
+    
+    # Esempio confini regionali per Chesapeake Bay
+    if latitude > 39.0:
+        return "upper_bay"
+    elif latitude > 38.0:
+        return "mid_bay"
+    elif latitude > 37.0:
+        if longitude < -76.2:
+            return "west_lower_bay"
+        else:
+            return "east_lower_bay"
+    else:
+        return "bay_mouth"
 
 def process_prediction_data(s3_client, data):
-    """Processes prediction data and stores it in the Gold layer"""
+    """Processa dati predizione e li archivia nel livello Gold"""
     try:
-        # Extract data
+        # Standardizza i dati
+        data = standardize_data(data, "prediction")
+        
+        # Estrai dati
         prediction_id = data.get("prediction_set_id", "unknown")
         timestamp = data.get("generated_at", int(time.time() * 1000))
         
-        # Convert timestamp to date for partitioning
+        # Converti timestamp in data per partizionamento
         dt = datetime.fromtimestamp(timestamp / 1000)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save in Gold layer
+        # Salva nel livello Gold
         key = f"predictions/year={year}/month={month}/day={day}/prediction_{prediction_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
@@ -438,19 +506,22 @@ def process_prediction_data(s3_client, data):
         return False
 
 def process_alert_data(s3_client, data):
-    """Processes alert data and stores it in the Gold layer"""
+    """Processa dati allarme e li archivia nel livello Gold"""
     try:
-        # Extract data
+        # Standardizza i dati
+        data = standardize_data(data, "alert")
+        
+        # Estrai dati
         alert_id = data.get("alert_id", "unknown")
         timestamp = data.get("timestamp", int(time.time() * 1000))
         
-        # Convert timestamp to date for partitioning
+        # Converti timestamp in data per partizionamento
         dt = datetime.fromtimestamp(timestamp / 1000)
         year = dt.strftime("%Y")
         month = dt.strftime("%m")
         day = dt.strftime("%d")
         
-        # Save in Gold layer
+        # Salva nel livello Gold
         key = f"alerts/year={year}/month={month}/day={day}/alert_{alert_id}_{timestamp}.json"
         s3_client.put_object(
             Bucket="gold",
@@ -465,97 +536,18 @@ def process_alert_data(s3_client, data):
         logger.error(f"Errore nel processare i dati alert: {e}")
         return False
 
-def save_to_timescaledb(conn, table_type, data):
-    """Saves data to TimescaleDB based on type"""
-    try:
-        if table_type == "sensor_analysis":
-            with conn.cursor() as cur:
-                # Extract standardized data
-                timestamp = datetime.fromtimestamp(data.get("timestamp", 0) / 1000)
-                location = data.get("location", {})
-                measurements = data.get("measurements", {})
-                pollution_analysis = data.get("pollution_analysis", {})
-
-                # Insert into sensor_measurements table
-                cur.execute("""
-                    INSERT INTO sensor_measurements (
-                        time, source_type, source_id, latitude, longitude,
-                        temperature, ph, turbidity, wave_height, microplastics,
-                        water_quality_index, risk_score, pollution_level
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    timestamp,
-                    data.get("source_type", "buoy"),
-                    location.get("sensor_id", "unknown"),
-                    location.get("latitude", location.get("lat")),
-                    location.get("longitude", location.get("lon")),
-                    measurements.get("temperature", measurements.get("WTMP")),
-                    measurements.get("ph", measurements.get("pH")),
-                    measurements.get("turbidity"),
-                    measurements.get("wave_height", measurements.get("WVHT")),
-                    measurements.get("microplastics", 0),
-                    measurements.get("water_quality_index", 0),
-                    pollution_analysis.get("risk_score"),
-                    pollution_analysis.get("level")
-                ))
-                conn.commit()
-                logger.info(f"Salvati dati in TimescaleDB: sensor_measurements per sensore {location.get('sensor_id')}")
-
-        elif table_type == "hotspots":
-            with conn.cursor() as cur:
-                # Extract standardized data
-                timestamp = datetime.fromtimestamp(data.get("timestamp", 0) / 1000)
-                location = data.get("location", {})
-                summary = data.get("pollution_summary", {})
-
-                # Insert into pollution_metrics table
-                cur.execute("""
-                    INSERT INTO pollution_metrics (
-                        time, region, avg_risk_score, max_risk_score,
-                        pollutant_types, affected_area_km2, sensor_count
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    timestamp,
-                    "Chesapeake Bay",  # Default region
-                    summary.get("risk_score"),
-                    summary.get("risk_score"),  # Same value for max
-                    json.dumps({summary.get("pollutant_type", "unknown"): 1}),
-                    summary.get("affected_area_km2"),
-                    summary.get("measurement_count", 1)
-                ))
-                conn.commit()
-                logger.info(f"Salvati dati in TimescaleDB: pollution_metrics per hotspot {data.get('hotspot_id')}")
-
-        return True
-
-    except Exception as e:
-        logger.error(f"Errore nel salvare in TimescaleDB ({table_type}): {e}")
-        if conn:
-            conn.rollback()
-        return False
-
-
 def main():
-    """Main function"""
+    """Funzione principale"""
     logger.info("Starting Storage Consumer")
     
-    # Connect to TimescaleDB
+    # Connetti a TimescaleDB
     try:
         conn_timescale = connect_to_timescaledb()
     except Exception as e:
         logger.error(f"Errore nella connessione a TimescaleDB: {e}")
         return
     
-    # Connect to PostgreSQL
-    try:
-        conn_postgres = connect_to_postgres()
-    except Exception as e:
-        logger.error(f"Errore nella connessione a PostgreSQL: {e}")
-        return
-    
-    # Create MinIO client and ensure buckets
+    # Crea client MinIO e assicura bucket
     try:
         s3_client = get_minio_client()
         ensure_minio_buckets(s3_client)
@@ -563,14 +555,14 @@ def main():
         logger.error(f"Errore nella configurazione di MinIO: {e}")
         return
     
-    # Create tables
+    # Crea tabelle
     try:
-        create_tables(conn_timescale, conn_postgres)
+        create_tables(conn_timescale)
     except Exception as e:
         logger.error(f"Errore nella creazione delle tabelle: {e}")
         return
     
-    # Create Kafka consumer
+    # Crea consumer Kafka
     consumer = KafkaConsumer(
         *TOPICS,
         bootstrap_servers=KAFKA_SERVERS,
@@ -580,7 +572,7 @@ def main():
     )
     logger.info(f"Consumer Kafka avviato, in ascolto sui topic: {', '.join(TOPICS)}")
     
-    # Main loop
+    # Loop principale
     try:
         for message in consumer:
             topic = message.topic
@@ -589,7 +581,7 @@ def main():
             try:
                 logger.info(f"Ricevuto messaggio dal topic {topic}")
                 
-                # Process based on topic
+                # Processa in base al topic
                 if topic == "buoy_data":
                     process_raw_buoy_data(s3_client, data)
                 elif topic == "satellite_imagery":
@@ -617,8 +609,6 @@ def main():
     finally:
         if conn_timescale:
             conn_timescale.close()
-        if conn_postgres:
-            conn_postgres.close()
         consumer.close()
         logger.info("Consumer chiuso")
 

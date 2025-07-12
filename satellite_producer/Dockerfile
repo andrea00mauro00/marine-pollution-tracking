@@ -47,6 +47,7 @@ RUN if [ -d "/app/Utils/config" ]; then \
         cp -r /app/Utils/config/* /app/satellite_producer/utils/config/; \
     fi
 
+
 # Imposta variabili d'ambiente
 ENV KAFKA_BOOTSTRAP_SERVERS=kafka:9092
 ENV KAFKA_TOPIC=satellite_img

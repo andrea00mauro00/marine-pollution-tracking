@@ -163,6 +163,8 @@ services:
       - MINIO_BUCKET=bronze
       - AWS_ACCESS_KEY_ID=minioadmin
       - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - ./schemas:/app/schemas
     restart: always
     networks:
       - marine_net

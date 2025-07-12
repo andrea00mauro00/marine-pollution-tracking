@@ -1,11 +1,11 @@
 """
-Marine Pollution Monitoring System - Enhanced Alert Manager
-This component:
-1. Consumes alerts from sensor_alerts Kafka topic
-2. Manages alert lifecycle in PostgreSQL with advanced escalation paths
-3. Sends multi-channel notifications based on alert severity and region
-4. Maintains alert state in Redis for dashboard access
-5. Handles alert deduplication, update logic, and resolution workflows
+Marine Pollution Monitoring System - Enhanced Alert Manager (Ristrutturato)
+Questo componente:
+1. Consuma allarmi dal topic Kafka sensor_alerts
+2. Gestisce ciclo di vita allarmi in PostgreSQL con percorsi di escalation avanzati
+3. Invia notifiche multi-canale basate su severità e regione dell'allarme
+4. Mantiene stato allarmi in PostgreSQL per accesso dashboard
+5. Gestisce deduplicazione allarmi, logica di aggiornamento e workflow di risoluzione
 """
 
 import os
@@ -23,11 +23,11 @@ from datetime import datetime, timedelta
 from kafka import KafkaConsumer, KafkaProducer
 import redis
 
-# Configure logging
+# Configurazione logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Configuration
+# Configurazione
 KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
@@ -39,7 +39,7 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 # Topic Kafka
 ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
 
-# Email configuration - enhanced with more options
+# Configurazione email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_SERVER = os.environ.get("EMAIL_SERVER", "smtp.example.com")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", 587))
@@ -50,7 +50,7 @@ HIGH_PRIORITY_RECIPIENTS = os.environ.get("HIGH_PRIORITY_RECIPIENTS", "emergency
 MEDIUM_PRIORITY_RECIPIENTS = os.environ.get("MEDIUM_PRIORITY_RECIPIENTS", "operations@example.com").split(",")
 LOW_PRIORITY_RECIPIENTS = os.environ.get("LOW_PRIORITY_RECIPIENTS", "monitoring@example.com").split(",")
 
-# SMS configuration (new)
+# Configurazione SMS
 SMS_ENABLED = os.environ.get("SMS_ENABLED", "false").lower() == "true"
 SMS_PROVIDER = os.environ.get("SMS_PROVIDER", "twilio")
 SMS_ACCOUNT_SID = os.environ.get("SMS_ACCOUNT_SID", "")
@@ -58,12 +58,12 @@ SMS_AUTH_TOKEN = os.environ.get("SMS_AUTH_TOKEN", "")
 SMS_FROM_NUMBER = os.environ.get("SMS_FROM_NUMBER", "")
 SMS_RECIPIENTS = os.environ.get("SMS_RECIPIENTS", "").split(",")
 
-# Webhook configuration (new) - Fixed syntax error
+# Configurazione webhook
 WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "false").lower() == "true"
 WEBHOOK_URLS = os.environ.get("WEBHOOK_URLS", "").split(",")
 WEBHOOK_AUTH_TOKEN = os.environ.get("WEBHOOK_AUTH_TOKEN", "")
 
-# Alert escalation configuration (new)
+# Configurazione escalation allarmi
 ESCALATION_CONFIG = {
     "high": {
         "reminder_interval_minutes": 30,
@@ -79,13 +79,13 @@ ESCALATION_CONFIG = {
     }
 }
 
-# Region configuration (new)
+# Configurazione regionale
 REGIONAL_CONFIG = json.loads(os.environ.get("REGIONAL_CONFIG", "{}"))
 
 def connect_to_postgres():
-    """Establishes connection to PostgreSQL with retry logic"""
+    """Stabilisce connessione a PostgreSQL con logica di retry"""
     max_retries = 5
-    retry_interval = 10  # seconds
+    retry_interval = 10  # secondi
     
     for attempt in range(max_retries):
         try:
@@ -95,39 +95,20 @@ def connect_to_postgres():
                 user=POSTGRES_USER,
                 password=POSTGRES_PASSWORD
             )
-            logger.info("Connected to PostgreSQL")
+            logger.info("Connesso a PostgreSQL")
             return conn
         except psycopg2.OperationalError as e:
             if attempt < max_retries - 1:
-                logger.warning(f"Attempt {attempt+1}/{max_retries} failed: {e}. Retrying in {retry_interval} seconds...")
+                logger.warning(f"Tentativo {attempt+1}/{max_retries} fallito: {e}. Riprovo tra {retry_interval} secondi...")
                 time.sleep(retry_interval)
             else:
-                logger.error(f"Failed to connect to PostgreSQL after {max_retries} attempts: {e}")
-                raise
-
-def connect_to_redis():
-    """Establishes connection to Redis with retry logic"""
-    max_retries = 5
-    retry_interval = 5  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-            r.ping()  # Check connection
-            logger.info("Connected to Redis")
-            return r
-        except redis.exceptions.ConnectionError as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Attempt {attempt+1}/{max_retries} failed: {e}. Retrying in {retry_interval} seconds...")
-                time.sleep(retry_interval)
-            else:
-                logger.error(f"Failed to connect to Redis after {max_retries} attempts: {e}")
+                logger.error(f"Impossibile connettersi a PostgreSQL dopo {max_retries} tentativi: {e}")
                 raise
 
 def create_tables(conn):
-    """Creates enhanced tables in PostgreSQL if they don't exist"""
+    """Crea tabelle potenziate in PostgreSQL se non esistono"""
     with conn.cursor() as cur:
-        # Original tables
+        # Tabella per eventi inquinamento con vincoli check
         cur.execute("""
         CREATE TABLE IF NOT EXISTS pollution_events (
             event_id SERIAL PRIMARY KEY,
@@ -137,59 +118,59 @@ def create_tables(conn):
             center_latitude DOUBLE PRECISION,
             center_longitude DOUBLE PRECISION,
             radius_km DOUBLE PRECISION,
-            pollution_level TEXT NOT NULL,
+            pollution_level TEXT NOT NULL CHECK (pollution_level IN ('high', 'medium', 'low', 'minimal', 'unknown')),
             pollutant_type TEXT,
-            risk_score DOUBLE PRECISION,
+            risk_score DOUBLE PRECISION CHECK (risk_score >= 0 AND risk_score <= 1),
             affected_area_km2 DOUBLE PRECISION,
-            status TEXT NOT NULL
+            status TEXT NOT NULL CHECK (status IN ('active', 'resolved', 'archived'))
         )
         """)
         
-        # Enhanced alerts table with additional fields
+        # Tabella allarmi potenziata con campi aggiuntivi e vincoli
         cur.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
             alert_id TEXT PRIMARY KEY,
-            event_id INTEGER REFERENCES pollution_events(event_id),
+            event_id INTEGER REFERENCES pollution_events(event_id) NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
-            severity TEXT NOT NULL,
+            severity TEXT NOT NULL CHECK (severity IN ('high', 'medium', 'low')),
             message TEXT NOT NULL,
             recommended_actions TEXT[],
-            status TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('active', 'acknowledged', 'resolved', 'false_alarm')),
             resolved_at TIMESTAMPTZ,
             resolved_by TEXT,
             update_count INTEGER DEFAULT 0,
             last_updated TIMESTAMPTZ,
-            escalation_level INTEGER DEFAULT 0,
+            escalation_level INTEGER DEFAULT 0 CHECK (escalation_level >= 0),
             next_reminder_at TIMESTAMPTZ,
             next_escalation_at TIMESTAMPTZ,
             effectiveness_score FLOAT
         )
         """)
         
-        # Enhanced notifications table
+        # Tabella notifiche potenziata
         cur.execute("""
         CREATE TABLE IF NOT EXISTS notifications (
             notification_id SERIAL PRIMARY KEY,
-            alert_id TEXT REFERENCES alerts(alert_id),
+            alert_id TEXT REFERENCES alerts(alert_id) NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
-            channel TEXT NOT NULL,
+            channel TEXT NOT NULL CHECK (channel IN ('email', 'sms', 'webhook', 'app')),
             recipients TEXT[],
             subject TEXT,
             message TEXT,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'delivered', 'read')),
             status_details TEXT,
             retry_count INTEGER DEFAULT 0
         )
         """)
         
-        # New tables for escalation and feedback
+        # Nuove tabelle per escalation e feedback
         cur.execute("""
         CREATE TABLE IF NOT EXISTS alert_feedback (
             feedback_id SERIAL PRIMARY KEY,
-            alert_id TEXT REFERENCES alerts(alert_id),
+            alert_id TEXT REFERENCES alerts(alert_id) NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
-            feedback_type TEXT NOT NULL,
-            feedback_score INTEGER,
+            feedback_type TEXT NOT NULL CHECK (feedback_type IN ('accuracy', 'response_time', 'effectiveness', 'other')),
+            feedback_score INTEGER CHECK (feedback_score >= 1 AND feedback_score <= 5),
             comment TEXT,
             reported_by TEXT
         )
@@ -198,25 +179,77 @@ def create_tables(conn):
         cur.execute("""
         CREATE TABLE IF NOT EXISTS alert_actions (
             action_id SERIAL PRIMARY KEY,
-            alert_id TEXT REFERENCES alerts(alert_id),
+            alert_id TEXT REFERENCES alerts(alert_id) NOT NULL,
             created_at TIMESTAMPTZ NOT NULL,
             action_type TEXT NOT NULL,
             action_details JSONB,
-            status TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
             performed_by TEXT,
             completion_time TIMESTAMPTZ,
             effectiveness_score FLOAT
         )
         """)
         
+        # Crea indici per migliorare le performance
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+        CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
+        CREATE INDEX IF NOT EXISTS idx_alerts_next_reminder ON alerts(next_reminder_at) WHERE status = 'active';
+        CREATE INDEX IF NOT EXISTS idx_alerts_next_escalation ON alerts(next_escalation_at) WHERE status = 'active';
+        CREATE INDEX IF NOT EXISTS idx_pollution_events_status ON pollution_events(status);
+        CREATE INDEX IF NOT EXISTS idx_pollution_events_region ON pollution_events(region);
+        """)
+        
         conn.commit()
-        logger.info("Enhanced alert tables created/verified")
+        logger.info("Tabelle alert potenziate create/verificate con indici")
 
-def process_alert(alert_data, conn, redis_client):
-    """Process an incoming alert with enhanced orchestration"""
+def standardize_alert_data(data):
+    """Standardizza i nomi delle variabili nei dati allarme"""
+    standardized = data.copy()
+    
+    # Standardizzazione localizzazione
+    if "location" in standardized:
+        loc = standardized["location"]
+        if "lat" in loc and "latitude" not in loc:
+            loc["latitude"] = loc.pop("lat")
+        if "lon" in loc and "longitude" not in loc:
+            loc["longitude"] = loc.pop("lon")
+        if "center_lat" in loc and "center_latitude" not in loc:
+            loc["center_latitude"] = loc.pop("center_lat")
+        if "center_lon" in loc and "center_longitude" not in loc:
+            loc["center_longitude"] = loc.pop("center_lon")
+    
+    # Standardizzazione livello inquinamento
+    if "level" in standardized and "pollution_level" not in standardized:
+        standardized["pollution_level"] = standardized.pop("level")
+    
+    return standardized
+
+def process_alert(alert_data, conn):
     try:
-        # Extract alert details
-        alert_id = alert_data.get("alert_id")
+        # Standardizza i dati
+        alert_data = standardize_alert_data(alert_data)
+        
+        # Estrai o genera alert_id
+        alert_id = None
+        
+        # Se è un evento di inquinamento
+        if "pollution_event_detection" in alert_data:
+            event_detection = alert_data["pollution_event_detection"]
+            alert_id = event_detection.get("event_id")
+        
+        # Se è un hotspot
+        elif "hotspot_id" in alert_data:
+            alert_id = alert_data.get("hotspot_id")
+        
+        # Se non è stato trovato, genera un nuovo UUID
+        if not alert_id:
+            alert_id = str(uuid.uuid4())
+        
+        logger.info(f"Usando alert_id: {alert_id}")
+        
+        # Aggiungi alert_id ai dati
+        alert_data["alert_id"] = alert_id
         hotspot_id = alert_data.get("hotspot_id")
         timestamp = alert_data.get("timestamp", int(time.time() * 1000))
         severity = alert_data.get("severity", "low")
@@ -226,97 +259,103 @@ def process_alert(alert_data, conn, redis_client):
         recommendations = alert_data.get("recommendations", [])
         status = alert_data.get("status", "active")
         
-        # Check if this is an update to an existing alert
-        is_update, existing_alert_id = check_existing_alert(redis_client, alert_id, hotspot_id)
+        # Controlla se questo è un aggiornamento di un allarme esistente
+        is_update, existing_alert_id = check_existing_alert(conn, alert_id, hotspot_id, location)
         
-        # Convert timestamp to datetime
+        # Converti timestamp in datetime
         dt = datetime.fromtimestamp(timestamp / 1000)
         
-        # Process in PostgreSQL
-        alert_record = process_alert_in_postgres(
-            conn, alert_id, hotspot_id, dt, severity, risk_score, 
-            pollutant_type, location, recommendations, status, 
-            is_update, existing_alert_id
-        )
+        # Processa in PostgreSQL usando transazione
+        with conn:  # Questo gestirà automaticamente commit/rollback
+            alert_record = process_alert_in_postgres(
+                conn, alert_id, hotspot_id, dt, severity, risk_score, 
+                pollutant_type, location, recommendations, status, 
+                is_update, existing_alert_id
+            )
+            
+            # Determina target notifica
+            notification_targets = determine_notification_targets(
+                severity, pollutant_type, location, is_update, existing_alert_id
+            )
+            
+            # Invia notifiche
+            send_notifications(conn, alert_record, notification_targets)
+            
+            # Pianifica promemoria e escalation
+            schedule_followups(conn, alert_record)
         
-        # Process in Redis for dashboard
-        process_alert_in_redis(
-            redis_client, alert_id, hotspot_id, timestamp, severity, risk_score,
-            pollutant_type, location, recommendations, status,
-            is_update, existing_alert_id
-        )
-        
-        # Determine notification targets
-        notification_targets = determine_notification_targets(
-            severity, pollutant_type, location, is_update, existing_alert_id
-        )
-        
-        # Send notifications
-        send_notifications(conn, alert_record, notification_targets)
-        
-        # Schedule reminders and escalations
-        schedule_followups(conn, redis_client, alert_record)
-        
-        # Update dashboard metrics
-        update_dashboard_metrics(redis_client)
-        
-        logger.info(f"Alert {alert_id} processed successfully with enhanced orchestration")
+        logger.info(f"Allarme {alert_id} processato con successo con orchestrazione potenziata")
         
     except Exception as e:
-        logger.error(f"Error processing alert with enhanced orchestration: {e}")
-        if conn:
-            conn.rollback()
+        logger.error(f"Errore nel processare allarme con orchestrazione potenziata: {e}")
+        # Il rollback è gestito automaticamente dal contesto 'with'
 
-def check_existing_alert(redis_client, alert_id, hotspot_id):
-    """Check if this is an update to an existing alert"""
+def check_existing_alert(conn, alert_id, hotspot_id, location):
+    """Controlla se questo è un aggiornamento di un allarme esistente"""
     is_update = False
     existing_alert_id = None
     
-    # Check if the alert already exists in Redis
-    if redis_client.exists(f"alert:{alert_id}"):
-        is_update = True
-        existing_alert_id = alert_id
-        logger.info(f"Processing update for existing alert {alert_id}")
-    else:
-        # Check if there's another alert for the same hotspot
-        active_alerts = redis_client.smembers("active_alerts")
+    with conn.cursor() as cur:
+        # Controlla se l'allarme esiste già per ID
+        cur.execute("SELECT alert_id FROM alerts WHERE alert_id = %s", (alert_id,))
+        result = cur.fetchone()
         
-        for active_alert_id in active_alerts:
-            hotspot_from_alert = redis_client.hget(f"alert:{active_alert_id}", "hotspot_id")
-            
-            if hotspot_from_alert == hotspot_id:
-                # Found an existing alert for this hotspot
-                is_update = True
-                existing_alert_id = active_alert_id
-                logger.info(f"Found existing alert {existing_alert_id} for hotspot {hotspot_id}")
-                break
+        if result:
+            is_update = True
+            existing_alert_id = alert_id
+            logger.info(f"Processando aggiornamento per allarme esistente {alert_id}")
+        else:
+            # Controlla se esiste un altro allarme per lo stesso hotspot
+            if hotspot_id:
+                cur.execute("""
+                    SELECT a.alert_id 
+                    FROM alerts a
+                    JOIN pollution_events e ON a.event_id = e.event_id
+                    WHERE a.status = 'active'
+                    AND e.pollutant_type = %s
+                    AND ST_DWithin(
+                        ST_MakePoint(e.center_longitude, e.center_latitude),
+                        ST_MakePoint(%s, %s),
+                        %s * 1000  -- Convert km to meters
+                    )
+                """, (
+                    hotspot_id,
+                    location.get("center_longitude", 0),
+                    location.get("center_latitude", 0),
+                    5.0  # Raggio di ricerca in km
+                ))
+                result = cur.fetchone()
+                
+                if result:
+                    is_update = True
+                    existing_alert_id = result[0]
+                    logger.info(f"Trovato allarme esistente {existing_alert_id} per hotspot {hotspot_id}")
     
     return is_update, existing_alert_id
 
 def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_score, 
                             pollutant_type, location, recommendations, status,
                             is_update, existing_alert_id):
-    """Process alert in PostgreSQL with enhanced fields"""
+    """Processa allarme in PostgreSQL con campi potenziati"""
     with conn.cursor() as cur:
-        # First, create or find associated pollution event
-        # Standardized variable names for latitude and longitude
+        # Prima, crea o trova evento inquinamento associato
         cur.execute("""
         SELECT event_id FROM pollution_events 
         WHERE status = 'active' AND pollutant_type = %s 
         AND center_latitude = %s AND center_longitude = %s
         """, (
             pollutant_type,
-            location.get("center_latitude", location.get("center_lat")),  # Support for backwards compatibility
-            location.get("center_longitude", location.get("center_lon"))  # Support for backwards compatibility
+            location.get("center_latitude", 0),
+            location.get("center_longitude", 0)
         ))
         
         event_row = cur.fetchone()
         
         if event_row:
             event_id = event_row[0]
-            logger.info(f"Found existing event: {event_id}")
+            logger.info(f"Trovato evento esistente: {event_id}")
             
-            # Update event data
+            # Aggiorna dati evento
             cur.execute("""
             UPDATE pollution_events 
             SET pollution_level = %s, risk_score = %s, radius_km = %s, affected_area_km2 = %s
@@ -325,11 +364,11 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
                 severity,
                 risk_score,
                 location.get("radius_km", 5.0),
-                location.get("radius_km", 5.0)**2 * 3.14159,  # Approximate area
+                location.get("radius_km", 5.0)**2 * 3.14159,  # Area approssimata
                 event_id
             ))
         else:
-            # Create new event - using standardized variable names
+            # Crea nuovo evento - usando nomi variabili standardizzati
             cur.execute("""
             INSERT INTO pollution_events
             (start_time, region, center_latitude, center_longitude, radius_km, 
@@ -338,25 +377,25 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
             RETURNING event_id
             """, (
                 dt,
-                determine_region(location.get("center_latitude", location.get("center_lat")), 
-                                location.get("center_longitude", location.get("center_lon"))),
-                location.get("center_latitude", location.get("center_lat")),
-                location.get("center_longitude", location.get("center_lon")),
+                determine_region(location.get("center_latitude", 0), 
+                                location.get("center_longitude", 0)),
+                location.get("center_latitude", 0),
+                location.get("center_longitude", 0),
                 location.get("radius_km", 5.0),
                 severity,
                 pollutant_type,
                 risk_score,
-                location.get("radius_km", 5.0)**2 * 3.14159,  # Approximate area
+                location.get("radius_km", 5.0)**2 * 3.14159,  # Area approssimata
                 "active"
             ))
             
             event_id = cur.fetchone()[0]
-            logger.info(f"Created new event: {event_id}")
+            logger.info(f"Creato nuovo evento: {event_id}")
         
-        # Create alert message
-        alert_message = f"Pollution detected: {pollutant_type.replace('_', ' ')} with {severity} severity"
+        # Crea messaggio allarme
+        alert_message = f"Inquinamento rilevato: {pollutant_type.replace('_', ' ')} con severità {severity}"
         
-        # Set escalation schedule based on severity
+        # Imposta pianificazione escalation basata su severità
         now = datetime.now()
         reminder_interval = ESCALATION_CONFIG[severity]["reminder_interval_minutes"]
         escalation_after = ESCALATION_CONFIG[severity]["escalation_after_minutes"]
@@ -364,11 +403,11 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
         next_reminder = now + timedelta(minutes=reminder_interval)
         next_escalation = now + timedelta(minutes=escalation_after)
         
-        # Use the actual alert ID
+        # Usa l'ID allarme effettivo
         actual_alert_id = existing_alert_id if is_update and existing_alert_id else alert_id
         
         if is_update and existing_alert_id:
-            # Update existing alert with enhanced fields
+            # Aggiorna allarme esistente con campi potenziati
             cur.execute("""
             UPDATE alerts
             SET severity = %s, message = %s, recommended_actions = %s, status = %s,
@@ -387,14 +426,14 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
                 actual_alert_id
             ))
             
-            # Check if we got a result
+            # Verifica se abbiamo ottenuto un risultato
             result = cur.fetchone()
             if result:
                 column_names = [desc[0] for desc in cur.description]
                 alert_record = dict(zip(column_names, result))
-                logger.info(f"Updated alert in PostgreSQL with ID: {actual_alert_id}")
+                logger.info(f"Aggiornato allarme in PostgreSQL con ID: {actual_alert_id}")
             else:
-                # If the alert doesn't exist in the enhanced table yet
+                # Se l'allarme non esiste ancora nella tabella potenziata
                 cur.execute("""
                 INSERT INTO alerts
                 (alert_id, event_id, created_at, severity, message, recommended_actions, 
@@ -409,9 +448,9 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
                     alert_message,
                     recommendations,
                     status,
-                    1,  # update count
+                    1,  # conteggio aggiornamenti
                     now,
-                    0,  # escalation level
+                    0,  # livello escalation
                     next_reminder,
                     next_escalation
                 ))
@@ -419,9 +458,9 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
                 column_names = [desc[0] for desc in cur.description]
                 result = cur.fetchone()
                 alert_record = dict(zip(column_names, result))
-                logger.info(f"Inserted existing alert into enhanced alerts table: {actual_alert_id}")
+                logger.info(f"Inserito allarme esistente nella tabella alerts potenziata: {actual_alert_id}")
         else:
-            # Insert new alert
+            # Inserisci nuovo allarme
             cur.execute("""
             INSERT INTO alerts
             (alert_id, event_id, created_at, severity, message, recommended_actions, 
@@ -436,9 +475,9 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
                 alert_message,
                 recommendations,
                 status,
-                0,  # update count
+                0,  # conteggio aggiornamenti
                 now,
-                0,  # escalation level
+                0,  # livello escalation
                 next_reminder,
                 next_escalation
             ))
@@ -446,75 +485,21 @@ def process_alert_in_postgres(conn, alert_id, hotspot_id, dt, severity, risk_sco
             column_names = [desc[0] for desc in cur.description]
             result = cur.fetchone()
             alert_record = dict(zip(column_names, result))
-            logger.info(f"Created new alert in PostgreSQL with ID: {actual_alert_id}")
+            logger.info(f"Creato nuovo allarme in PostgreSQL con ID: {actual_alert_id}")
         
-        conn.commit()
         return alert_record
 
-def process_alert_in_redis(redis_client, alert_id, hotspot_id, timestamp, severity, risk_score,
-                         pollutant_type, location, recommendations, status,
-                         is_update, existing_alert_id):
-    """Process alert in Redis for dashboard access"""
-    # Determine the actual alert ID to use
-    actual_alert_id = existing_alert_id if is_update and existing_alert_id else alert_id
-    alert_key = f"alert:{actual_alert_id}"
-    
-    # Prepare data for Redis (all values must be strings)
-    # Use standardized variable names
-    redis_data = {
-        "alert_id": actual_alert_id,
-        "hotspot_id": hotspot_id,
-        "timestamp": str(timestamp),
-        "severity": severity,
-        "risk_score": str(risk_score),
-        "pollutant_type": pollutant_type,
-        "latitude": str(location.get("center_latitude", location.get("center_lat", 0))),
-        "longitude": str(location.get("center_longitude", location.get("center_lon", 0))),
-        "radius_km": str(location.get("radius_km", 5.0)),
-        "recommendations": json.dumps(recommendations),
-        "status": status,
-        "update_count": str(int(redis_client.hget(alert_key, "update_count") or "0") + 1 if is_update else "0"),
-        "last_updated": str(int(time.time() * 1000)),
-        "escalation_level": str(int(redis_client.hget(alert_key, "escalation_level") or "0") if is_update else "0")
-    }
-    
-    # Store in Redis using HASH
-    redis_client.hset(alert_key, mapping=redis_data)
-    
-    # Set TTL (48 hours - extended from original 24)
-    redis_client.expire(alert_key, 172800)  # 48 hours in seconds
-    
-    # Add to active alerts set if status is active
-    if status == "active":
-        redis_client.sadd("active_alerts", actual_alert_id)
-    elif status == "resolved":
-        # Remove from active alerts if resolved
-        redis_client.srem("active_alerts", actual_alert_id)
-    
-    # Track the alert in scheduling sets if active
-    if status == "active":
-        # Add to scheduled reminders and escalations sets with appropriate timestamps
-        now = int(time.time())
-        reminder_interval = ESCALATION_CONFIG[severity]["reminder_interval_minutes"] * 60  # convert to seconds
-        escalation_interval = ESCALATION_CONFIG[severity]["escalation_after_minutes"] * 60  # convert to seconds
-        
-        reminder_time = now + reminder_interval
-        escalation_time = now + escalation_interval
-        
-        redis_client.zadd("scheduled_reminders", {actual_alert_id: reminder_time})
-        redis_client.zadd("scheduled_escalations", {actual_alert_id: escalation_time})
-
 def determine_notification_targets(severity, pollutant_type, location, is_update, existing_alert_id):
-    """Determine who should be notified based on alert details and regional configuration"""
+    """Determina chi dovrebbe essere notificato in base ai dettagli dell'allarme e alla configurazione regionale"""
     targets = []
     
-    # Get regional information - using standardized variable names
-    region = determine_region(location.get("center_latitude", location.get("center_lat")), 
-                            location.get("center_longitude", location.get("center_lon")))
+    # Ottieni informazioni regionali - usando nomi variabili standardizzati
+    region = determine_region(location.get("center_latitude", 0), 
+                            location.get("center_longitude", 0))
     
-    # Email notification targets
+    # Target notifica email
     if EMAIL_ENABLED:
-        # Default recipients based on severity
+        # Destinatari predefiniti basati su severità
         if severity == "high":
             recipients = HIGH_PRIORITY_RECIPIENTS
         elif severity == "medium":
@@ -522,7 +507,7 @@ def determine_notification_targets(severity, pollutant_type, location, is_update
         else:
             recipients = LOW_PRIORITY_RECIPIENTS
         
-        # Add regional email recipients if configured
+        # Aggiungi destinatari email regionali se configurati
         regional_emails = REGIONAL_CONFIG.get(region, {}).get("email_recipients", [])
         all_recipients = list(set(recipients + regional_emails))
         
@@ -532,33 +517,33 @@ def determine_notification_targets(severity, pollutant_type, location, is_update
                 "recipients": all_recipients
             })
     
-    # SMS notification targets
-    if SMS_ENABLED and severity == "high":  # Only send SMS for high severity
+    # Target notifica SMS
+    if SMS_ENABLED and severity == "high":  # Invia SMS solo per severità alta
         targets.append({
             "channel": "sms",
             "recipients": SMS_RECIPIENTS
         })
     
-    # Webhook notifications
+    # Notifiche webhook
     if WEBHOOK_ENABLED:
         targets.append({
             "channel": "webhook",
             "recipients": WEBHOOK_URLS
         })
     
-    # If this is an update, only notify for significant changes
+    # Se questo è un aggiornamento, notifica solo per cambiamenti significativi
     if is_update and existing_alert_id:
-        # This would require checking the previous severity
+        # Questo richiederebbe il controllo della severità precedente
         pass
     
     return targets
 
 def determine_region(lat, lon):
-    """Determine the region based on coordinates"""
+    """Determina la regione in base alle coordinate"""
     if not lat or not lon:
         return "unknown"
     
-    # Example regional boundaries for Chesapeake Bay
+    # Esempio confini regionali per Chesapeake Bay
     if lat > 39.0:
         return "upper_bay"
     elif lat > 38.0:
@@ -572,7 +557,7 @@ def determine_region(lat, lon):
         return "bay_mouth"
 
 def send_notifications(conn, alert_record, notification_targets):
-    """Send notifications through appropriate channels"""
+    """Invia notifiche attraverso canali appropriati"""
     alert_id = alert_record["alert_id"]
     severity = alert_record["severity"]
     message = alert_record["message"]
@@ -583,7 +568,7 @@ def send_notifications(conn, alert_record, notification_targets):
         
         for recipient in recipients:
             try:
-                # Log the notification attempt in database
+                # Registra il tentativo di notifica nel database
                 with conn.cursor() as cur:
                     cur.execute("""
                     INSERT INTO notifications
@@ -594,14 +579,14 @@ def send_notifications(conn, alert_record, notification_targets):
                         alert_id,
                         datetime.now(),
                         channel,
-                        [recipient],  # Array with single recipient
+                        [recipient],  # Array con singolo destinatario
                         "pending"
                     ))
                     
                     notification_id = cur.fetchone()[0]
                     conn.commit()
                 
-                # Send notification based on channel
+                # Invia notifica basata sul canale
                 success = False
                 status_details = None
                 
@@ -618,7 +603,7 @@ def send_notifications(conn, alert_record, notification_targets):
                         alert_id, alert_record, recipient
                     )
                 
-                # Update notification status
+                # Aggiorna stato notifica
                 with conn.cursor() as cur:
                     cur.execute("""
                     UPDATE notifications
@@ -632,74 +617,76 @@ def send_notifications(conn, alert_record, notification_targets):
                     conn.commit()
                 
                 if success:
-                    logger.info(f"Sent {channel} notification for alert {alert_id} to {recipient}")
+                    logger.info(f"Inviata notifica {channel} per allarme {alert_id} a {recipient}")
                 else:
-                    logger.error(f"Failed to send {channel} notification for alert {alert_id} to {recipient}: {status_details}")
+                    logger.error(f"Impossibile inviare notifica {channel} per allarme {alert_id} a {recipient}: {status_details}")
             
             except Exception as e:
-                logger.error(f"Error sending {channel} notification: {e}")
+                logger.error(f"Errore nell'invio notifica {channel}: {e}")
                 if conn:
                     conn.rollback()
 
 def send_email_notification(alert_id, severity, message, recipient):
-    """Send email notification"""
+    """Invia notifica email"""
     if not EMAIL_ENABLED:
-        return False, "Email notifications disabled"
+        return False, "Notifiche email disabilitate"
     
     try:
-        # Create message
-        subject = f"[{severity.upper()}] Marine Pollution Alert {alert_id}"
+        # Crea messaggio
+        subject = f"[{severity.upper()}] Allarme Inquinamento Marino {alert_id}"
         
         msg = MIMEMultipart()
         msg['From'] = EMAIL_FROM
         msg['To'] = recipient
         msg['Subject'] = subject
         
-        # Email body with HTML formatting
+        # Corpo email con formattazione HTML
         body = f"""
         <html>
         <body>
-            <h2>Marine Pollution Alert</h2>
-            <p><strong>Alert ID:</strong> {alert_id}</p>
-            <p><strong>Severity:</strong> {severity.upper()}</p>
-            <p><strong>Message:</strong> {message}</p>
-            <p>Please check the monitoring dashboard for more details.</p>
-            <p>This is an automated message from the Marine Pollution Monitoring System.</p>
+            <h2>Allarme Inquinamento Marino</h2>
+            <p><strong>ID Allarme:</strong> {alert_id}</p>
+            <p><strong>Severità:</strong> {severity.upper()}</p>
+            <p><strong>Messaggio:</strong> {message}</p>
+            <p>Controlla la dashboard di monitoraggio per maggiori dettagli.</p>
+            <p>Questo è un messaggio automatico dal Sistema di Monitoraggio Inquinamento Marino.</p>
         </body>
         </html>
         """
         
         msg.attach(MIMEText(body, 'html'))
         
-        # Connect to server and send
-        server = smtplib.SMTP(EMAIL_SERVER, EMAIL_PORT)
-        server.starttls()
-        server.login(EMAIL_USER, EMAIL_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+        # Simula invio email
+        logger.info(f"Simulo invio email a {recipient} con oggetto: {subject}")
+        # Nel codice reale, scommentare queste righe:
+        # server = smtplib.SMTP(EMAIL_SERVER, EMAIL_PORT)
+        # server.starttls()
+        # server.login(EMAIL_USER, EMAIL_PASSWORD)
+        # server.send_message(msg)
+        # server.quit()
         
-        return True, "Email sent successfully"
+        return True, "Email inviata con successo (simulata)"
         
     except Exception as e:
         return False, str(e)
 
 def send_sms_notification(alert_id, severity, message, recipient):
-    """Send SMS notification"""
+    """Invia notifica SMS"""
     if not SMS_ENABLED:
-        return False, "SMS notifications disabled"
+        return False, "Notifiche SMS disabilitate"
     
-    # This is a placeholder - you would need to implement actual SMS sending
-    # using your preferred provider (Twilio, etc.)
-    logger.info(f"Would send SMS to {recipient}: ALERT [{severity.upper()}]: {message[:50]}...")
-    return True, "SMS sending simulated"
+    # Questo è un placeholder - dovresti implementare l'invio SMS effettivo
+    # usando il tuo provider preferito (Twilio, ecc.)
+    logger.info(f"Invio SMS a {recipient}: ALLARME [{severity.upper()}]: {message[:50]}...")
+    return True, "Invio SMS simulato"
 
 def send_webhook_notification(alert_id, alert_data, webhook_url):
-    """Send webhook notification"""
+    """Invia notifica webhook"""
     if not WEBHOOK_ENABLED:
-        return False, "Webhook notifications disabled"
+        return False, "Notifiche webhook disabilitate"
     
     try:
-        # Prepare webhook payload
+        # Prepara payload webhook
         payload = {
             "alert_id": alert_id,
             "event_type": "pollution_alert",
@@ -709,7 +696,7 @@ def send_webhook_notification(alert_id, alert_data, webhook_url):
             "data": alert_data
         }
         
-        # Add authentication if configured
+        # Aggiungi autenticazione se configurata
         headers = {
             "Content-Type": "application/json"
         }
@@ -717,328 +704,242 @@ def send_webhook_notification(alert_id, alert_data, webhook_url):
         if WEBHOOK_AUTH_TOKEN:
             headers["Authorization"] = f"Bearer {WEBHOOK_AUTH_TOKEN}"
         
-        # Send webhook request
-        response = requests.post(
-            webhook_url,
-            json=payload,
-            headers=headers,
-            timeout=10
-        )
+        # Simula richiesta webhook
+        logger.info(f"Simulo invio webhook a {webhook_url}")
+        # Nel codice reale, scommentare queste righe:
+        # response = requests.post(
+        #     webhook_url,
+        #     json=payload,
+        #     headers=headers,
+        #     timeout=10
+        # )
+        # 
+        # if response.status_code >= 200 and response.status_code < 300:
+        #     return True, f"Webhook consegnato con codice stato: {response.status_code}"
+        # else:
+        #     return False, f"Webhook fallito con codice stato: {response.status_code}"
         
-        if response.status_code >= 200 and response.status_code < 300:
-            return True, f"Webhook delivered with status code: {response.status_code}"
-        else:
-            return False, f"Webhook failed with status code: {response.status_code}"
+        return True, "Invio webhook simulato"
         
     except Exception as e:
         return False, str(e)
 
-def schedule_followups(conn, redis_client, alert_record):
-    """Schedule reminder and escalation actions for active alerts"""
+def schedule_followups(conn, alert_record):
+    """Pianifica azioni di promemoria ed escalation per allarmi attivi"""
     if alert_record["status"] != "active":
         return
         
     alert_id = alert_record["alert_id"]
     severity = alert_record["severity"]
     
-    # Calculate timing based on severity
-    now = int(time.time())
-    reminder_interval = ESCALATION_CONFIG[severity]["reminder_interval_minutes"] * 60  # convert to seconds
-    escalation_interval = ESCALATION_CONFIG[severity]["escalation_after_minutes"] * 60  # convert to seconds
+    # Calcola tempistiche basate su severità
+    now = datetime.now()
+    reminder_interval = ESCALATION_CONFIG[severity]["reminder_interval_minutes"]
+    escalation_interval = ESCALATION_CONFIG[severity]["escalation_after_minutes"]
     
-    reminder_time = now + reminder_interval
-    escalation_time = now + escalation_interval
+    next_reminder = now + timedelta(minutes=reminder_interval)
+    next_escalation = now + timedelta(minutes=escalation_interval)
     
-    # Store in Redis sorted sets for efficient processing
-    redis_client.zadd("scheduled_reminders", {alert_id: reminder_time})
-    redis_client.zadd("scheduled_escalations", {alert_id: escalation_time})
+    # Aggiorna record allarme con tempistiche
+    with conn.cursor() as cur:
+        cur.execute("""
+        UPDATE alerts
+        SET next_reminder_at = %s, next_escalation_at = %s
+        WHERE alert_id = %s
+        """, (
+            next_reminder,
+            next_escalation,
+            alert_id
+        ))
+        conn.commit()
     
-    logger.info(f"Scheduled followups for alert {alert_id}: reminder at {reminder_time}, escalation at {escalation_time}")
+    logger.info(f"Pianificati followup per allarme {alert_id}: promemoria {next_reminder}, escalation {next_escalation}")
 
-def update_dashboard_metrics(redis_client):
-    """Update dashboard metrics in Redis"""
+def process_reminders(conn):
+    """Processa promemoria pianificati scaduti"""
     try:
-        # Count active alerts by severity
-        alerts_high = 0
-        alerts_medium = 0
-        alerts_low = 0
+        now = datetime.now()
         
-        # Get all active alerts
-        active_alerts = redis_client.smembers("active_alerts")
-        
-        for alert_id in active_alerts:
-            alert_key = f"alert:{alert_id}"
-            severity = redis_client.hget(alert_key, "severity")
+        # Ottieni tutti i promemoria scaduti
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT * FROM alerts
+            WHERE status = 'active'
+            AND next_reminder_at <= %s
+            """, (now,))
             
-            if severity == "high":
-                alerts_high += 1
-            elif severity == "medium":
-                alerts_medium += 1
-            elif severity == "low":
-                alerts_low += 1
-        
-        # Update dashboard metrics
-        redis_client.hset("dashboard:metrics", mapping={
-            "alerts_high": str(alerts_high),
-            "alerts_medium": str(alerts_medium),
-            "alerts_low": str(alerts_low),
-            "active_alerts": str(len(active_alerts)),
-            "updated_at": str(int(time.time() * 1000))
-        })
-        
-        logger.debug("Dashboard metrics updated")
-        
-    except Exception as e:
-        logger.error(f"Error updating dashboard metrics: {e}")
-
-def process_reminders(conn, redis_client):
-    """Process scheduled reminders that are due"""
-    try:
-        now = int(time.time())
-        
-        # Get all reminders that are due
-        due_reminders = redis_client.zrangebyscore("scheduled_reminders", 0, now)
-        
-        for alert_id in due_reminders:
-            try:
-                # Get alert data from database
-                with conn.cursor() as cur:
-                    cur.execute("""
-                    SELECT * FROM alerts
-                    WHERE alert_id = %s AND status = 'active'
-                    """, (alert_id,))
+            columns = [desc[0] for desc in cur.description]
+            
+            for row in cur.fetchall():
+                alert_dict = dict(zip(columns, row))
+                
+                try:
+                    # Invia notifiche promemoria
+                    alert_id = alert_dict["alert_id"]
+                    severity = alert_dict["severity"]
                     
-                    result = cur.fetchone()
+                    # Aggiungi nota promemoria al messaggio
+                    alert_dict["message"] = f"PROMEMORIA: {alert_dict['message']} (Nessuna risposta ricevuta)"
                     
-                    if not result:
-                        # Alert doesn't exist or is no longer active, remove from scheduled reminders
-                        redis_client.zrem("scheduled_reminders", alert_id)
-                        continue
+                    # Determina target notifica per promemoria (semplificato per promemoria)
+                    if severity == "high":
+                        notification_targets = [{
+                            "channel": "email",
+                            "recipients": HIGH_PRIORITY_RECIPIENTS
+                        }]
+                    elif severity == "medium":
+                        notification_targets = [{
+                            "channel": "email",
+                            "recipients": MEDIUM_PRIORITY_RECIPIENTS
+                        }]
+                    else:
+                        notification_targets = [{
+                            "channel": "email",
+                            "recipients": LOW_PRIORITY_RECIPIENTS
+                        }]
                     
-                    # Convert to dict
-                    column_names = [desc[0] for desc in cur.description]
-                    alert_dict = dict(zip(column_names, result))
-                
-                # Send reminder notifications
-                severity = alert_dict["severity"]
-                
-                # Add reminder note to the message
-                alert_dict["message"] = f"REMINDER: {alert_dict['message']} (No response received)"
-                
-                # Determine notification targets for reminder (simplified for reminders)
-                if severity == "high":
-                    notification_targets = [{
-                        "channel": "email",
-                        "recipients": HIGH_PRIORITY_RECIPIENTS
-                    }]
-                elif severity == "medium":
-                    notification_targets = [{
-                        "channel": "email",
-                        "recipients": MEDIUM_PRIORITY_RECIPIENTS
-                    }]
-                else:
-                    notification_targets = [{
-                        "channel": "email",
-                        "recipients": LOW_PRIORITY_RECIPIENTS
-                    }]
-                
-                # Send notifications
-                send_notifications(conn, alert_dict, notification_targets)
-                
-                # Schedule next reminder
-                reminder_interval = ESCALATION_CONFIG[severity]["reminder_interval_minutes"] * 60
-                next_reminder = now + reminder_interval
-                
-                # Update in Redis
-                redis_client.zadd("scheduled_reminders", {alert_id: next_reminder})
-                
-                # Update in database
-                with conn.cursor() as cur:
-                    cur.execute("""
-                    UPDATE alerts
-                    SET next_reminder_at = %s
-                    WHERE alert_id = %s
-                    """, (
-                        datetime.fromtimestamp(next_reminder),
-                        alert_id
-                    ))
-                    conn.commit()
-                
-                logger.info(f"Processed reminder for alert {alert_id}, next reminder at {next_reminder}")
-                
-            except Exception as e:
-                logger.error(f"Error processing reminder for alert {alert_id}: {e}")
-                if conn:
+                    # Invia notifiche
+                    send_notifications(conn, alert_dict, notification_targets)
+                    
+                    # Pianifica prossimo promemoria
+                    reminder_interval = ESCALATION_CONFIG[severity]["reminder_interval_minutes"]
+                    next_reminder = now + timedelta(minutes=reminder_interval)
+                    
+                    # Aggiorna nel database
+                    with conn.cursor() as update_cur:
+                        update_cur.execute("""
+                        UPDATE alerts
+                        SET next_reminder_at = %s
+                        WHERE alert_id = %s
+                        """, (
+                            next_reminder,
+                            alert_id
+                        ))
+                        conn.commit()
+                    
+                    logger.info(f"Processato promemoria per allarme {alert_id}, prossimo promemoria alle {next_reminder}")
+                    
+                except Exception as e:
+                    logger.error(f"Errore nel processare promemoria per allarme {alert_dict.get('alert_id')}: {e}")
                     conn.rollback()
         
     except Exception as e:
-        logger.error(f"Error processing reminders: {e}")
+        logger.error(f"Errore nel processare promemoria: {e}")
+        conn.rollback()
 
-def process_escalations(conn, redis_client):
-    """Process scheduled escalations that are due"""
+def process_escalations(conn):
+    """Processa escalation pianificate scadute"""
     try:
-        now = int(time.time())
+        now = datetime.now()
         
-        # Get all escalations that are due
-        due_escalations = redis_client.zrangebyscore("scheduled_escalations", 0, now)
-        
-        for alert_id in due_escalations:
-            try:
-                # Get alert data from database
-                with conn.cursor() as cur:
-                    cur.execute("""
-                    SELECT * FROM alerts
-                    WHERE alert_id = %s AND status = 'active'
-                    """, (alert_id,))
+        # Ottieni tutte le escalation scadute
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT * FROM alerts
+            WHERE status = 'active'
+            AND next_escalation_at <= %s
+            """, (now,))
+            
+            columns = [desc[0] for desc in cur.description]
+            
+            for row in cur.fetchall():
+                alert_dict = dict(zip(columns, row))
+                
+                try:
+                    # Esegui escalation
+                    alert_id = alert_dict["alert_id"]
+                    severity = alert_dict["severity"]
+                    current_escalation_level = alert_dict["escalation_level"]
+                    new_escalation_level = current_escalation_level + 1
                     
-                    result = cur.fetchone()
+                    # Aggiungi nota escalation al messaggio
+                    alert_dict["message"] = f"ESCALATION (Livello {new_escalation_level}): {alert_dict['message']} (Nessuna azione presa dopo multiple notifiche)"
                     
-                    if not result:
-                        # Alert doesn't exist or is no longer active, remove from scheduled escalations
-                        redis_client.zrem("scheduled_escalations", alert_id)
-                        continue
+                    # Per escalation, usa sempre canali di notifica priorità più alta
+                    notification_targets = []
                     
-                    # Convert to dict
-                    column_names = [desc[0] for desc in cur.description]
-                    alert_dict = dict(zip(column_names, result))
-                
-                # Perform escalation
-                severity = alert_dict["severity"]
-                current_escalation_level = alert_dict["escalation_level"]
-                new_escalation_level = current_escalation_level + 1
-                
-                # Add escalation note to the message
-                alert_dict["message"] = f"ESCALATED (Level {new_escalation_level}): {alert_dict['message']} (No action taken after multiple notifications)"
-                
-                # For escalation, always use higher priority notification channels
-                # For demonstration, we'll use email and SMS if enabled
-                notification_targets = []
-                
-                # Always include email
-                if EMAIL_ENABLED:
-                    notification_targets.append({
-                        "channel": "email",
-                        "recipients": HIGH_PRIORITY_RECIPIENTS  # Always use high priority for escalations
-                    })
-                
-                # Include SMS if enabled
-                if SMS_ENABLED:
-                    notification_targets.append({
-                        "channel": "sms",
-                        "recipients": SMS_RECIPIENTS
-                    })
-                
-                # Send notifications
-                send_notifications(conn, alert_dict, notification_targets)
-                
-                # Schedule next escalation (if needed)
-                escalation_interval = ESCALATION_CONFIG[severity]["escalation_after_minutes"] * 60 * 2  # Double the interval for next escalation
-                next_escalation = now + escalation_interval
-                
-                # Update in database
-                with conn.cursor() as cur:
-                    cur.execute("""
-                    UPDATE alerts
-                    SET escalation_level = %s, next_escalation_at = %s
-                    WHERE alert_id = %s
-                    """, (
-                        new_escalation_level,
-                        datetime.fromtimestamp(next_escalation),
-                        alert_id
-                    ))
-                    conn.commit()
-                
-                # Update in Redis
-                redis_client.hset(f"alert:{alert_id}", "escalation_level", str(new_escalation_level))
-                redis_client.zadd("scheduled_escalations", {alert_id: next_escalation})
-                
-                logger.info(f"Processed escalation for alert {alert_id} to level {new_escalation_level}, next escalation at {next_escalation}")
-                
-            except Exception as e:
-                logger.error(f"Error processing escalation for alert {alert_id}: {e}")
-                if conn:
+                    # Includi sempre email
+                    if EMAIL_ENABLED:
+                        notification_targets.append({
+                            "channel": "email",
+                            "recipients": HIGH_PRIORITY_RECIPIENTS  # Usa sempre priorità alta per escalation
+                        })
+                    
+                    # Includi SMS se abilitato
+                    if SMS_ENABLED:
+                        notification_targets.append({
+                            "channel": "sms",
+                            "recipients": SMS_RECIPIENTS
+                        })
+                    
+                    # Invia notifiche
+                    send_notifications(conn, alert_dict, notification_targets)
+                    
+                    # Pianifica prossima escalation (se necessario)
+                    escalation_interval = ESCALATION_CONFIG[severity]["escalation_after_minutes"] * 2  # Raddoppia intervallo per prossima escalation
+                    next_escalation = now + timedelta(minutes=escalation_interval)
+                    
+                    # Aggiorna nel database
+                    with conn.cursor() as update_cur:
+                        update_cur.execute("""
+                        UPDATE alerts
+                        SET escalation_level = %s, next_escalation_at = %s
+                        WHERE alert_id = %s
+                        """, (
+                            new_escalation_level,
+                            next_escalation,
+                            alert_id
+                        ))
+                        conn.commit()
+                    
+                    logger.info(f"Processata escalation per allarme {alert_id} al livello {new_escalation_level}, prossima escalation alle {next_escalation}")
+                    
+                except Exception as e:
+                    logger.error(f"Errore nel processare escalation per allarme {alert_dict.get('alert_id')}: {e}")
                     conn.rollback()
         
     except Exception as e:
-        logger.error(f"Error processing escalations: {e}")
+        logger.error(f"Errore nel processare escalation: {e}")
+        conn.rollback()
 
-def check_for_expired_alerts(conn, redis_client):
-    """Check for alerts that have been active for too long without updates"""
+def check_for_expired_alerts(conn):
+    """Controlla allarmi attivi da troppo tempo senza aggiornamenti"""
     try:
-        # Get all active alerts
-        active_alerts = redis_client.smembers("active_alerts")
-        now = int(time.time() * 1000)
-        
-        for alert_id in active_alerts:
-            alert_key = f"alert:{alert_id}"
-            alert_data = redis_client.hgetall(alert_key)
+        with conn.cursor() as cur:
+            # Risolvi automaticamente allarmi non aggiornati nelle ultime 48 ore
+            cur.execute("""
+            UPDATE alerts 
+            SET status = 'resolved', resolved_at = %s, resolved_by = 'system'
+            WHERE status = 'active'
+            AND last_updated < NOW() - INTERVAL '48 hours'
+            RETURNING alert_id
+            """, (datetime.now(),))
             
-            # Skip if the alert doesn't exist
-            if not alert_data:
-                continue
+            resolved_alerts = cur.fetchall()
             
-            # Get the last updated time
-            last_updated = int(alert_data.get("last_updated", alert_data.get("timestamp", "0")))
-            time_since_update = now - last_updated
+            if resolved_alerts:
+                alert_ids = [row[0] for row in resolved_alerts]
+                logger.info(f"Auto-risolti {len(resolved_alerts)} allarmi per inattività: {', '.join(alert_ids)}")
             
-            # Auto-resolve alerts that haven't been updated in 48 hours (extended from 24)
-            if time_since_update > 48 * 60 * 60 * 1000:  # 48 hours in milliseconds
-                logger.info(f"Auto-resolving alert {alert_id} that hasn't been updated in 48 hours")
-                
-                # Update Redis
-                redis_client.hset(alert_key, "status", "resolved")
-                redis_client.hset(alert_key, "resolved_at", str(now))
-                redis_client.hset(alert_key, "resolved_by", "system")
-                redis_client.srem("active_alerts", alert_id)
-                
-                # Remove from scheduled reminders and escalations
-                redis_client.zrem("scheduled_reminders", alert_id)
-                redis_client.zrem("scheduled_escalations", alert_id)
-                
-                # Update PostgreSQL
-                with conn.cursor() as cur:
-                    cur.execute("""
-                    UPDATE alerts 
-                    SET status = 'resolved', resolved_at = %s, resolved_by = 'system'
-                    WHERE alert_id = %s
-                    """, (
-                        datetime.now(),
-                        alert_id
-                    ))
-                    conn.commit()
-                
-                logger.info(f"Alert {alert_id} auto-resolved due to inactivity")
+            conn.commit()
     
     except Exception as e:
-        logger.error(f"Error checking for expired alerts: {e}")
-        if conn:
-            conn.rollback()
-
-def severity_rank(severity):
-    """Convert severity string to numeric rank for comparison"""
-    ranks = {"high": 3, "medium": 2, "low": 1, "minimal": 0}
-    return ranks.get(severity, 0)
+        logger.error(f"Errore nel controllare allarmi scaduti: {e}")
+        conn.rollback()
 
 def main():
-    """Main function"""
+    """Funzione principale"""
     logger.info("Starting Enhanced Alert Manager")
     
-    # Connect to PostgreSQL
+    # Connetti a PostgreSQL
     try:
         conn = connect_to_postgres()
         create_tables(conn)
     except Exception as e:
-        logger.error(f"Error connecting to PostgreSQL: {e}")
+        logger.error(f"Errore nella connessione a PostgreSQL: {e}")
         return
     
-    # Connect to Redis
-    try:
-        redis_client = connect_to_redis()
-    except Exception as e:
-        logger.error(f"Error connecting to Redis: {e}")
-        return
-    
-    # Connect to Kafka
+    # Connetti a Kafka
     consumer = KafkaConsumer(
         ALERTS_TOPIC,
         bootstrap_servers=KAFKA_SERVERS,
@@ -1047,56 +948,56 @@ def main():
         value_deserializer=lambda x: json.loads(x.decode('utf-8'))
     )
     
-    logger.info(f"Connected to Kafka, listening on topic: {ALERTS_TOPIC}")
+    logger.info(f"Connesso a Kafka, in ascolto sul topic: {ALERTS_TOPIC}")
     
-    # Set up periodic task timing
+    # Imposta temporizzazione attività periodiche
     last_reminder_check = 0
     last_escalation_check = 0
     last_expired_check = 0
     
-    reminder_interval = 60  # Check reminders every minute
-    escalation_interval = 120  # Check escalations every 2 minutes
-    expired_check_interval = 900  # Check for expired alerts every 15 minutes
+    reminder_interval = 60  # Controlla promemoria ogni minuto
+    escalation_interval = 120  # Controlla escalation ogni 2 minuti
+    expired_check_interval = 900  # Controlla allarmi scaduti ogni 15 minuti
     
-    # Process messages
+    # Processa messaggi
     try:
         for message in consumer:
             try:
                 alert_data = message.value
-                logger.info(f"Received alert: {alert_data.get('alert_id', 'unknown')}")
+                logger.info(f"Ricevuto allarme: {alert_data.get('alert_id', 'unknown')}")
                 
-                # Process alert
-                process_alert(alert_data, conn, redis_client)
+                # Processa allarme
+                process_alert(alert_data, conn)
                 
-                # Run periodic tasks
+                # Esegui attività periodiche
                 current_time = int(time.time())
                 
-                # Check reminders
+                # Controlla promemoria
                 if current_time - last_reminder_check > reminder_interval:
-                    process_reminders(conn, redis_client)
+                    process_reminders(conn)
                     last_reminder_check = current_time
                 
-                # Check escalations
+                # Controlla escalation
                 if current_time - last_escalation_check > escalation_interval:
-                    process_escalations(conn, redis_client)
+                    process_escalations(conn)
                     last_escalation_check = current_time
                 
-                # Check for expired alerts
+                # Controlla allarmi scaduti
                 if current_time - last_expired_check > expired_check_interval:
-                    check_for_expired_alerts(conn, redis_client)
+                    check_for_expired_alerts(conn)
                     last_expired_check = current_time
                 
             except Exception as e:
-                logger.error(f"Error processing message: {e}")
+                logger.error(f"Errore nel processare messaggio: {e}")
                 
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
+        logger.info("Interruzione manuale")
     except Exception as e:
-        logger.error(f"Error in consumer loop: {e}")
+        logger.error(f"Errore nel loop consumer: {e}")
     finally:
         consumer.close()
         conn.close()
-        logger.info("Alert Manager shutdown")
+        logger.info("Alert Manager spento")
 
 if __name__ == "__main__":
     main()

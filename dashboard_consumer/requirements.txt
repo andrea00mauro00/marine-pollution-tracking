@@ -1,2 +1,6 @@
 kafka-python
 redis
+boto3
+psycopg2-binary
+loguru
+requests

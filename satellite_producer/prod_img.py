@@ -30,7 +30,7 @@ from satellite_producer.utils.buoy_utils import fetch_buoy_positions, bbox_aroun
 
 # ---- env-var ---------------------------------------------------------------
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "satellite_imagery")
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092").split(",")
+KAFKA_BROKERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092").split(",")
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 DLQ_TOPIC = os.getenv("DLQ_TOPIC", "satellite_imagery_dlq")
 
@@ -41,8 +41,8 @@ CLOUD_LIMIT = float(os.getenv("SAT_MAX_CLOUD", "20"))           # %
 # MinIO
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "bronze")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -71,8 +71,8 @@ def get_minio_client():
     client = boto3.client(
         "s3",
         endpoint_url=f"http://{MINIO_ENDPOINT}",
-        aws_access_key_id=MINIO_ACCESS_KEY,
-        aws_secret_access_key=MINIO_SECRET_KEY,
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
     )
     # Create bucket if it doesn't exist
     try:
@@ -128,7 +128,7 @@ def create_schema_registry_producer(schema_path):
         
         # Configure Kafka producer with Avro serializer
         producer_conf = {
-            'bootstrap.servers': ','.join(KAFKA_BOOTSTRAP_SERVERS),
+            'bootstrap.servers': ','.join(KAFKA_BROKERS),
             'value.serializer': avro_serializer,
             'error.cb': on_delivery_error
         }
@@ -143,7 +143,7 @@ def create_fallback_producer():
     """Creates a regular Kafka producer for fallback"""
     logger.warning("Using fallback JSON producer without Schema Registry")
     return KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        bootstrap_servers=KAFKA_BROKERS,
         value_serializer=lambda v: v.encode('utf-8')
     )
 
@@ -153,7 +153,7 @@ def on_delivery_error(err, msg):
     # Send to DLQ if possible
     try:
         dlq_producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            bootstrap_servers=KAFKA_BROKERS,
             value_serializer=lambda v: json.dumps(v).encode("utf-8")
         )
         # Extract original message if possible
@@ -195,8 +195,8 @@ def main() -> None:
     logger.info(f"🛰️ Fetch every {POLL_SECONDS}s, clouds < {CLOUD_LIMIT}%")
 
     while True:
-        for buoy_id, latitude, longitude, radius_km in fetch_buoy_positions():
-            bbox = bbox_around(latitude, longitude, radius_km)
+        for buoy_id, lat, lon, radius_km in fetch_buoy_positions():
+            bbox = bbox_around(lat, lon, radius_km)
             scene = pick_best_scene(sh_cfg, bbox)
             if not scene:
                 logger.warning(f"🛰️ No scene <{CLOUD_LIMIT}% for buoy {buoy_id}")
@@ -277,7 +277,7 @@ def main() -> None:
                         # Send to DLQ
                         try:
                             dlq_producer = KafkaProducer(
-                                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                                bootstrap_servers=KAFKA_BROKERS,
                                 value_serializer=lambda v: json.dumps(v).encode("utf-8")
                             )
                             error_msg = {

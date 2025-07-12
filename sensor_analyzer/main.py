@@ -51,10 +51,10 @@ ANALYZED_SENSOR_TOPIC = os.environ.get("ANALYZED_SENSOR_TOPIC", "analyzed_sensor
 # Reference ranges for water quality parameters
 PARAMETER_RANGES = {
     "ph": {
-        "min_excellent": 6.8, "max_excellent": 8.0,
-        "min_good": 6.5, "max_good": 8.5,
-        "min_fair": 6.0, "max_fair": 9.0,
-        "min_poor": 5.0, "max_poor": 10.0
+        "min_excellent": 7.5, "max_excellent": 8.1,  # Marine water optimal range
+        "min_good": 7.0, "max_good": 8.5,
+        "min_fair": 6.5, "max_fair": 9.0,
+        "min_poor": 6.0, "max_poor": 10.0
     },
     "turbidity": {  # NTU
         "excellent": 5, "good": 10, "fair": 20, "poor": 50
@@ -62,13 +62,17 @@ PARAMETER_RANGES = {
     "dissolved_oxygen": {  # % saturation
         "excellent": 90, "good": 80, "fair": 60, "poor": 30
     },
-    "temperature": {  # °C - Chesapeake Bay average ranges
-        "min_normal": 5, "max_normal": 30,
-        "min_winter": 3, "max_winter": 12,
-        "min_summer": 18, "max_summer": 32
+    "temperature": {  # °C - Seasonal ranges
+        "summer": {"min_normal": 18, "max_normal": 32},
+        "winter": {"min_normal": 3, "max_normal": 15},
+        "spring": {"min_normal": 10, "max_normal": 20},
+        "fall": {"min_normal": 12, "max_normal": 24}
     },
     "microplastics": {  # particles/m³
         "excellent": 1, "good": 3, "fair": 8, "poor": 15
+    },
+    "water_quality_index": {  # 0-100 scale
+        "excellent": 80, "good": 60, "fair": 40, "poor": 20
     }
 }
 
@@ -76,7 +80,7 @@ PARAMETER_RANGES = {
 POLLUTION_SIGNATURES = {
     "oil_spill": {
         "primary": ["petroleum_hydrocarbons", "polycyclic_aromatic"],
-        "secondary": ["turbidity", "dissolved_oxygen"]
+        "secondary": ["dissolved_oxygen", "turbidity"]
     },
     "chemical_discharge": {
         "primary": ["mercury", "lead", "cadmium", "chromium"],
@@ -111,9 +115,6 @@ class SensorAnalyzer(MapFunction):
         self.parameter_history = {}
         # Window size for moving average and deviation calculations
         self.window_size = 10
-        # Current month for seasonal adjustments
-        self.current_month = datetime.now().month
-        self.is_summer = 5 <= self.current_month <= 9
         
         # IMPORTANTE: NON inizializzare ModelManager ed ErrorHandler qui
         # Saranno inizializzati nel metodo open()
@@ -161,12 +162,15 @@ class SensorAnalyzer(MapFunction):
             if sensor_id not in self.parameter_history:
                 self.parameter_history[sensor_id] = {}
             
+            # Determine season for temperature analysis
+            season = self._determine_season(timestamp, latitude)
+            
             # Extract and analyze all parameters
             parameter_scores = {}
             anomalies = {}
             
             # Process core parameters (ph, turbidity, temperature)
-            self._analyze_core_parameters(sensor_id, data, parameter_scores, anomalies)
+            self._analyze_core_parameters(sensor_id, data, parameter_scores, anomalies, season)
             
             # Process heavy metals
             heavy_metals = {}
@@ -233,6 +237,11 @@ class SensorAnalyzer(MapFunction):
             if microplastics is not None:
                 self._analyze_parameter(sensor_id, "microplastics", microplastics, parameter_scores, anomalies)
             
+            # Process water quality index
+            water_quality_index = data.get("water_quality_index")
+            if water_quality_index is not None:
+                self._analyze_water_quality_index(water_quality_index, parameter_scores, anomalies)
+            
             # Try to detect anomalies using ML model
             anomaly_score = self._detect_anomalies_ml(data)
             if anomaly_score is not None:
@@ -261,9 +270,18 @@ class SensorAnalyzer(MapFunction):
             else:
                 level = "minimal"
             
+            # Map pollution level to description
+            level_description = {
+                "high": "Requires immediate intervention",
+                "medium": "Requires frequent monitoring",
+                "low": "Under observation",
+                "minimal": "Normal conditions"
+            }.get(level, "Unknown")
+            
             # Create pollution analysis result
             pollution_analysis = {
                 "level": level,
+                "level_description": level_description,
                 "risk_score": round(risk_score, 3),
                 "pollutant_type": pollution_type,
                 "type_confidence": round(type_confidence, 3),
@@ -299,7 +317,8 @@ class SensorAnalyzer(MapFunction):
                 },
                 "pollution_analysis": pollution_analysis,
                 "source_type": "buoy",
-                "processed_at": int(time.time() * 1000)
+                "processed_at": int(time.time() * 1000),
+                "recommendations": self._generate_recommendations(pollution_type, level, parameter_scores)
             }
             
             logger.info(f"Analyzed buoy data for {sensor_id}: {level} risk ({round(risk_score, 3)}) - {pollution_type}")
@@ -309,7 +328,7 @@ class SensorAnalyzer(MapFunction):
             logger.error(f"Error processing buoy data: {e}")
             return value
     
-    def _analyze_core_parameters(self, sensor_id, data, parameter_scores, anomalies):
+    def _analyze_core_parameters(self, sensor_id, data, parameter_scores, anomalies, season):
         """Analyze core water quality parameters (pH, turbidity, temperature)"""
         # Extract parameters with standardized names and fallbacks
         ph = data.get("ph", data.get("pH"))
@@ -409,13 +428,9 @@ class SensorAnalyzer(MapFunction):
                 z_score = abs(temperature - mean_temp) / std_temp
                 
                 # Use seasonal temperature ranges
-                temp_ranges = PARAMETER_RANGES["temperature"]
-                if self.is_summer:
-                    min_normal = temp_ranges["min_summer"]
-                    max_normal = temp_ranges["max_summer"]
-                else:
-                    min_normal = temp_ranges["min_winter"]
-                    max_normal = temp_ranges["max_winter"]
+                temp_ranges = PARAMETER_RANGES["temperature"][season]
+                min_normal = temp_ranges["min_normal"]
+                max_normal = temp_ranges["max_normal"]
                 
                 # Calculate temperature anomaly score
                 if temperature < min_normal - 5 or temperature > max_normal + 5:
@@ -434,7 +449,8 @@ class SensorAnalyzer(MapFunction):
                         "value": temperature,
                         "deviation_score": parameter_scores["temperature_anomaly"],
                         "z_score": z_score,
-                        "seasonal_range": [min_normal, max_normal]
+                        "seasonal_range": [min_normal, max_normal],
+                        "season": season
                     }
     
     def _analyze_parameter(self, sensor_id, param_name, value, parameter_scores, anomalies):
@@ -526,6 +542,24 @@ class SensorAnalyzer(MapFunction):
             if param_name in anomalies:
                 anomalies[param_name]["z_score"] = z_score
                 anomalies[param_name]["mean"] = mean_val
+    
+    def _analyze_water_quality_index(self, wqi, parameter_scores, anomalies):
+        """Analyze water quality index"""
+        if wqi is None:
+            return
+            
+        # Higher WQI is better, so invert for risk score (0-1)
+        wqi_score = max(0, 1.0 - (wqi / 100.0))
+        parameter_scores["water_quality_index"] = wqi_score
+        
+        # Record anomaly if WQI is concerning
+        if wqi < PARAMETER_RANGES["water_quality_index"]["fair"]:
+            anomalies["water_quality_index"] = {
+                "value": wqi,
+                "score": wqi_score,
+                "threshold": PARAMETER_RANGES["water_quality_index"]["fair"],
+                "description": "Low overall water quality"
+            }
     
     def _detect_anomalies_ml(self, data):
         """
@@ -634,7 +668,8 @@ class SensorAnalyzer(MapFunction):
                     "lead": ["lead", "hm_lead_pb"],
                     "petroleum": ["petroleum_hydrocarbons", "hc_total_petroleum_hydrocarbons"],
                     "oxygen": ["dissolved_oxygen", "bi_dissolved_oxygen_saturation"],
-                    "microplastics": ["microplastics", "microplastics_concentration"]
+                    "microplastics": ["microplastics", "microplastics_concentration"],
+                    "water_quality_index": ["water_quality_index"]  # Added WQI as a feature
                 }
             
             # Extract features
@@ -771,6 +806,9 @@ class SensorAnalyzer(MapFunction):
             # Special case
             "microplastics": 0.7,
             
+            # Water Quality Index (high weight as it's a composite index)
+            "water_quality_index": 0.8,
+            
             # ML anomaly detection
             "ml_anomaly": 0.9  # High weight for ML-detected anomalies
         }
@@ -808,6 +846,112 @@ class SensorAnalyzer(MapFunction):
         mean = sum(values) / len(values)
         variance = sum((x - mean) ** 2 for x in values) / len(values)
         return math.sqrt(variance)
+    
+    def _determine_season(self, timestamp_ms, latitude):
+        """Determine season based on timestamp and latitude"""
+        dt = datetime.fromtimestamp(timestamp_ms / 1000)
+        month = dt.month
+        
+        # Northern hemisphere
+        if latitude >= 0:
+            if 3 <= month <= 5:
+                return "spring"
+            elif 6 <= month <= 8:
+                return "summer"
+            elif 9 <= month <= 11:
+                return "fall"
+            else:
+                return "winter"
+        # Southern hemisphere (seasons reversed)
+        else:
+            if 3 <= month <= 5:
+                return "fall"
+            elif 6 <= month <= 8:
+                return "winter"
+            elif 9 <= month <= 11:
+                return "spring"
+            else:
+                return "summer"
+    
+    def _generate_recommendations(self, pollution_type, level, parameter_scores):
+        """Generate recommendations based on pollution type and severity"""
+        recommendations = []
+        
+        # Base recommendations by pollution type
+        type_recommendations = {
+            "oil_spill": [
+                "Deploy containment booms to prevent spreading",
+                "Use skimmers to remove surface oil",
+                "Consider dispersants for open water if authorized",
+                "Monitor dissolved oxygen levels in affected area"
+            ],
+            "chemical_discharge": [
+                "Identify and stop source if possible",
+                "Test for toxicity and specific compounds",
+                "Monitor bioaccumulation in local fauna",
+                "Consider activated carbon treatment if applicable"
+            ],
+            "agricultural_runoff": [
+                "Monitor for algal bloom development",
+                "Track nutrient levels (nitrates, phosphates)",
+                "Assess impact on dissolved oxygen",
+                "Coordinate with land management agencies"
+            ],
+            "sewage": [
+                "Test for pathogens and public health risk",
+                "Monitor dissolved oxygen and biological indicators",
+                "Ensure proper notification of recreational users",
+                "Identify source and assess treatment system failure"
+            ],
+            "algal_bloom": [
+                "Monitor dissolved oxygen for potential hypoxia",
+                "Test for toxin-producing algal species",
+                "Assess fish kill risk",
+                "Track extent and movement of bloom"
+            ],
+            "plastic_pollution": [
+                "Deploy collection systems appropriate for microplastics",
+                "Assess potential sources (urban runoff, wastewater)",
+                "Sample sediments for accumulated particles",
+                "Monitor impact on filter feeding organisms"
+            ],
+            "unknown": [
+                "Conduct broad spectrum analysis for pollutant identification",
+                "Compare with historical data for the location",
+                "Deploy additional sensors for better characterization",
+                "Establish monitoring protocol based on affected parameters"
+            ]
+        }
+        
+        # Add type-specific recommendations
+        if pollution_type in type_recommendations:
+            recommendations.extend(type_recommendations[pollution_type])
+        
+        # Add severity-based recommendations
+        if level == "high":
+            recommendations.append("Initiate emergency response protocol")
+            recommendations.append("Deploy additional monitoring equipment")
+            recommendations.append("Alert relevant authorities immediately")
+            recommendations.append("Consider public health notification if appropriate")
+        elif level == "medium":
+            recommendations.append("Increase monitoring frequency")
+            recommendations.append("Prepare response equipment for possible deployment")
+            recommendations.append("Notify monitoring team and standby response personnel")
+        elif level == "low":
+            recommendations.append("Continue regular monitoring")
+            recommendations.append("Schedule follow-up measurements")
+            
+        # Parameter-specific recommendations
+        if "mercury" in parameter_scores and parameter_scores["mercury"] > 0.5:
+            recommendations.append("Test biota for mercury bioaccumulation")
+            
+        if "microplastics" in parameter_scores and parameter_scores["microplastics"] > 0.5:
+            recommendations.append("Deploy specialized microplastic collection systems")
+            
+        if "dissolved_oxygen" in parameter_scores and parameter_scores["dissolved_oxygen"] > 0.7:
+            recommendations.append("Prepare for potential hypoxic conditions and fish kill")
+            
+        return recommendations
 
 def wait_for_services():
     """Wait for Kafka to be available"""

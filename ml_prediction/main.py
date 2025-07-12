@@ -102,6 +102,17 @@ POLLUTANT_PROPERTIES = {
         "current_influence": 0.7,# High current influence
         "cleanup_methods": ["wetland_filtration", "buffer_zones", "phytoremediation"]
     },
+    "sediment": {
+        "density": 1200,         # kg/m³
+        "viscosity": 15,         # cSt
+        "evaporation_rate": 0.0, # fraction per day
+        "diffusion_coef": 0.2,   # m²/s
+        "degradation_rate": 0.01,# fraction per day
+        "water_solubility": 5,   # g/L
+        "wind_influence": 0.1,   # Low wind influence
+        "current_influence": 0.8,# High current influence
+        "cleanup_methods": ["dredging", "sedimentation_basin", "erosion_control"]
+    },
     "unknown": {
         "density": 1000,         # kg/m³
         "viscosity": 10,         # cSt
@@ -201,6 +212,23 @@ CURRENT_PATTERNS = {
             "lat_max": 37.3,
             "lon_min": -76.3,
             "lon_max": -75.9
+        }
+    },
+    # Default region
+    "default_region": {
+        "direction": {
+            "flood_tide": 0,     # North (degrees)
+            "ebb_tide": 180      # South (degrees)
+        },
+        "speed": {
+            "flood_tide": 0.4,   # m/s
+            "ebb_tide": 0.5      # m/s
+        },
+        "bounds": {
+            "lat_min": 36.0,
+            "lat_max": 40.0,
+            "lon_min": -77.0,
+            "lon_max": -75.0
         }
     }
 }
@@ -563,7 +591,7 @@ class PollutionSpreadPredictor(MapFunction):
             "sewage": 0.7,
             "agricultural_runoff": 0.6,
             "algal_bloom": 0.8,
-            "plastic_pollution": 0.5,
+            "sediment": 0.5,
             "unknown": 0.7
         }
         
@@ -721,14 +749,30 @@ class PollutionSpreadPredictor(MapFunction):
     
     def _get_current_pattern(self, latitude, longitude, region_id=None):
         """Determine the current pattern for a location"""
-        # Find which region contains the point
+        # First try to use the region_id if provided
+        if region_id in CURRENT_PATTERNS:
+            region_pattern = CURRENT_PATTERNS[region_id]
+            
+            # Determine if we're in flood or ebb tide (simplified, alternating every 6 hours)
+            # In a real system, this would use actual tide data
+            current_hour = datetime.now().hour
+            is_flood = (current_hour % 12) < 6
+            
+            tide_type = "flood_tide" if is_flood else "ebb_tide"
+            
+            return {
+                "name": region_id,
+                "direction": region_pattern["direction"][tide_type],
+                "speed": region_pattern["speed"][tide_type]
+            }
+        
+        # Otherwise try to find which region contains the point
         for name, pattern in CURRENT_PATTERNS.items():
             bounds = pattern["bounds"]
             if (bounds["lat_min"] <= latitude <= bounds["lat_max"] and
                 bounds["lon_min"] <= longitude <= bounds["lon_max"]):
                 
                 # Determine if we're in flood or ebb tide (simplified, alternating every 6 hours)
-                # In a real system, this would use actual tide data
                 current_hour = datetime.now().hour
                 is_flood = (current_hour % 12) < 6
                 
@@ -741,13 +785,13 @@ class PollutionSpreadPredictor(MapFunction):
                 }
         
         # Default to main channel if not in any region
-        default_pattern = CURRENT_PATTERNS["main_channel"]
+        default_pattern = CURRENT_PATTERNS["default_region"]
         current_hour = datetime.now().hour
         is_flood = (current_hour % 12) < 6
         tide_type = "flood_tide" if is_flood else "ebb_tide"
         
         return {
-            "name": "main_channel",
+            "name": "default_region",
             "direction": default_pattern["direction"][tide_type],
             "speed": default_pattern["speed"][tide_type]
         }
