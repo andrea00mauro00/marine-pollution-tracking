@@ -126,8 +126,8 @@ class PostgresClient:
     
     # ===== ALERT METHODS =====
     
-    def get_alerts(self, limit=100, days=7, severity_filter=None, status_filter=None):
-        """Get alerts from the database with optional severity and status filters"""
+    def get_alerts(self, days=7, limit=100, severity_filter=None, pollutant_filter=None, status_filter=None):
+        """Get alerts with optional filters"""
         if not self.is_connected() and not self.reconnect():
             return []
         
@@ -139,17 +139,26 @@ class PostgresClient:
                 query = """
                 SELECT alert_id, source_id, source_type, alert_type, alert_time,
                     severity, latitude, longitude, pollutant_type, risk_score,
-                    message, parent_hotspot_id, derived_from, processed
+                    message, status
                 FROM pollution_alerts
                 WHERE alert_time > %s
                 """
-                
                 params = [date_from]
                 
-                # Add severity filter if provided
+                # Add pollutant filter if provided
+                if pollutant_filter:
+                    query += " AND pollutant_type = %s"
+                    params.append(pollutant_filter)
+                    
+                # Add severity filter if provided - gestire sia singolo valore che array
                 if severity_filter:
-                    query += " AND severity = %s"
-                    params.append(severity_filter)
+                    if isinstance(severity_filter, list):
+                        placeholders = ', '.join(['%s'] * len(severity_filter))
+                        query += f" AND severity IN ({placeholders})"
+                        params.extend(severity_filter)
+                    else:
+                        query += " AND severity = %s"
+                        params.append(severity_filter)
                     
                 # Add status filter if provided
                 if status_filter:

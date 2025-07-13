@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import math
+import uuid 
 import redis
 from datetime import datetime
 from kafka import KafkaConsumer
@@ -488,34 +489,231 @@ def process_prediction(data, redis_conn):
     except Exception as e:
         logger.error(f"Errore processamento previsioni: {e}")
 
-def process_alert(data, redis_conn):
-    """Processa alert per dashboard"""
+def sync_alert_counter(redis_conn):
+    """Sincronizza il contatore degli alert attivi con i dati attuali in Redis"""
     try:
-        # Assicurati che i contatori esistano
-        init_redis_counters(redis_conn)
+        # Conteggio alert attivi da Redis
+        active_alerts = safe_redis_operation(redis_conn.zcard, "dashboard:alerts:active")
+        if active_alerts is None:
+            active_alerts = 0
         
-        # Verifica la presenza di hotspot_id
-        if 'hotspot_id' not in data:
-            logger.warning("Alert senza hotspot_id ricevuto, ignorato")
-            return
+        # Conteggio per severità
+        high_alerts = safe_redis_operation(redis_conn.scard, "dashboard:alerts:by_severity:high")
+        if high_alerts is None:
+            high_alerts = 0
             
-        # Verifica che location e altri campi siano presenti
-        if 'location' not in data or not isinstance(data['location'], dict):
-            logger.warning(f"Alert per hotspot {data['hotspot_id']} senza location valida, saltato")
-            return
+        medium_alerts = safe_redis_operation(redis_conn.scard, "dashboard:alerts:by_severity:medium")
+        if medium_alerts is None:
+            medium_alerts = 0
             
+        low_alerts = safe_redis_operation(redis_conn.scard, "dashboard:alerts:by_severity:low")
+        if low_alerts is None:
+            low_alerts = 0
+        
+        # Verifica la coerenza tra il conteggio totale e la somma per severità
+        severity_sum = high_alerts + medium_alerts + low_alerts
+        
+        if severity_sum != active_alerts:
+            logger.warning(f"Discrepanza nei conteggi alert: totale={active_alerts}, somma severità={severity_sum}")
+            
+            # Aggiorna il conteggio totale con la somma delle severità se c'è una discrepanza
+            # Questo assicura che i due conteggi siano sempre coerenti
+            active_alerts = severity_sum
+        
+        # Crea distribuzione per severità
+        severity_distribution = json.dumps({
+            "high": high_alerts,
+            "medium": medium_alerts,
+            "low": low_alerts
+        })
+        
+        # Aggiorna tutti i contatori nelle strutture Redis
+        # 1. Dashboard summary (usato nella home page)
+        safe_redis_operation(redis_conn.hset, "dashboard:summary", "alerts_count", active_alerts)
+        safe_redis_operation(redis_conn.hset, "dashboard:summary", "severity_distribution", severity_distribution)
+        safe_redis_operation(redis_conn.hset, "dashboard:summary", "updated_at", int(time.time() * 1000))
+        
+        # 2. Contatori separati (usati in altre parti dell'applicazione)
+        safe_redis_operation(redis_conn.hset, "dashboard:counters", "alerts", active_alerts)
+        safe_redis_operation(redis_conn.hset, "dashboard:counters", "high_alerts", high_alerts)
+        safe_redis_operation(redis_conn.hset, "dashboard:counters", "medium_alerts", medium_alerts)
+        safe_redis_operation(redis_conn.hset, "dashboard:counters", "low_alerts", low_alerts)
+        
+        logger.info(f"Contatori alert sincronizzati: {active_alerts} alert attivi (H:{high_alerts}/M:{medium_alerts}/L:{low_alerts})")
+        
+        # Verifica se i contatori sono tutti zero e in tal caso imposta un TTL
+        # Questo previene la visualizzazione di contatori vuoti se non ci sono alert attivi
+        if active_alerts == 0:
+            safe_redis_operation(redis_conn.expire, "dashboard:summary", ALERTS_TTL)
+            safe_redis_operation(redis_conn.expire, "dashboard:counters", ALERTS_TTL)
+        
+        return {
+            "total": active_alerts,
+            "high": high_alerts,
+            "medium": medium_alerts,
+            "low": low_alerts
+        }
+    except Exception as e:
+        logger.error(f"Errore durante la sincronizzazione dei contatori alert: {e}")
+        return {
+            "total": 0,
+            "high": 0, 
+            "medium": 0,
+            "low": 0
+        }
+    
+def sanitize_value(value):
+    """Sanitizza un valore per l'archiviazione in Redis"""
+    if value is None:
+        return ""
+    elif isinstance(value, (int, float)):
+        return str(value)
+    elif isinstance(value, bool):
+        return str(value).lower()
+    elif isinstance(value, dict) or isinstance(value, list):
+        return json.dumps(value)
+    else:
+        return str(value)
+import math  # Aggiungi questa importazione in cima al file
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Calcola la distanza in km tra due punti usando la formula di Haversine"""
+    # Converti tutto in float per sicurezza
+    lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
+    
+    # Raggio della Terra in km
+    R = 6371.0
+    
+    # Converti latitudine e longitudine in radianti
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+    
+    # Differenze
+    dlon = lon2_rad - lon1_rad
+    dlat = lat2_rad - lat1_rad
+    
+    # Formula di Haversine
+    a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    # Distanza in km
+    distance = R * c
+    
+    return distance
+
+def process_alert(data, redis_conn):
+    """Processa un alert e lo salva in Redis per la dashboard"""
+    try:
+        # Verifica presenza campi obbligatori
+        if 'hotspot_id' not in data or 'location' not in data:
+            logger.warning("Alert senza campi obbligatori ricevuto, ignorato")
+            return
+        
         location = data['location']
         if 'center_latitude' not in location or 'center_longitude' not in location:
-            logger.warning(f"Alert con location incompleta, saltato")
+            logger.warning("Alert senza coordinate valide, ignorato")
             return
-            
-        # Estrai ID o genera se non presente
-        alert_id = data.get('alert_id', f"alert_{data['hotspot_id']}_{int(time.time())}")
+        
+        # Estrai dati principali
+        alert_id = data.get('alert_id', f"alert_{str(uuid.uuid4())}")
         hotspot_id = data['hotspot_id']
         
         # Estrai campi di relazione con valori default
         parent_hotspot_id = sanitize_value(data.get('parent_hotspot_id', ''))
         derived_from = sanitize_value(data.get('derived_from', ''))
+        
+        # Estrai coordinate
+        latitude = float(location['center_latitude'])
+        longitude = float(location['center_longitude'])
+        pollutant_type = sanitize_value(data.get('pollutant_type', 'unknown'))
+        severity = sanitize_value(data.get('severity', 'low'))
+        
+        # Calcola bin spaziale principale
+        lat_bin = int(latitude * 100)
+        lon_bin = int(longitude * 100)
+        
+        # NUOVA LOGICA: Controllo delle celle adiacenti
+        nearby_alert_found = False
+        superseded_alert_id = None
+        
+        # Controlla un'area 3x3 di celle centrate sulla posizione dell'alert
+        for dlat in [-1, 0, 1]:
+            for dlon in [-1, 0, 1]:
+                check_lat_bin = lat_bin + dlat
+                check_lon_bin = lon_bin + dlon
+                spatial_key = f"spatial:{check_lat_bin},{check_lon_bin}"
+                
+                # Ottieni alert in questa cella
+                nearby_alerts_ids = safe_redis_operation(redis_conn.smembers, spatial_key)
+                
+                if nearby_alerts_ids:
+                    # Controlla ogni alert in questa cella
+                    for alert_id_bytes in nearby_alerts_ids:
+                        alert_id_str = alert_id_bytes.decode('utf-8') if isinstance(alert_id_bytes, bytes) else alert_id_bytes
+                        
+                        # Ottieni dati dell'alert vicino
+                        nearby_alert_key = f"alert:{alert_id_str}"
+                        nearby_lat = safe_redis_operation(redis_conn.hget, nearby_alert_key, "latitude")
+                        nearby_lon = safe_redis_operation(redis_conn.hget, nearby_alert_key, "longitude")
+                        nearby_type = safe_redis_operation(redis_conn.hget, nearby_alert_key, "pollutant_type")
+                        nearby_severity = safe_redis_operation(redis_conn.hget, nearby_alert_key, "severity")
+                        
+                        # Converti da byte a string/float se necessario
+                        if nearby_lat and isinstance(nearby_lat, bytes):
+                            nearby_lat = nearby_lat.decode('utf-8')
+                        if nearby_lon and isinstance(nearby_lon, bytes):
+                            nearby_lon = nearby_lon.decode('utf-8')
+                        if nearby_type and isinstance(nearby_type, bytes):
+                            nearby_type = nearby_type.decode('utf-8')
+                        if nearby_severity and isinstance(nearby_severity, bytes):
+                            nearby_severity = nearby_severity.decode('utf-8')
+                        
+                        # Calcola la distanza effettiva
+                        if nearby_lat and nearby_lon:
+                            distance = calculate_distance(latitude, longitude, float(nearby_lat), float(nearby_lon))
+                            
+                            # Se è lo stesso tipo e entro 500m (0.5 km)
+                            if nearby_type == pollutant_type and distance < 0.5:
+                                logger.info(f"Trovato alert spazialmente vicino {alert_id_str} in Redis (distanza: {distance:.2f} km)")
+                                
+                                # Confronta severità
+                                severity_ranks = {'high': 3, 'medium': 2, 'low': 1}
+                                current_rank = severity_ranks.get(severity, 0)
+                                nearby_rank = severity_ranks.get(nearby_severity, 0)
+                                
+                                if current_rank > nearby_rank:
+                                    # Il nuovo alert è più severo, rimuovi quello vecchio
+                                    logger.info(f"Nuovo alert ha severità più alta ({severity} > {nearby_severity}), sostituisco {alert_id_str} in Redis")
+                                    
+                                    # Rimuovi il vecchio alert dalle strutture Redis
+                                    safe_redis_operation(redis_conn.zrem, "dashboard:alerts:active", alert_id_str)
+                                    safe_redis_operation(redis_conn.srem, f"dashboard:alerts:by_severity:{nearby_severity}", alert_id_str)
+                                    
+                                    # Rimuovi anche dal bin spaziale
+                                    nearby_lat_bin = int(float(nearby_lat) * 100)
+                                    nearby_lon_bin = int(float(nearby_lon) * 100)
+                                    nearby_spatial_key = f"spatial:{nearby_lat_bin},{nearby_lon_bin}"
+                                    safe_redis_operation(redis_conn.srem, nearby_spatial_key, alert_id_str)
+                                    
+                                    # Segna questo alert come sostituito per il log
+                                    superseded_alert_id = alert_id_str
+                                    
+                                    # Non interrompere il ciclo per controllare tutti gli alert vicini
+                                    # e rimuovere quelli che potrebbero essere duplicati
+                                else:
+                                    # L'alert esistente è ugualmente o più severo, skippiamo il nuovo
+                                    logger.info(f"Alert esistente ha severità uguale/maggiore ({nearby_severity} >= {severity}), skippiamo il nuovo in Redis")
+                                    return
+                
+                # Se abbiamo sostituito un alert, non serve controllare altre celle
+                if superseded_alert_id:
+                    nearby_alert_found = True
+                    break
+            
+            if nearby_alert_found:
+                break
         
         # Estrai tipo di alert
         if data.get('is_update', False):
@@ -528,20 +726,21 @@ def process_alert(data, redis_conn):
         # Preparazione dati alert
         alert_data = {
             'id': alert_id,
-            'hotspot_id': data['hotspot_id'],
-            'severity': sanitize_value(data.get('severity', 'low')),
-            'pollutant_type': sanitize_value(data.get('pollutant_type', 'unknown')),
+            'hotspot_id': hotspot_id,
+            'severity': severity,
+            'pollutant_type': pollutant_type,
             'timestamp': sanitize_value(data.get('detected_at', str(int(time.time() * 1000)))),
-            'latitude': location['center_latitude'],
-            'longitude': location['center_longitude'],
+            'latitude': str(latitude),
+            'longitude': str(longitude),
             'processed': 'false',
             'parent_hotspot_id': parent_hotspot_id,
             'derived_from': derived_from,
-            'alert_type': alert_type
+            'alert_type': alert_type,
+            'status': 'active'
         }
         
         # Crea messaggio di alert
-        alert_data['message'] = f"{data.get('severity', 'low').upper()} {data.get('pollutant_type', 'unknown')} ({alert_type})"
+        alert_data['message'] = f"{severity.upper()} {pollutant_type} ({alert_type})"
         
         # Estrai raccomandazioni se presenti
         if 'recommendations' in data:
@@ -551,9 +750,12 @@ def process_alert(data, redis_conn):
         else:
             alert_data['has_recommendations'] = 'false'
         
-        # Se è un aggiornamento, rimuovi gli alert precedenti per lo stesso hotspot
-        if alert_type in ['update', 'severity_change']:
-            # Trova tutti gli alert attivi per questo hotspot
+        # Se è un aggiornamento o il nuovo alert ha sostituito uno esistente,
+        # aggiorna questo dato
+        if alert_type in ['update', 'severity_change'] or superseded_alert_id:
+            alert_data['supersedes'] = superseded_alert_id or ''
+            
+            # Se è un aggiornamento per lo stesso hotspot, rimuovi gli alert precedenti
             active_alerts = safe_redis_operation(redis_conn.zrange, "dashboard:alerts:active", 0, -1)
             for active_alert_id_bytes in active_alerts:
                 active_alert_id = active_alert_id_bytes.decode('utf-8') if isinstance(active_alert_id_bytes, bytes) else active_alert_id_bytes
@@ -565,7 +767,27 @@ def process_alert(data, redis_conn):
                 
                 # Se appartiene allo stesso hotspot ma è un alert diverso, rimuovilo
                 if active_alert_hotspot_id == hotspot_id and active_alert_id != alert_id:
+                    active_alert_severity = safe_redis_operation(redis_conn.hget, active_alert_key, "severity")
+                    active_alert_severity = active_alert_severity.decode('utf-8') if isinstance(active_alert_severity, bytes) else active_alert_severity
+                    
                     safe_redis_operation(redis_conn.zrem, "dashboard:alerts:active", active_alert_id)
+                    safe_redis_operation(redis_conn.srem, f"dashboard:alerts:by_severity:{active_alert_severity}", active_alert_id)
+                    
+                    # Rimuovi anche dal bin spaziale
+                    active_lat = safe_redis_operation(redis_conn.hget, active_alert_key, "latitude")
+                    active_lon = safe_redis_operation(redis_conn.hget, active_alert_key, "longitude")
+                    
+                    if active_lat and active_lon:
+                        if isinstance(active_lat, bytes):
+                            active_lat = active_lat.decode('utf-8')
+                        if isinstance(active_lon, bytes):
+                            active_lon = active_lon.decode('utf-8')
+                            
+                        active_lat_bin = int(float(active_lat) * 100)
+                        active_lon_bin = int(float(active_lon) * 100)
+                        active_spatial_key = f"spatial:{active_lat_bin},{active_lon_bin}"
+                        safe_redis_operation(redis_conn.srem, active_spatial_key, active_alert_id)
+                    
                     logger.info(f"Rimosso alert obsoleto {active_alert_id} per hotspot {hotspot_id}")
         
         # Hash con dettagli alert
@@ -577,19 +799,19 @@ def process_alert(data, redis_conn):
         timestamp = int(sanitize_value(data.get('detected_at', time.time() * 1000)))
         safe_redis_operation(redis_conn.zadd, "dashboard:alerts:active", {alert_id: timestamp})
         
-        # Imposta TTL anche sul sorted set di alert attivi
-        safe_redis_operation(redis_conn.expire, "dashboard:alerts:active", ALERTS_TTL)
-        
         # Set per severità
-        severity = sanitize_value(data.get('severity', 'low'))
         safe_redis_operation(redis_conn.sadd, f"dashboard:alerts:by_severity:{severity}", alert_id)
+        
+        # Aggiungi al bin spaziale principale
+        main_spatial_key = f"spatial:{lat_bin},{lon_bin}"
+        safe_redis_operation(redis_conn.sadd, main_spatial_key, alert_id)
         
         # Aggiunta alle notifiche dashboard (limitate a 20)
         try:
             notification = json.dumps({
                 'id': alert_id,
                 'message': alert_data['message'],
-                'severity': sanitize_value(data.get('severity', 'low')),
+                'severity': severity,
                 'timestamp': sanitize_value(data.get('detected_at', int(time.time() * 1000))),
                 'parent_hotspot_id': parent_hotspot_id,
                 'derived_from': derived_from,
@@ -604,6 +826,7 @@ def process_alert(data, redis_conn):
         safe_redis_operation(redis_conn.expire, alert_key, ALERTS_TTL)
         safe_redis_operation(redis_conn.expire, f"dashboard:alerts:by_severity:{severity}", ALERTS_TTL)
         safe_redis_operation(redis_conn.expire, "dashboard:notifications", ALERTS_TTL)
+        safe_redis_operation(redis_conn.expire, main_spatial_key, ALERTS_TTL)
         
         # Ricalcola contatori dopo la pulizia degli alert obsoleti
         sync_alert_counter(redis_conn)

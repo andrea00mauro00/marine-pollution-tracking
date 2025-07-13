@@ -1,787 +1,563 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import json
+import logging
+from datetime import datetime, timedelta
+
+# Importazioni per le mappe
+import folium
+from folium.plugins import MarkerCluster
+from streamlit_folium import folium_static
+
+# Importazioni per i grafici
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import json
+
+# Configurazione logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def show_alerts_page(clients):
-    """Render the alerts management page"""
-    st.markdown("<h1 class='main-header'>Pollution Alerts</h1>", unsafe_allow_html=True)
+    """Visualizza la pagina degli alert con raccomandazioni dettagliate"""
     
-    # Get clients
-    redis_client = clients["redis"]
-    postgres_client = clients["postgres"]
+    # Intestazione
+    st.markdown("<h1 class='main-header'>Pollution Alerts Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown("<p>Monitor and track pollution alerts with detailed intervention recommendations</p>", unsafe_allow_html=True)
     
-    # Apply custom CSS for alerts and recommendations
-    st.markdown("""
-    <style>
-    .alert-card {
-        border-radius: 8px;
-        padding: 20px;
-        margin-bottom: 20px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .alert-high {
-        border-left: 5px solid #DC2626;
-        background-color: #FEF2F2;
-    }
-    .alert-medium {
-        border-left: 5px solid #F59E0B;
-        background-color: #FFFBEB;
-    }
-    .alert-low {
-        border-left: 5px solid #10B981;
-        background-color: #ECFDF5;
-    }
-    .alert-header {
-        display: flex;
-        justify-content: space-between;
-        margin-bottom: 15px;
-    }
-    .alert-title {
-        font-size: 1.2rem;
-        font-weight: bold;
-    }
-    .alert-badge {
-        padding: 5px 10px;
-        border-radius: 15px;
-        font-weight: bold;
-        font-size: 0.8rem;
-        color: white;
-    }
-    .badge-high {
-        background-color: #DC2626;
-    }
-    .badge-medium {
-        background-color: #F59E0B;
-    }
-    .badge-low {
-        background-color: #10B981;
-    }
-    .alert-meta {
-        display: flex;
-        gap: 15px;
-        margin-bottom: 15px;
-        color: #6B7280;
-    }
-    .alert-message {
-        margin-bottom: 15px;
-        font-size: 1.1rem;
-    }
+    # Layout in 3 colonne per le metriche principali
+    col1, col2, col3 = st.columns(3)
     
-    /* Recommendation Styles */
-    .recommendations-container {
-        margin-top: 20px;
-        border-top: 1px solid #E5E7EB;
-        padding-top: 15px;
-    }
-    .recommendation-section {
-        margin-bottom: 15px;
-    }
-    .section-title {
-        font-weight: bold;
-        margin-bottom: 8px;
-        color: #1F2937;
-    }
-    .action-item {
-        padding: 8px 12px;
-        background-color: #FEF2F2;
-        border-left: 3px solid #DC2626;
-        margin-bottom: 6px;
-        border-radius: 4px;
-    }
-    .resource-item {
-        padding: 8px 12px;
-        background-color: #F0FDF4;
-        border-left: 3px solid #10B981;
-        margin-bottom: 6px;
-        border-radius: 4px;
-    }
-    .stakeholder-item {
-        padding: 8px 12px;
-        background-color: #FEF3C7;
-        border-left: 3px solid #F59E0B;
-        margin-bottom: 6px;
-        border-radius: 4px;
-    }
-    .regulatory-item {
-        padding: 8px 12px;
-        background-color: #EEF2FF;
-        border-left: 3px solid #4F46E5;
-        margin-bottom: 6px;
-        border-radius: 4px;
-    }
-    .cleanup-badge {
-        display: inline-block;
-        padding: 5px 10px;
-        background-color: #DBEAFE;
-        color: #1E40AF;
-        border-radius: 15px;
-        margin: 3px;
-        font-size: 0.85rem;
-    }
-    .impact-table th {
-        background-color: #F3F4F6;
-        padding: 8px;
-    }
-    .impact-table td {
-        padding: 8px;
-    }
+    # Ottieni le metriche dal summary di Redis
+    dashboard_summary = clients["redis"].get_dashboard_summary()
     
-    /* Alert List Styles */
-    .dataframe tbody tr:hover {
-        background-color: #F9FAFB;
-    }
-    .dataframe thead th {
-        text-align: left;
-        background-color: #F3F4F6;
-    }
+    # Estrai conteggi per severità
+    severity_counts = {}
+    if "severity_distribution" in dashboard_summary:
+        try:
+            severity_distribution = dashboard_summary.get("severity_distribution", "{}")
+            if isinstance(severity_distribution, bytes):
+                severity_distribution = severity_distribution.decode('utf-8')
+            severity_counts = json.loads(severity_distribution)
+        except Exception as e:
+            logger.error(f"Error parsing severity distribution: {e}")
+            severity_counts = {"high": 0, "medium": 0, "low": 0}
     
-    /* Metrics Section */
-    .metrics-container {
-        display: flex;
-        gap: 15px;
-        margin-bottom: 20px;
-    }
-    .metric-card {
-        flex: 1;
-        background-color: white;
-        border-radius: 8px;
-        padding: 15px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    }
-    .metric-title {
-        font-size: 0.9rem;
-        color: #6B7280;
-        margin-bottom: 5px;
-    }
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: bold;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+    with col1:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h2 class='sub-header'>High Severity</h2>", unsafe_allow_html=True)
+        st.markdown(f"<p class='stat-large status-high'>{severity_counts.get('high', 0)}</p>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     
-    # Create tabs
-    tab1, tab2, tab3 = st.tabs(["Active Alerts", "Alert History", "Notification Settings"])
+    with col2:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h2 class='sub-header'>Medium Severity</h2>", unsafe_allow_html=True)
+        st.markdown(f"<p class='stat-large status-medium'>{severity_counts.get('medium', 0)}</p>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     
-    # Tab 1: Active Alerts
-    with tab1:
-        # Get active alerts
-        active_alert_ids = redis_client.get_active_alerts()
-        
-        # Display alerts dashboard
-        st.markdown("<h2>Active Alerts</h2>", unsafe_allow_html=True)
-        
-        # Get alert counts by severity
-        high_alerts = redis_client.get_alerts_by_severity("high")
-        medium_alerts = redis_client.get_alerts_by_severity("medium")
-        low_alerts = redis_client.get_alerts_by_severity("low")
-        
-        # Statistics row with styled metrics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Active Alerts", len(active_alert_ids))
-        
-        with col2:
-            st.metric("High Priority", len(high_alerts), 
-                     delta=f"{round(len(high_alerts)/max(len(active_alert_ids), 1)*100)}%" if active_alert_ids else None)
-        
-        with col3:
-            st.metric("Medium Priority", len(medium_alerts))
-        
-        with col4:
-            st.metric("Low Priority", len(low_alerts))
-        
-        # Display active alerts
-        if active_alert_ids:
-            # Get alert details for all active alerts
-            alerts_data = []
-            for alert_id in active_alert_ids:
-                alert_data = redis_client.get_alert_data(alert_id)
-                if alert_data:
-                    alerts_data.append(alert_data)
-            
-            if alerts_data:
-                # Convert to DataFrame
-                alerts_df = pd.DataFrame(alerts_data)
-                
-                # Create alert map
-                st.markdown("<h3>Alert Map</h3>", unsafe_allow_html=True)
-                
-                # Check if we have location data
-                if 'latitude' in alerts_df.columns and 'longitude' in alerts_df.columns:
-                    # Convert coordinates to float
-                    alerts_df['latitude'] = pd.to_numeric(alerts_df['latitude'], errors='coerce')
-                    alerts_df['longitude'] = pd.to_numeric(alerts_df['longitude'], errors='coerce')
-                    
-                    # Drop rows with invalid coordinates
-                    alerts_df = alerts_df.dropna(subset=['latitude', 'longitude'])
-                    
-                    if not alerts_df.empty:
-                        # Create map
-                        fig = go.Figure(go.Scattermapbox(
-                            lat=alerts_df['latitude'],
-                            lon=alerts_df['longitude'],
-                            mode='markers',
-                            marker=dict(
-                                size=12,
-                                color=['#DC2626' if sev == 'high' else 
-                                      '#F59E0B' if sev == 'medium' else 
-                                      '#10B981' for sev in alerts_df['severity']] if 'severity' in alerts_df.columns else '#3B82F6',
-                                opacity=0.8
-                            ),
-                            text=[f"Alert: {row.get('message', 'Pollution Alert')}<br>" + 
-                                 f"Type: {row.get('pollutant_type', 'Unknown')}<br>" + 
-                                 f"Severity: {row.get('severity', 'Unknown').upper()}" 
-                                 for _, row in alerts_df.iterrows()],
-                            hoverinfo='text'
-                        ))
-                        
-                        # Set map style
-                        fig.update_layout(
-                            mapbox=dict(
-                                style="open-street-map",
-                                center=dict(
-                                    lat=alerts_df['latitude'].mean(),
-                                    lon=alerts_df['longitude'].mean()
-                                ),
-                                zoom=7
-                            ),
-                            margin={"r":0,"t":0,"l":0,"b":0},
-                            height=400
-                        )
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.warning("Alert data contains invalid coordinates")
-                else:
-                    st.info("No location data available for alerts")
-                
-                # Filter alert data for better display
-                id_column = next((col for col in ['alert_id', 'id', 'source_id'] if col in alerts_df.columns), None)
-                
-                if id_column:
-                    # Alert selection dropdown
-                    selected_id = st.selectbox(
-                        "Select an alert to view details",
-                        options=alerts_df[id_column].tolist(),
-                        format_func=lambda x: f"{x} - {alerts_df[alerts_df[id_column]==x]['message'].iloc[0][:30]}..." if 'message' in alerts_df.columns else x,
-                        index=None
-                    )
-                    
-                    if selected_id:
-                        # Find the selected alert
-                        selected_alert = alerts_df[alerts_df[id_column] == selected_id].iloc[0].to_dict()
-                        
-                        # Get enhanced recommendations from PostgreSQL
-                        enhanced_recommendations = None
-                        postgres_alert = postgres_client.get_alert_by_id(selected_id)
-                        
-                        if postgres_alert and 'recommendations' in postgres_alert:
-                            enhanced_recommendations = postgres_alert['recommendations']
-                            if isinstance(enhanced_recommendations, str):
-                                try:
-                                    enhanced_recommendations = json.loads(enhanced_recommendations)
-                                except:
-                                    enhanced_recommendations = None
-                        
-                        # Fallback to Redis recommendations if PostgreSQL doesn't have them
-                        recommendations = None
-                        if enhanced_recommendations:
-                            recommendations = enhanced_recommendations
-                        elif 'recommendations' in selected_alert:
-                            recommendations = selected_alert['recommendations']
-                            if isinstance(recommendations, str):
-                                try:
-                                    recommendations = json.loads(recommendations)
-                                except:
-                                    recommendations = None
-                        elif 'details' in selected_alert and isinstance(selected_alert['details'], dict):
-                            recommendations = selected_alert['details'].get('recommendations')
-                        
-                        # Display alert card with severity-based styling
-                        severity = selected_alert.get('severity', 'low')
-                        
-                        st.markdown(f"""
-                        <div class="alert-card alert-{severity}">
-                            <div class="alert-header">
-                                <div class="alert-title">{selected_alert.get('message', 'Pollution Alert')}</div>
-                                <div class="alert-badge badge-{severity}">{severity.upper()}</div>
-                            </div>
-                            <div class="alert-meta">
-                                <div><strong>ID:</strong> {selected_id}</div>
-                                <div><strong>Type:</strong> {selected_alert.get('pollutant_type', 'Unknown')}</div>
-                                <div><strong>Source:</strong> {selected_alert.get('source_id', 'Unknown')}</div>
-                            </div>
-                            <div class="alert-meta">
-                                <div><strong>Date:</strong> {selected_alert.get('alert_time', 'Unknown')}</div>
-                                <div><strong>Status:</strong> {'Processed' if str(selected_alert.get('processed', '')).lower() == 'true' else 'Unprocessed'}</div>
-                                <div><strong>Risk Score:</strong> {selected_alert.get('risk_score', 'N/A')}</div>
-                            </div>
-                        """, unsafe_allow_html=True)
-                        
-                        # Display recommendations if available
-                        if recommendations and isinstance(recommendations, dict):
-                            st.markdown("""
-                            <div class="recommendations-container">
-                                <h3>Response Recommendations</h3>
-                            """, unsafe_allow_html=True)
-                            
-                            # Create two columns for recommendations
-                            rec_col1, rec_col2 = st.columns(2)
-                            
-                            with rec_col1:
-                                # Immediate Actions section
-                                if "immediate_actions" in recommendations and recommendations["immediate_actions"]:
-                                    st.markdown("""
-                                    <div class="recommendation-section">
-                                        <div class="section-title">Immediate Actions</div>
-                                    """, unsafe_allow_html=True)
-                                    
-                                    for action in recommendations["immediate_actions"]:
-                                        st.markdown(f'<div class="action-item">{action}</div>', unsafe_allow_html=True)
-                                    
-                                    st.markdown('</div>', unsafe_allow_html=True)
-                                
-                                # Resource Requirements section
-                                if "resource_requirements" in recommendations and recommendations["resource_requirements"]:
-                                    st.markdown("""
-                                    <div class="recommendation-section">
-                                        <div class="section-title">Resource Requirements</div>
-                                    """, unsafe_allow_html=True)
-                                    
-                                    for resource_type, resource_details in recommendations["resource_requirements"].items():
-                                        resource_name = resource_type.replace("_", " ").title()
-                                        st.markdown(f'<div class="resource-item"><strong>{resource_name}:</strong> {resource_details}</div>', unsafe_allow_html=True)
-                                    
-                                    st.markdown('</div>', unsafe_allow_html=True)
-                            
-                            with rec_col2:
-                                # Stakeholders to Notify section
-                                if "stakeholders_to_notify" in recommendations and recommendations["stakeholders_to_notify"]:
-                                    st.markdown("""
-                                    <div class="recommendation-section">
-                                        <div class="section-title">Stakeholders to Notify</div>
-                                    """, unsafe_allow_html=True)
-                                    
-                                    for stakeholder in recommendations["stakeholders_to_notify"]:
-                                        st.markdown(f'<div class="stakeholder-item">{stakeholder}</div>', unsafe_allow_html=True)
-                                    
-                                    st.markdown('</div>', unsafe_allow_html=True)
-                                
-                                # Regulatory Implications section
-                                if "regulatory_implications" in recommendations and recommendations["regulatory_implications"]:
-                                    st.markdown("""
-                                    <div class="recommendation-section">
-                                        <div class="section-title">Regulatory Implications</div>
-                                    """, unsafe_allow_html=True)
-                                    
-                                    for regulation in recommendations["regulatory_implications"]:
-                                        st.markdown(f'<div class="regulatory-item">{regulation}</div>', unsafe_allow_html=True)
-                                    
-                                    st.markdown('</div>', unsafe_allow_html=True)
-                            
-                            # Cleanup Methods section (full width)
-                            if "cleanup_methods" in recommendations and recommendations["cleanup_methods"]:
-                                st.markdown("""
-                                <div class="recommendation-section">
-                                    <div class="section-title">Recommended Cleanup Methods</div>
-                                    <div>
-                                """, unsafe_allow_html=True)
-                                
-                                for method in recommendations["cleanup_methods"]:
-                                    method_display = method.replace("_", " ").title()
-                                    st.markdown(f'<span class="cleanup-badge">{method_display}</span>', unsafe_allow_html=True)
-                                
-                                st.markdown("""
-                                    </div>
-                                </div>
-                                """, unsafe_allow_html=True)
-                            
-                            # Environmental Impact Assessment section (full width)
-                            if "environmental_impact_assessment" in recommendations and recommendations["environmental_impact_assessment"]:
-                                st.markdown("""
-                                <div class="recommendation-section">
-                                    <div class="section-title">Environmental Impact Assessment</div>
-                                """, unsafe_allow_html=True)
-                                
-                                impact = recommendations["environmental_impact_assessment"]
-                                
-                                # Create clean table
-                                impact_data = []
-                                for key, value in impact.items():
-                                    # Format key and value for better display
-                                    display_key = key.replace("_", " ").title()
-                                    
-                                    if isinstance(value, list):
-                                        display_value = ", ".join([v.replace("_", " ").title() for v in value])
-                                    else:
-                                        display_value = str(value)
-                                    
-                                    impact_data.append([display_key, display_value])
-                                
-                                # Create dataframe
-                                impact_df = pd.DataFrame(impact_data, columns=["Impact Factor", "Assessment"])
-                                st.dataframe(impact_df, hide_index=True, use_container_width=True)
-                                
-                                st.markdown('</div>', unsafe_allow_html=True)
-                            
-                            st.markdown('</div>', unsafe_allow_html=True)
-                        else:
-                            st.markdown("""
-                            <div class="recommendations-container">
-                                <em>No detailed recommendations available for this alert.</em>
-                            </div>
-                            """, unsafe_allow_html=True)
-                        
-                        st.markdown('</div>', unsafe_allow_html=True)
-                        
-                        # Action buttons
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if str(selected_alert.get('processed', '')).lower() != 'true':
-                                if st.button("Mark as Processed", use_container_width=True):
-                                    st.success("Alert marked as processed.")
-                                    # In a real implementation, update the database
-                        
-                        with col2:
-                            if st.button("Export Report", use_container_width=True):
-                                st.info("Report exported. Check your downloads folder.")
-                                # In a real implementation, generate PDF report
-                else:
-                    st.warning("No ID column available for alert selection")
-                
-                # Alert list table
-                st.markdown("<h3>All Active Alerts</h3>", unsafe_allow_html=True)
-                
-                # Determine columns to display
-                display_cols = [col for col in ['alert_id', 'severity', 'pollutant_type', 'message', 'alert_time'] 
-                               if col in alerts_df.columns]
-                
-                if display_cols:
-                    # Format timestamp if present
-                    if 'alert_time' in display_cols:
-                        try:
-                            alerts_df['alert_time'] = pd.to_datetime(alerts_df['alert_time']).dt.strftime('%Y-%m-%d %H:%M')
-                        except:
-                            pass
-                    
-                    # Apply custom formatting for severity
-                    if 'severity' in display_cols:
-                        alerts_df['severity'] = alerts_df['severity'].str.upper()
-                    
-                    # Display clean table
-                    st.dataframe(alerts_df[display_cols], use_container_width=True)
-                else:
-                    st.warning("No standard columns available for display")
-            else:
-                st.info("No active alerts data available")
-        else:
-            st.success("No active alerts currently. All clear!")
+    with col3:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h2 class='sub-header'>Low Severity</h2>", unsafe_allow_html=True)
+        st.markdown(f"<p class='stat-large status-low'>{severity_counts.get('low', 0)}</p>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     
-    # Tab 2: Alert History
-    with tab2:
-        st.markdown("<h2>Alert History</h2>", unsafe_allow_html=True)
+    # Sezione filtri
+    st.markdown("<h2 class='sub-header'>Alert Filters</h2>", unsafe_allow_html=True)
+    
+    # Layout filtri in 3 colonne
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    
+    with filter_col1:
+        # Filtro per severità - multi-select per selezionare più valori
+        severity_options = ["high", "medium", "low"]
+        selected_severities = st.multiselect("Severity", severity_options, default=severity_options)
+    
+    with filter_col2:
+        # Filtro per tipo di inquinante
+        pollutant_options = ["All", "oil_spill", "chemical_discharge", "algal_bloom", 
+                            "sewage", "agricultural_runoff", "plastic_pollution", "unknown"]
+        selected_pollutant = st.selectbox("Pollutant Type", pollutant_options)
+    
+    with filter_col3:
+        # Filtro per tempo
+        time_options = ["Last 24 hours", "Last 3 days", "Last week", "Last month", "All active"]
+        selected_time = st.selectbox("Time Range", time_options)
+    
+    # Recupera gli alert - Usa direttamente PostgreSQL per ora
+    try:
+        # Converti filtri per PostgreSQL
+        severity_filter = None if not selected_severities else selected_severities
+        pollutant_filter = None if selected_pollutant == "All" else selected_pollutant
         
-        # Filter controls in a single row
-        col1, col2, col3 = st.columns(3)
+        # Mappa il filtro di tempo a giorni per PostgreSQL
+        days_map = {
+            "Last 24 hours": 1,
+            "Last 3 days": 3,
+            "Last week": 7,
+            "Last month": 30,
+            "All active": 90  # Assumiamo 90 giorni come "tutti gli attivi"
+        }
+        days = days_map.get(selected_time, 30)
         
-        with col1:
-            days = st.selectbox(
-                "Time Period",
-                options=[1, 3, 7, 14, 30],
-                index=2,  # Default to 7 days
-                format_func=lambda x: f"Last {x} days"
-            )
+        # Recupera da PostgreSQL con stato "active"
+        alerts = clients["postgres"].get_alerts(
+            days=days,
+            severity_filter=severity_filter,
+            pollutant_filter=pollutant_filter,
+            status_filter="active"
+        )
         
-        with col2:
-            severity_filter = st.multiselect(
-                "Severity",
-                ["high", "medium", "low"],
-                default=["high", "medium", "low"]
-            )
+        logger.info(f"Retrieved {len(alerts)} alerts from PostgreSQL")
+    except Exception as e:
+        st.error(f"Error retrieving alerts: {e}")
+        logger.error(f"Error retrieving alerts: {e}")
+        alerts = []
+    
+    # Layout principale con 2 colonne
+    main_col1, main_col2 = st.columns([2, 1])
+    
+    with main_col1:
+        # Mappa con gli alert
+        st.markdown("<h2 class='sub-header'>Alert Map</h2>", unsafe_allow_html=True)
         
-        with col3:
-            processed_filter = st.selectbox(
-                "Processing Status",
-                options=["all", "processed", "unprocessed"],
-                index=0
-            )
+        # Crea mappa di base con posizione di default
+        alert_map = folium.Map(location=[0, 0], zoom_start=2)
         
-        # Get alert history
-        alerts = postgres_client.get_alerts(limit=100, days=days)
-        
-        # Apply filters
-        if severity_filter:
-            alerts = [a for a in alerts if a.get('severity', 'low') in severity_filter]
-        
-        if processed_filter != "all":
-            is_processed = processed_filter == "processed"
-            alerts = [a for a in alerts if a.get('processed', False) == is_processed]
-        
-        # Display alert history
+        # Aggiungi marker per ogni alert
         if alerts:
-            # Create DataFrame
-            alerts_df = pd.DataFrame(alerts)
+            # Calcola centro della mappa (media delle coordinate)
+            latitudes = [float(alert["latitude"]) for alert in alerts if alert.get("latitude")]
+            longitudes = [float(alert["longitude"]) for alert in alerts if alert.get("longitude")]
             
-            # Create two columns for charts
+            if latitudes and longitudes:
+                center_lat = sum(latitudes) / len(latitudes)
+                center_lng = sum(longitudes) / len(longitudes)
+                alert_map = folium.Map(location=[center_lat, center_lng], zoom_start=5)
+            
+            # Aggiungi layer a cluster per i marker
+            marker_cluster = MarkerCluster().add_to(alert_map)
+            
+            # Colori per severità
+            severity_colors = {
+                "high": "red",
+                "medium": "orange",
+                "low": "green"
+            }
+            
+            # Aggiungi marker per ogni alert
+            for alert in alerts:
+                if not alert.get("latitude") or not alert.get("longitude"):
+                    continue
+                    
+                # Crea popup con informazioni dell'alert
+                alert_id = alert.get("alert_id", "N/A")
+                popup_html = f"""
+                <strong>ID:</strong> {alert_id}<br>
+                <strong>Type:</strong> {alert.get("pollutant_type", "N/A")}<br>
+                <strong>Severity:</strong> {alert.get("severity", "N/A")}<br>
+                <strong>Message:</strong> {alert.get("message", "N/A")}<br>
+                <strong>Status:</strong> {alert.get("status", "N/A")}<br>
+                """
+                
+                # Crea icona basata sulla severità
+                icon = folium.Icon(
+                    color=severity_colors.get(alert.get("severity", "low"), "blue"),
+                    icon="info-sign"
+                )
+                
+                # Aggiungi marker alla mappa
+                folium.Marker(
+                    location=[float(alert["latitude"]), float(alert["longitude"])],
+                    popup=folium.Popup(popup_html, max_width=300),
+                    icon=icon,
+                    tooltip=f"{alert.get('severity', 'unknown').upper()} - {alert.get('pollutant_type', 'unknown')}"
+                ).add_to(marker_cluster)
+        
+        # Visualizza mappa
+        folium_static(alert_map)
+        
+        # Sezione grafici
+        if alerts:
+            st.markdown("<h2 class='sub-header'>Alert Analytics</h2>", unsafe_allow_html=True)
+            
+            # Layout grafici in 2 colonne
             chart_col1, chart_col2 = st.columns(2)
             
             with chart_col1:
-                # Alert trend chart
-                if 'alert_time' in alerts_df.columns:
-                    # Convert to datetime
-                    alerts_df['alert_time'] = pd.to_datetime(alerts_df['alert_time'])
-                    
-                    # Group by day
-                    alerts_df['date'] = alerts_df['alert_time'].dt.date
-                    
-                    if 'severity' in alerts_df.columns:
-                        # Group by day and severity
-                        trend_data = alerts_df.groupby(['date', 'severity']).size().reset_index(name='count')
-                        
-                        # Create area chart
-                        fig = px.area(
-                            trend_data,
-                            x='date',
-                            y='count',
-                            color='severity',
-                            title="Alert Trend Over Time",
-                            color_discrete_map={
-                                "high": "#DC2626",
-                                "medium": "#F59E0B",
-                                "low": "#10B981"
-                            }
-                        )
-                    else:
-                        # Simple count by date
-                        trend_data = alerts_df.groupby(['date']).size().reset_index(name='count')
-                        fig = px.area(trend_data, x='date', y='count', title="Alert Trend Over Time")
-                    
-                    # Update layout
-                    fig.update_layout(
-                        xaxis_title="Date",
-                        yaxis_title="Number of Alerts",
-                        legend_title="Severity",
-                        height=300
+                # Distribuzione degli alert per tipo di inquinante
+                pollutant_counts = {}
+                for alert in alerts:
+                    pollutant_type = alert.get("pollutant_type", "unknown")
+                    pollutant_counts[pollutant_type] = pollutant_counts.get(pollutant_type, 0) + 1
+                
+                # Crea dataframe per il grafico
+                pollutant_df = pd.DataFrame({
+                    "Pollutant Type": list(pollutant_counts.keys()),
+                    "Count": list(pollutant_counts.values())
+                })
+                
+                # Crea grafico a torta
+                if not pollutant_df.empty:
+                    fig = px.pie(
+                        pollutant_df,
+                        values="Count",
+                        names="Pollutant Type",
+                        title="Distribution by Pollutant Type",
+                        color_discrete_sequence=px.colors.qualitative.Safe
                     )
-                    
                     st.plotly_chart(fig, use_container_width=True)
             
             with chart_col2:
-                # Create pie chart showing distribution
-                if 'pollutant_type' in alerts_df.columns:
-                    pollutant_counts = alerts_df['pollutant_type'].value_counts()
-                    
-                    fig = px.pie(
-                        names=pollutant_counts.index,
-                        values=pollutant_counts.values,
-                        title="Alerts by Pollutant Type",
-                        hole=0.4,
-                        color_discrete_sequence=px.colors.qualitative.Pastel
-                    )
-                    
-                    fig.update_layout(height=300)
-                    st.plotly_chart(fig, use_container_width=True)
-                elif 'severity' in alerts_df.columns:
-                    severity_counts = alerts_df['severity'].value_counts()
-                    
-                    fig = px.pie(
-                        names=severity_counts.index,
-                        values=severity_counts.values,
-                        title="Alerts by Severity",
-                        hole=0.4,
-                        color_discrete_map={
-                            "high": "#DC2626",
-                            "medium": "#F59E0B",
-                            "low": "#10B981"
-                        }
-                    )
-                    
-                    fig.update_layout(height=300)
-                    st.plotly_chart(fig, use_container_width=True)
-            
-            # Alert list
-            st.markdown("<h3>Alert History</h3>", unsafe_allow_html=True)
-            
-            # Define display columns
-            display_cols = [col for col in ['alert_id', 'source_id', 'severity', 'pollutant_type', 'message', 'alert_time', 'processed']
-                           if col in alerts_df.columns]
-            
-            if display_cols:
-                # Format timestamp if present
-                if 'alert_time' in display_cols:
-                    try:
-                        alerts_df['alert_time'] = pd.to_datetime(alerts_df['alert_time']).dt.strftime('%Y-%m-%d %H:%M')
-                    except:
-                        pass
+                # Distribuzione per severità
+                severity_counts_filtered = {}
+                for alert in alerts:
+                    severity = alert.get("severity", "unknown")
+                    severity_counts_filtered[severity] = severity_counts_filtered.get(severity, 0) + 1
                 
-                # Display table
-                st.dataframe(alerts_df[display_cols], use_container_width=True)
-            else:
-                st.warning("No standard columns available in alert history data")
-        else:
-            st.info("No alerts found for the selected filters")
+                # Crea dataframe per il grafico
+                severity_df = pd.DataFrame({
+                    "Severity": list(severity_counts_filtered.keys()),
+                    "Count": list(severity_counts_filtered.values())
+                })
+                
+                # Definisci colori per il grafico
+                severity_colors = {
+                    "high": "#F44336",
+                    "medium": "#FF9800",
+                    "low": "#4CAF50",
+                    "unknown": "#9E9E9E"
+                }
+                
+                # Crea colori per il grafico
+                colors = [severity_colors.get(severity, "#9E9E9E") for severity in severity_df["Severity"]]
+                
+                # Crea grafico a barre
+                if not severity_df.empty:
+                    fig = px.bar(
+                        severity_df,
+                        x="Severity",
+                        y="Count",
+                        title="Distribution by Severity",
+                        color="Severity",
+                        color_discrete_map=severity_colors
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
     
-    # Tab 3: Notification Settings
-    with tab3:
-        st.markdown("<h2>Notification Settings</h2>", unsafe_allow_html=True)
+    with main_col2:
+        # Lista degli alert
+        st.markdown("<h2 class='sub-header'>Alert List</h2>", unsafe_allow_html=True)
         
-        # Create two columns
-        config_col1, config_col2 = st.columns([2, 1])
-        
-        with config_col1:
-            # Get notification configurations
-            notification_configs = postgres_client.get_notification_configs()
+        if alerts:
+            # Aggiungi opzione per ordinamento
+            sort_options = ["Most Recent", "Highest Severity", "Lowest Severity"]
+            selected_sort = st.selectbox("Sort by", sort_options)
             
-            # Display existing configurations
-            if notification_configs:
-                st.markdown("<h3>Active Notification Configurations</h3>", unsafe_allow_html=True)
-                
-                # Convert to DataFrame
-                configs_df = pd.DataFrame(notification_configs)
-                
-                # Define display columns
-                display_cols = [col for col in ['config_id', 'region_id', 'severity_level', 'pollutant_type', 
-                                              'notification_type', 'cooldown_minutes', 'active']
-                               if col in configs_df.columns]
-                
-                if display_cols:
-                    # Format for better display
-                    if 'region_id' in display_cols:
-                        configs_df['region_id'] = configs_df['region_id'].fillna('Global')
-                    
-                    if 'severity_level' in display_cols:
-                        configs_df['severity_level'] = configs_df['severity_level'].fillna('All')
-                    
-                    if 'pollutant_type' in display_cols:
-                        configs_df['pollutant_type'] = configs_df['pollutant_type'].fillna('All')
-                    
-                    if 'active' in display_cols:
-                        configs_df['active'] = configs_df['active'].map({True: 'Yes', False: 'No'})
-                    
-                    # Display table
-                    st.dataframe(configs_df[display_cols], use_container_width=True)
+            # Ordina in base all'opzione selezionata
+            if selected_sort == "Most Recent":
+                # Ordina per alert_time (gestisci sia stringhe che datetime)
+                alerts = sorted(alerts, 
+                               key=lambda x: x.get("alert_time", ""),
+                               reverse=True)
+            elif selected_sort == "Highest Severity":
+                severity_order = {"high": 0, "medium": 1, "low": 2, None: 3}
+                alerts = sorted(alerts, 
+                               key=lambda x: (severity_order.get(x.get("severity"), 3), x.get("alert_time", "")))
+            elif selected_sort == "Lowest Severity":
+                severity_order = {"low": 0, "medium": 1, "high": 2, None: 3}
+                alerts = sorted(alerts, 
+                               key=lambda x: (severity_order.get(x.get("severity"), 3), x.get("alert_time", "")))
+            
+            # Mostra alert in formato card con raccomandazioni integrate
+            for i, alert in enumerate(alerts):
+                # Estrai informazioni di base
+                alert_id = alert.get("alert_id", f"unknown-{i}")
+                alert_time = alert.get("alert_time", "")
+                if isinstance(alert_time, str) and "T" in alert_time:
+                    alert_time_display = alert_time.split("T")[0]
                 else:
-                    st.warning("No standard columns available in notification configurations")
-        
-        with config_col2:
-            if notification_configs:
-                st.markdown("<h3>Configuration Details</h3>", unsafe_allow_html=True)
+                    alert_time_display = str(alert_time)[:10]
                 
-                # Find a suitable ID column
-                id_column = next((col for col in ['config_id'] if col in configs_df.columns), None)
+                severity = alert.get("severity", "unknown")
+                pollutant_type = alert.get("pollutant_type", "unknown")
+                status = alert.get("status", "unknown")
                 
-                if id_column:
-                    # Select configuration
-                    selected_config_id = st.selectbox(
-                        "Select a configuration",
-                        options=configs_df[id_column].tolist(),
-                        index=None
-                    )
+                # Crea expander con titolo informativo
+                with st.expander(f"{severity.upper()} - {pollutant_type} - {alert_time_display}"):
+                    # Mostra dettagli dell'alert
+                    st.markdown(f"**ID:** {alert_id}")
+                    st.markdown(f"**Message:** {alert.get('message', 'No message')}")
+                    st.markdown(f"**Status:** {status}")
+                    st.markdown(f"**Location:** Lat {float(alert.get('latitude', 0)):.5f}, Lon {float(alert.get('longitude', 0)):.5f}")
+                    st.markdown(f"**Time:** {alert_time}")
+                    st.markdown(f"**Risk Score:** {alert.get('risk_score', 'N/A')}")
                     
-                    if selected_config_id:
-                        # Find selected configuration
-                        selected_config = next((c for c in notification_configs if c.get('config_id') == selected_config_id), None)
+                    # NUOVA SEZIONE: Recupera e mostra raccomandazioni direttamente
+                    try:
+                        # Ottieni dettagli completi dell'alert per accedere alle raccomandazioni
+                        alert_details = clients["postgres"].get_alert_details(alert_id)
                         
-                        if selected_config:
-                            # Display configuration details
-                            st.markdown(f"""
-                            <div style="background-color: #F3F4F6; padding: 15px; border-radius: 8px;">
-                                <div><strong>ID:</strong> {selected_config.get('config_id', 'N/A')}</div>
-                                <div><strong>Region:</strong> {selected_config.get('region_id', 'Global')}</div>
-                                <div><strong>Severity:</strong> {selected_config.get('severity_level', 'All')}</div>
-                                <div><strong>Pollutant Type:</strong> {selected_config.get('pollutant_type', 'All')}</div>
-                                <div><strong>Notification Type:</strong> {selected_config.get('notification_type', 'N/A')}</div>
-                                <div><strong>Cooldown:</strong> {selected_config.get('cooldown_minutes', 'N/A')} minutes</div>
-                                <div><strong>Active:</strong> {selected_config.get('active', False)}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            
-                            # Display recipients
-                            if 'recipients' in selected_config:
-                                st.markdown("<h4>Recipients</h4>", unsafe_allow_html=True)
-                                
-                                recipients = selected_config['recipients']
-                                if isinstance(recipients, dict):
-                                    # Email recipients
-                                    if 'email_recipients' in recipients and recipients['email_recipients']:
-                                        st.markdown("<strong>Email Recipients:</strong>", unsafe_allow_html=True)
-                                        for email in recipients['email_recipients']:
-                                            st.markdown(f"- {email}")
-                                    
-                                    # SMS recipients
-                                    if 'sms_recipients' in recipients and recipients['sms_recipients']:
-                                        st.markdown("<strong>SMS Recipients:</strong>", unsafe_allow_html=True)
-                                        for phone in recipients['sms_recipients']:
-                                            st.markdown(f"- {phone}")
-                                    
-                                    # Webhook endpoints
-                                    if 'webhook_endpoints' in recipients and recipients['webhook_endpoints']:
-                                        st.markdown("<strong>Webhook Endpoints:</strong>", unsafe_allow_html=True)
-                                        for webhook in recipients['webhook_endpoints']:
-                                            st.markdown(f"- {webhook}")
+                        # Estrai raccomandazioni se disponibili
+                        recommendations = None
+                        
+                        if alert_details:
+                            if alert_details.get("details") and isinstance(alert_details["details"], dict) and alert_details["details"].get("recommendations"):
+                                recommendations = alert_details["details"]["recommendations"]
+                            elif alert_details.get("recommendations"):
+                                if isinstance(alert_details["recommendations"], str):
+                                    try:
+                                        recommendations = json.loads(alert_details["recommendations"])
+                                    except json.JSONDecodeError:
+                                        recommendations = None
                                 else:
-                                    st.info("No recipients information available")
+                                    recommendations = alert_details["recommendations"]
+                        
+                        if recommendations:
+                            # Mostra sezione di raccomandazioni condensata
+                            st.markdown("---")
+                            st.markdown("### Key Recommendations")
                             
-                            # Action buttons
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                if st.button("Edit", use_container_width=True):
-                                    st.session_state.editing_config = selected_config_id
-                                    
-                            with col2:
-                                if st.button("Disable" if selected_config.get('active', False) else "Enable", use_container_width=True):
-                                    st.success(f"Configuration {'disabled' if selected_config.get('active', False) else 'enabled'}")
-                                    # In a real implementation, update the database
+                            # Mostra solo le sezioni più importanti
+                            # 1. Azioni immediate
+                            if "immediate_actions" in recommendations and recommendations["immediate_actions"]:
+                                st.markdown("**Immediate Actions:**")
+                                actions = recommendations["immediate_actions"][:3]  # Limita a 3 per brevità
+                                for action in actions:
+                                    st.markdown(f"- {action}")
+                                if len(recommendations["immediate_actions"]) > 3:
+                                    st.markdown(f"_...and {len(recommendations['immediate_actions']) - 3} more actions_")
+                            
+                            # 2. Metodi di pulizia
+                            if "cleanup_methods" in recommendations and recommendations["cleanup_methods"]:
+                                st.markdown("**Cleanup Methods:**")
+                                methods = recommendations["cleanup_methods"][:3]  # Limita a 3 per brevità
+                                for method in methods:
+                                    st.markdown(f"- {method}")
+                                if len(recommendations["cleanup_methods"]) > 3:
+                                    st.markdown(f"_...and {len(recommendations['cleanup_methods']) - 3} more methods_")
+                            
+                            # 3. Stakeholder da notificare
+                            if "stakeholders_to_notify" in recommendations and recommendations["stakeholders_to_notify"]:
+                                st.markdown("**Key Stakeholders:**")
+                                stakeholders = recommendations["stakeholders_to_notify"][:3]  # Limita a 3 per brevità
+                                for stakeholder in stakeholders:
+                                    st.markdown(f"- {stakeholder}")
+                                if len(recommendations["stakeholders_to_notify"]) > 3:
+                                    st.markdown(f"_...and {len(recommendations['stakeholders_to_notify']) - 3} more stakeholders_")
+                    except Exception as e:
+                        logger.warning(f"Error retrieving recommendations for alert {alert_id}: {e}")
+                    
+                    # Pulsante per visualizzare dettagli completi
+                    st.markdown("---")
+                    if st.button(f"View Complete Details", key=f"btn_{alert_id}"):
+                        st.session_state.selected_alert_id = alert_id
+        else:
+            st.info("No alerts found matching the selected filters.")
+    
+    # Sezione dettagli alert selezionato e raccomandazioni complete
+    if 'selected_alert_id' in st.session_state:
+        st.markdown("<h2 class='sub-header'>Complete Alert Details & Recommendations</h2>", unsafe_allow_html=True)
         
-        # Add new configuration form
-        st.markdown("<h3>Add New Configuration</h3>", unsafe_allow_html=True)
-        
-        with st.form("new_config_form"):
-            # Form layout with two columns
-            form_col1, form_col2 = st.columns(2)
+        try:
+            alert_id = st.session_state.selected_alert_id
+            # Log per debugging
+            logger.info(f"Retrieving details for alert ID: {alert_id}")
             
-            with form_col1:
-                region_id = st.text_input("Region ID (leave empty for global)")
-                
-                severity_level = st.selectbox(
-                    "Severity Level",
-                    options=[None, "high", "medium", "low"],
-                    index=0,
-                    format_func=lambda x: "All" if x is None else x.capitalize()
-                )
-                
-                pollutant_type = st.selectbox(
-                    "Pollutant Type",
-                    options=[None, "oil_spill", "chemical_discharge", "sewage", "algal_bloom", "agricultural_runoff"],
-                    index=0,
-                    format_func=lambda x: "All" if x is None else x.replace("_", " ").capitalize()
-                )
+            # Controlla se l'alert ID è nell'elenco degli alert già recuperati
+            alert_exists = any(a.get("alert_id") == alert_id for a in alerts)
+            logger.info(f"Alert exists in current list: {alert_exists}")
             
-            with form_col2:
-                notification_type = st.selectbox(
-                    "Notification Type",
-                    options=["email", "sms", "webhook"],
-                    index=0
-                )
-                
-                recipients = st.text_area("Recipients (one per line)")
-                
-                cooldown_minutes = st.slider(
-                    "Cooldown (minutes)",
-                    min_value=5,
-                    max_value=120,
-                    value=30,
-                    step=5
-                )
+            # Se l'alert non esiste nella lista corrente, ma abbiamo un ID, prova comunque a recuperare i dettagli
+            alert_details = clients["postgres"].get_alert_details(alert_id)
             
-            # Submit button
-            submitted = st.form_submit_button("Add Configuration", use_container_width=True)
-            
-            if submitted:
-                st.success("Configuration added successfully!")
-                # In a real implementation, save to the database
+            if alert_details:
+                # Layout dettagli in 2 colonne
+                detail_col1, detail_col2 = st.columns(2)
+                
+                with detail_col1:
+                    st.markdown("<div class='card'>", unsafe_allow_html=True)
+                    st.markdown("<h3>Alert Information</h3>", unsafe_allow_html=True)
+                    
+                    # Formatta alert_time
+                    alert_time = alert_details.get("alert_time", "")
+                    if isinstance(alert_time, str) and "T" in alert_time:
+                        alert_time_display = alert_time.replace("T", " ").split(".")[0]
+                    else:
+                        alert_time_display = str(alert_time)
+                    
+                    # Dettagli generali dell'alert
+                    st.markdown(f"**ID:** {alert_details.get('alert_id', 'N/A')}")
+                    st.markdown(f"**Type:** {alert_details.get('pollutant_type', 'N/A')}")
+                    st.markdown(f"**Severity:** {alert_details.get('severity', 'N/A')}")
+                    st.markdown(f"**Status:** {alert_details.get('status', 'N/A')}")
+                    st.markdown(f"**Time:** {alert_time_display}")
+                    st.markdown(f"**Message:** {alert_details.get('message', 'N/A')}")
+                    
+                    if alert_details.get("latitude") and alert_details.get("longitude"):
+                        st.markdown(f"**Location:** Lat {float(alert_details['latitude']):.5f}, Lon {float(alert_details['longitude']):.5f}")
+                    
+                    st.markdown(f"**Risk Score:** {alert_details.get('risk_score', 'N/A')}")
+                    
+                    # Informazioni aggiuntive se disponibili
+                    if alert_details.get("parent_hotspot_id"):
+                        st.markdown(f"**Parent Hotspot:** {alert_details['parent_hotspot_id']}")
+                    if alert_details.get("derived_from"):
+                        st.markdown(f"**Derived From:** {alert_details['derived_from']}")
+                    if alert_details.get("supersedes"):
+                        st.markdown(f"**Supersedes Alert:** {alert_details['supersedes']}")
+                    
+                    st.markdown("</div>", unsafe_allow_html=True)
+                
+                with detail_col2:
+                    # Mappa dettagliata della posizione se ci sono coordinate
+                    if alert_details.get("latitude") and alert_details.get("longitude"):
+                        # Crea mappa
+                        lat = float(alert_details["latitude"])
+                        lon = float(alert_details["longitude"])
+                        detail_map = folium.Map(location=[lat, lon], zoom_start=10)
+                        
+                        # Aggiungi marker
+                        severity = alert_details.get("severity", "low")
+                        color = {"high": "red", "medium": "orange", "low": "green"}.get(severity, "blue")
+                        
+                        folium.Marker(
+                            location=[lat, lon],
+                            popup=alert_details.get("message", "Alert"),
+                            icon=folium.Icon(color=color, icon="info-sign")
+                        ).add_to(detail_map)
+                        
+                        # Aggiungi cerchio per indicare l'area approssimativa
+                        folium.Circle(
+                            location=[lat, lon],
+                            radius=1000,  # 1km di default
+                            color=color,
+                            fill=True,
+                            fill_opacity=0.2
+                        ).add_to(detail_map)
+                        
+                        folium_static(detail_map)
+                    else:
+                        st.warning("No location data available for this alert.")
+                
+                # Raccomandazioni (se disponibili)
+                recommendations = None
+                
+                # Verifica se ci sono raccomandazioni nei dettagli dell'alert
+                if alert_details.get("details") and isinstance(alert_details["details"], dict) and alert_details["details"].get("recommendations"):
+                    recommendations = alert_details["details"]["recommendations"]
+                elif alert_details.get("recommendations"):
+                    if isinstance(alert_details["recommendations"], str):
+                        try:
+                            recommendations = json.loads(alert_details["recommendations"])
+                        except json.JSONDecodeError:
+                            recommendations = None
+                    else:
+                        recommendations = alert_details["recommendations"]
+                
+                if recommendations:
+                    st.markdown("<h3>Intervention Recommendations</h3>", unsafe_allow_html=True)
+                    
+                    # Layout raccomandazioni in 3 colonne
+                    rec_col1, rec_col2, rec_col3 = st.columns(3)
+                    
+                    with rec_col1:
+                        st.markdown("<div class='card'>", unsafe_allow_html=True)
+                        st.markdown("<h4>Immediate Actions</h4>", unsafe_allow_html=True)
+                        
+                        if "immediate_actions" in recommendations and recommendations["immediate_actions"]:
+                            for action in recommendations["immediate_actions"]:
+                                st.markdown(f"- {action}")
+                        else:
+                            st.markdown("No immediate actions specified")
+                        
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    with rec_col2:
+                        st.markdown("<div class='card'>", unsafe_allow_html=True)
+                        st.markdown("<h4>Resource Requirements</h4>", unsafe_allow_html=True)
+                        
+                        if "resource_requirements" in recommendations and recommendations["resource_requirements"]:
+                            resources = recommendations["resource_requirements"]
+                            for resource_key, resource_value in resources.items():
+                                st.markdown(f"**{resource_key.title()}:** {resource_value}")
+                        else:
+                            st.markdown("No resource requirements specified")
+                        
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    with rec_col3:
+                        st.markdown("<div class='card'>", unsafe_allow_html=True)
+                        st.markdown("<h4>Cleanup Methods</h4>", unsafe_allow_html=True)
+                        
+                        if "cleanup_methods" in recommendations and recommendations["cleanup_methods"]:
+                            for method in recommendations["cleanup_methods"]:
+                                st.markdown(f"- {method}")
+                        else:
+                            st.markdown("No cleanup methods specified")
+                        
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    # Seconda riga di raccomandazioni
+                    rec_col4, rec_col5 = st.columns(2)
+                    
+                    with rec_col4:
+                        st.markdown("<div class='card'>", unsafe_allow_html=True)
+                        st.markdown("<h4>Stakeholders to Notify</h4>", unsafe_allow_html=True)
+                        
+                        if "stakeholders_to_notify" in recommendations and recommendations["stakeholders_to_notify"]:
+                            for stakeholder in recommendations["stakeholders_to_notify"]:
+                                st.markdown(f"- {stakeholder}")
+                        else:
+                            st.markdown("No stakeholders specified")
+                        
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    with rec_col5:
+                        st.markdown("<div class='card'>", unsafe_allow_html=True)
+                        st.markdown("<h4>Regulatory Implications</h4>", unsafe_allow_html=True)
+                        
+                        if "regulatory_implications" in recommendations and recommendations["regulatory_implications"]:
+                            for implication in recommendations["regulatory_implications"]:
+                                st.markdown(f"- {implication}")
+                        else:
+                            st.markdown("No regulatory implications specified")
+                        
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    # Sezione di valutazione dell'impatto ambientale
+                    if "environmental_impact_assessment" in recommendations and recommendations["environmental_impact_assessment"]:
+                        st.markdown("<h4>Environmental Impact Assessment</h4>", unsafe_allow_html=True)
+                        
+                        impact = recommendations["environmental_impact_assessment"]
+                        impact_cols = st.columns(3)
+                        
+                        with impact_cols[0]:
+                            st.markdown("<div class='card'>", unsafe_allow_html=True)
+                            st.markdown(f"**Estimated Area Affected:** {impact.get('estimated_area_affected', 'N/A')}")
+                            st.markdown(f"**Expected Duration:** {impact.get('expected_duration', 'N/A')}")
+                            st.markdown("</div>", unsafe_allow_html=True)
+                        
+                        with impact_cols[1]:
+                            st.markdown("<div class='card'>", unsafe_allow_html=True)
+                            st.markdown(f"**Wildlife Impact:** {impact.get('potential_wildlife_impact', 'N/A')}")
+                            st.markdown(f"**Recovery Time:** {impact.get('water_quality_recovery', 'N/A')}")
+                            st.markdown("</div>", unsafe_allow_html=True)
+                        
+                        with impact_cols[2]:
+                            st.markdown("<div class='card'>", unsafe_allow_html=True)
+                            st.markdown("**Sensitive Habitats Affected:**")
+                            if "sensitive_habitats_affected" in impact and impact["sensitive_habitats_affected"]:
+                                for habitat in impact["sensitive_habitats_affected"]:
+                                    st.markdown(f"- {habitat}")
+                            else:
+                                st.markdown("None specified")
+                            st.markdown("</div>", unsafe_allow_html=True)
+                else:
+                    st.warning("No recommendations available for this alert")
+            else:
+                st.error(f"Alert with ID {alert_id} not found")
+                
+                # Per aiutare a debuggare, aggiungiamo un suggerimento sulla possibile causa
+                st.info("This alert may no longer be active or might have been superseded by a more recent alert.")
+        except Exception as e:
+            st.error(f"Error retrieving alert details: {e}")
+            logger.error(f"Exception in alert details: {e}")
