@@ -98,6 +98,50 @@ def safe_redis_operation(func, *args, default_value=None, log_error=True, **kwar
             logger.warning(f"Errore nell'operazione Redis {func.__name__}: {e}")
         return default_value
 
+def cleanup_expired_alerts(redis_conn):
+    """Rimuove gli alert scaduti dalle strutture dati attive"""
+    try:
+        # Ottieni tutti gli alert nel sorted set
+        alerts = safe_redis_operation(redis_conn.zrange, "dashboard:alerts:active", 0, -1, withscores=True)
+        if not alerts:
+            return
+            
+        # Rimuovi alert più vecchi di ALERTS_TTL (1 ora)
+        current_time = int(time.time() * 1000)
+        cutoff_time = current_time - (ALERTS_TTL * 1000)
+        
+        # Raccogli alert da rimuovere
+        alerts_to_remove = []
+        for alert_id, timestamp in alerts:
+            if isinstance(alert_id, bytes):
+                alert_id = alert_id.decode('utf-8')
+            if timestamp < cutoff_time:
+                alerts_to_remove.append(alert_id)
+        
+        # Rimuovi alert scaduti
+        if alerts_to_remove:
+            for alert_id in alerts_to_remove:
+                safe_redis_operation(redis_conn.zrem, "dashboard:alerts:active", alert_id)
+            
+            logger.info(f"Rimossi {len(alerts_to_remove)} alert scaduti")
+            
+            # Aggiorna contatore
+            sync_alert_counter(redis_conn)
+    except Exception as e:
+        logger.error(f"Errore nella pulizia degli alert scaduti: {e}")
+
+def sync_alert_counter(redis_conn):
+    """Sincronizza il contatore degli alert con il numero effettivo"""
+    try:
+        # Conta gli alert attivi
+        active_count = safe_redis_operation(redis_conn.zcard, "dashboard:alerts:active", default_value=0)
+        
+        # Aggiorna il contatore
+        safe_redis_operation(redis_conn.set, "counters:alerts:active", active_count)
+        logger.info(f"Contatore alert sincronizzato: {active_count} alert attivi")
+    except Exception as e:
+        logger.error(f"Errore nella sincronizzazione del contatore alert: {e}")
+
 def process_sensor_data(data, redis_conn):
     """Processa dati dai sensori per dashboard"""
     try:
@@ -467,10 +511,19 @@ def process_alert(data, redis_conn):
             
         # Estrai ID o genera se non presente
         alert_id = data.get('alert_id', f"alert_{data['hotspot_id']}_{int(time.time())}")
+        hotspot_id = data['hotspot_id']
         
         # Estrai campi di relazione con valori default
         parent_hotspot_id = sanitize_value(data.get('parent_hotspot_id', ''))
         derived_from = sanitize_value(data.get('derived_from', ''))
+        
+        # Estrai tipo di alert
+        if data.get('is_update', False):
+            alert_type = "update"
+        elif data.get('severity_changed', False):
+            alert_type = "severity_change"
+        else:
+            alert_type = "new"
         
         # Preparazione dati alert
         alert_data = {
@@ -483,18 +536,37 @@ def process_alert(data, redis_conn):
             'longitude': location['center_longitude'],
             'processed': 'false',
             'parent_hotspot_id': parent_hotspot_id,
-            'derived_from': derived_from
+            'derived_from': derived_from,
+            'alert_type': alert_type
         }
         
         # Crea messaggio di alert
-        if data.get('is_update', False):
-            alert_type = "updated"
-        elif data.get('severity_changed', False):
-            alert_type = "increased severity"
-        else:
-            alert_type = "new"
-            
         alert_data['message'] = f"{data.get('severity', 'low').upper()} {data.get('pollutant_type', 'unknown')} ({alert_type})"
+        
+        # Estrai raccomandazioni se presenti
+        if 'recommendations' in data:
+            alert_data['has_recommendations'] = 'true'
+            recommendations_key = f"recommendations:{alert_id}"
+            safe_redis_operation(redis_conn.set, recommendations_key, json.dumps(data['recommendations']), ex=ALERTS_TTL)
+        else:
+            alert_data['has_recommendations'] = 'false'
+        
+        # Se è un aggiornamento, rimuovi gli alert precedenti per lo stesso hotspot
+        if alert_type in ['update', 'severity_change']:
+            # Trova tutti gli alert attivi per questo hotspot
+            active_alerts = safe_redis_operation(redis_conn.zrange, "dashboard:alerts:active", 0, -1)
+            for active_alert_id_bytes in active_alerts:
+                active_alert_id = active_alert_id_bytes.decode('utf-8') if isinstance(active_alert_id_bytes, bytes) else active_alert_id_bytes
+                
+                # Ottieni i dati di questo alert
+                active_alert_key = f"alert:{active_alert_id}"
+                active_alert_hotspot_id = safe_redis_operation(redis_conn.hget, active_alert_key, "hotspot_id")
+                active_alert_hotspot_id = active_alert_hotspot_id.decode('utf-8') if isinstance(active_alert_hotspot_id, bytes) else active_alert_hotspot_id
+                
+                # Se appartiene allo stesso hotspot ma è un alert diverso, rimuovilo
+                if active_alert_hotspot_id == hotspot_id and active_alert_id != alert_id:
+                    safe_redis_operation(redis_conn.zrem, "dashboard:alerts:active", active_alert_id)
+                    logger.info(f"Rimosso alert obsoleto {active_alert_id} per hotspot {hotspot_id}")
         
         # Hash con dettagli alert
         alert_key = f"alert:{alert_id}"
@@ -504,6 +576,9 @@ def process_alert(data, redis_conn):
         # Lista ordinata di alert attivi
         timestamp = int(sanitize_value(data.get('detected_at', time.time() * 1000)))
         safe_redis_operation(redis_conn.zadd, "dashboard:alerts:active", {alert_id: timestamp})
+        
+        # Imposta TTL anche sul sorted set di alert attivi
+        safe_redis_operation(redis_conn.expire, "dashboard:alerts:active", ALERTS_TTL)
         
         # Set per severità
         severity = sanitize_value(data.get('severity', 'low'))
@@ -517,7 +592,8 @@ def process_alert(data, redis_conn):
                 'severity': sanitize_value(data.get('severity', 'low')),
                 'timestamp': sanitize_value(data.get('detected_at', int(time.time() * 1000))),
                 'parent_hotspot_id': parent_hotspot_id,
-                'derived_from': derived_from
+                'derived_from': derived_from,
+                'has_recommendations': 'recommendations' in data
             })
             safe_redis_operation(redis_conn.lpush, "dashboard:notifications", notification)
             safe_redis_operation(redis_conn.ltrim, "dashboard:notifications", 0, 19)  # Mantieni solo le ultime 20
@@ -529,18 +605,8 @@ def process_alert(data, redis_conn):
         safe_redis_operation(redis_conn.expire, f"dashboard:alerts:by_severity:{severity}", ALERTS_TTL)
         safe_redis_operation(redis_conn.expire, "dashboard:notifications", ALERTS_TTL)
         
-        # Aggiorna contatori
-        alert_total_exists = safe_redis_operation(redis_conn.exists, "counters:alerts:total", default_value=False)
-        if not alert_total_exists:
-            safe_redis_operation(redis_conn.set, "counters:alerts:total", 1)
-        else:
-            safe_redis_operation(redis_conn.incr, "counters:alerts:total")
-            
-        alert_active_exists = safe_redis_operation(redis_conn.exists, "counters:alerts:active", default_value=False)
-        if not alert_active_exists:
-            safe_redis_operation(redis_conn.set, "counters:alerts:active", 1)
-        else:
-            safe_redis_operation(redis_conn.incr, "counters:alerts:active")
+        # Ricalcola contatori dopo la pulizia degli alert obsoleti
+        sync_alert_counter(redis_conn)
         
         logger.info(f"Salvato alert {alert_id} in Redis")
     except Exception as e:
@@ -639,8 +705,9 @@ def main():
     
     logger.info("Dashboard Consumer avviato - in attesa di messaggi...")
     
-    # Timer per aggiornamento periodico dashboard
+    # Timer per aggiornamento periodico dashboard e pulizia
     last_summary_update = 0
+    last_cleanup = 0
     
     try:
         for message in consumer:
@@ -668,6 +735,11 @@ def main():
                 if current_time - last_summary_update > 60:
                     update_dashboard_summary(redis_conn)
                     last_summary_update = current_time
+                    
+                # Pulizia periodica degli alert (ogni 5 minuti)
+                if current_time - last_cleanup > 300:
+                    cleanup_expired_alerts(redis_conn)
+                    last_cleanup = current_time
                 
             except Exception as e:
                 logger.error(f"Errore elaborazione messaggio da {topic}: {e}")

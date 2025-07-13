@@ -316,16 +316,11 @@ class AlertExtractor(MapFunction):
                 
                 logger.info(f"[ALERT CHECK] Checking hotspot: severity={severity}, avg_risk={avg_risk}, is_update={is_update}")
                 
-                # Filter updates that aren't significant
-                if is_update and not (is_significant or severity_changed):
-                    logger.info(f"[ALERT FILTERED] Hotspot update {hotspot_id} isn't significant, skipping")
-                    return None
-                
-                # Check cooldown if Redis is available
-                if self.redis_client and is_update:
+                # Check cooldown for ALL hotspots, not just updates
+                if self.redis_client:
                     cooldown_key = alert_cooldown_key(hotspot_id)
                     
-                    # Skip if in cooldown (only for updates, not new hotspots)
+                    # Skip if in cooldown (for ANY hotspot)
                     if self.redis_client.exists(cooldown_key):
                         logger.info(f"[ALERT FILTERED] Hotspot {hotspot_id} is in cooldown period, skipping")
                         return None

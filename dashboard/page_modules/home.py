@@ -13,6 +13,7 @@ def show_home_page(clients):
     # Get clients
     redis_client = clients["redis"]
     timescale_client = clients["timescale"]
+    postgres_client = clients["postgres"]  # Added to access alerts with recommendations
     
     # Get dashboard summary from Redis
     summary = redis_client.get_dashboard_summary()
@@ -70,7 +71,7 @@ def show_home_page(clients):
         st.markdown("<h2 class='sub-header'>Critical Hotspots</h2>", unsafe_allow_html=True)
         
         # Get top hotspots
-        top_hotspots = redis_client.get_top_hotspots(count=5)
+        top_hotspots = redis_client.get_top_hotspots(count=20)
         
         if top_hotspots:
             # Create DataFrame for plotting with improved validation
@@ -231,6 +232,85 @@ def show_home_page(clients):
                 """, unsafe_allow_html=True)
         else:
             st.info("No recent alerts")
+        
+        # NUOVA SEZIONE: Critical Response Actions
+        st.markdown("<h2 class='sub-header'>Critical Response Actions</h2>", unsafe_allow_html=True)
+        
+        # Add CSS for recommended actions
+        st.markdown("""
+        <style>
+        .immediate-action {
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            background-color: #fee2e2;
+            border-left: 4px solid #ef4444;
+        }
+        .resource-note {
+            padding: 6px 10px;
+            margin-top: 4px;
+            font-size: 0.85em;
+            color: #4b5563;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Get recent active alerts with high severity from PostgreSQL
+        critical_alerts = postgres_client.get_alerts(
+            limit=3, 
+            days=1, 
+            severity_filter=["high", "medium"],
+            status_filter=["active"]
+        )
+        
+        if critical_alerts:
+            for alert in critical_alerts:
+                severity = alert.get('severity', 'medium')
+                pollutant_type = alert.get('pollutant_type', 'unknown')
+                
+                # Extract recommendations from alert
+                recommendations = None
+                
+                # Check recommendations directly
+                if 'recommendations' in alert:
+                    recommendations = alert['recommendations']
+                    
+                # Check in details if available
+                elif 'details' in alert and isinstance(alert['details'], dict):
+                    recommendations = alert['details'].get('recommendations')
+                
+                # Try to parse if it's a string
+                if isinstance(recommendations, str):
+                    try:
+                        recommendations = json.loads(recommendations)
+                    except:
+                        recommendations = None
+                
+                # Display immediate actions if available
+                if recommendations and isinstance(recommendations, dict) and 'immediate_actions' in recommendations:
+                    st.markdown(f"""
+                    <div class='card'>
+                        <div><span class='status-{severity}'>{severity.upper()}</span> - {pollutant_type.replace('_', ' ').title()}</div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Display only the first 3 immediate actions to save space
+                    immediate_actions = recommendations['immediate_actions'][:3]
+                    for action in immediate_actions:
+                        st.markdown(f"<div class='immediate-action'>{action}</div>", unsafe_allow_html=True)
+                    
+                    # Display resource note if available
+                    if 'resource_requirements' in recommendations and 'personnel' in recommendations['resource_requirements']:
+                        personnel = recommendations['resource_requirements']['personnel']
+                        st.markdown(f"<div class='resource-note'>Resources needed: {personnel}</div>", unsafe_allow_html=True)
+                    
+                    st.markdown("</div>", unsafe_allow_html=True)
+                    
+                    # Add a link to view full details
+                    alert_id = alert.get('alert_id', '')
+                    if alert_id:
+                        st.markdown(f"<div style='text-align: right; margin-top: -8px; margin-bottom: 12px;'><a href='?page=alerts&alert={alert_id}'>View full details</a></div>", unsafe_allow_html=True)
+        else:
+            st.info("No critical alerts requiring immediate action")
         
         # Upcoming predictions
         st.markdown("<h2 class='sub-header'>Upcoming Critical Predictions</h2>", unsafe_allow_html=True)

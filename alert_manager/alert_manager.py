@@ -4,6 +4,7 @@ import time
 import uuid
 import logging
 import redis
+import requests
 import psycopg2
 from psycopg2.extras import Json
 from datetime import datetime
@@ -41,6 +42,12 @@ EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "password")
 HIGH_PRIORITY_RECIPIENTS = os.environ.get("HIGH_PRIORITY_RECIPIENTS", "").split(",")
 MEDIUM_PRIORITY_RECIPIENTS = os.environ.get("MEDIUM_PRIORITY_RECIPIENTS", "").split(",")
 LOW_PRIORITY_RECIPIENTS = os.environ.get("LOW_PRIORITY_RECIPIENTS", "").split(",")
+
+# Configurazione webhook
+WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "false").lower() == "true"
+HIGH_PRIORITY_WEBHOOK = os.environ.get("HIGH_PRIORITY_WEBHOOK", "")
+MEDIUM_PRIORITY_WEBHOOK = os.environ.get("MEDIUM_PRIORITY_WEBHOOK", "")
+LOW_PRIORITY_WEBHOOK = os.environ.get("LOW_PRIORITY_WEBHOOK", "")
 
 def connect_postgres():
     """Crea connessione a PostgreSQL"""
@@ -99,6 +106,198 @@ def load_notification_config(postgres_conn):
         logger.error(f"Errore caricamento configurazioni notifica: {e}")
         return []
 
+def generate_intervention_recommendations(data):
+    """Genera raccomandazioni specifiche per interventi basate sul tipo e severità dell'inquinamento"""
+    pollutant_type = data.get("pollutant_type", "unknown")
+    severity = data.get("severity", "low")
+    location = data.get("location", {})
+    risk_score = data.get("max_risk_score", 0.5)
+    
+    recommendations = {
+        "immediate_actions": [],
+        "resource_requirements": {},
+        "stakeholders_to_notify": [],
+        "regulatory_implications": [],
+        "environmental_impact_assessment": {},
+        "cleanup_methods": []
+    }
+    
+    # Raccomandazioni basate sul tipo di inquinante
+    if pollutant_type == "oil_spill":
+        recommendations["immediate_actions"] = [
+            "Deploy containment booms to prevent spreading",
+            "Activate oil spill response team",
+            "Notify coastal communities within 5km radius",
+            "Implement shoreline protection measures if near coast"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "15-20 trained responders",
+            "equipment": "Class B oil containment kit, 3 skimmers, absorbent materials",
+            "vessels": "2 response boats, 1 support vessel",
+            "supplies": "500m oil boom, dispersant if approved by authorities"
+        }
+        recommendations["cleanup_methods"] = ["mechanical_recovery", "dispersants_if_approved", "in_situ_burning", "shoreline_cleanup"]
+        
+    elif pollutant_type == "chemical_discharge":
+        recommendations["immediate_actions"] = [
+            "Identify chemical composition if unknown",
+            "Establish safety perimeter based on chemical type",
+            "Deploy specialized containment equipment",
+            "Prevent water intake in affected area"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "10-15 hazmat-trained responders",
+            "equipment": "Chemical neutralizing agents, specialized containment",
+            "vessels": "1 response vessel with hazmat capability",
+            "supplies": "pH buffers, neutralizing agents, chemical absorbents"
+        }
+        recommendations["cleanup_methods"] = ["neutralization", "extraction", "activated_carbon", "aeration"]
+
+    elif pollutant_type == "algal_bloom":
+        recommendations["immediate_actions"] = [
+            "Test for toxin-producing species",
+            "Implement public health advisories if needed",
+            "Monitor dissolved oxygen levels",
+            "Restrict recreational activities in affected area"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "5-10 water quality specialists",
+            "equipment": "Water testing kits, aeration systems",
+            "vessels": "2 monitoring vessels",
+            "supplies": "Algaecide (if permitted), aeration equipment"
+        }
+        recommendations["cleanup_methods"] = ["aeration", "nutrient_management", "algaecide_if_approved", "ultrasonic_treatment"]
+
+    elif pollutant_type == "sewage":
+        recommendations["immediate_actions"] = [
+            "Issue public health warning for affected area",
+            "Test for pathogenic bacteria",
+            "Identify source of discharge",
+            "Notify drinking water authorities"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "8-12 water quality and public health specialists",
+            "equipment": "Disinfection equipment, bacterial testing kits",
+            "vessels": "1 sampling vessel",
+            "supplies": "Chlorine or UV disinfection equipment"
+        }
+        recommendations["cleanup_methods"] = ["disinfection", "biological_treatment", "aeration", "filtration"]
+
+    elif pollutant_type == "agricultural_runoff":
+        recommendations["immediate_actions"] = [
+            "Monitor for fertilizer and pesticide concentrations",
+            "Check for fish kill risk",
+            "Assess nutrient loading",
+            "Identify source farms"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "5-8 environmental specialists",
+            "equipment": "Nutrient testing kits, water samplers",
+            "vessels": "1 monitoring vessel",
+            "supplies": "Buffer zone materials, erosion control"
+        }
+        recommendations["cleanup_methods"] = ["wetland_filtration", "buffer_zones", "phytoremediation", "soil_erosion_control"]
+    
+    else:  # unknown or other
+        recommendations["immediate_actions"] = [
+            "Conduct comprehensive water quality testing",
+            "Deploy monitoring buoys around affected area",
+            "Collect water and sediment samples",
+            "Document visual observations with photos/video"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "5-10 environmental response specialists",
+            "equipment": "Multi-parameter testing kits, sampling equipment",
+            "vessels": "1-2 monitoring vessels",
+            "supplies": "Sample containers, documentation equipment"
+        }
+        recommendations["cleanup_methods"] = ["monitoring", "containment", "assessment", "targeted_intervention"]
+    
+    # Adatta raccomandazioni basate sulla severità
+    if severity == "high":
+        recommendations["stakeholders_to_notify"].extend([
+            "Environmental Protection Agency",
+            "Coast Guard",
+            "Local Government Emergency Response",
+            "Fisheries and Wildlife Department",
+            "Public Health Authority",
+            "Water Management Authority"
+        ])
+        recommendations["regulatory_implications"] = [
+            "Mandatory reporting to environmental authorities within 24 hours",
+            "Potential penalties under Clean Water Act",
+            "Documentation requirements for affected area and response actions",
+            "Possible long-term monitoring requirements"
+        ]
+    elif severity == "medium":
+        recommendations["stakeholders_to_notify"].extend([
+            "Local Environmental Agency",
+            "Water Management Authority",
+            "Local Government"
+        ])
+        recommendations["regulatory_implications"] = [
+            "Documentation of incident and response actions",
+            "Potential monitoring requirements",
+            "Notification to local authorities"
+        ]
+    else:  # low
+        recommendations["stakeholders_to_notify"].extend([
+            "Local Environmental Monitoring Office"
+        ])
+        recommendations["regulatory_implications"] = [
+            "Standard documentation for minor incidents",
+            "Inclusion in routine monitoring reports"
+        ]
+    
+    # Valutazione dell'impatto
+    affected_area = risk_score * 10
+    recommendations["environmental_impact_assessment"] = {
+        "estimated_area_affected": f"{affected_area:.1f} km²",
+        "expected_duration": "3-5 days" if severity == "low" else "1-2 weeks" if severity == "medium" else "2-4 weeks",
+        "sensitive_habitats_affected": ["coral_reefs", "mangroves", "seagrass_beds"] if severity == "high" else 
+                                      ["shoreline", "nearshore_waters"] if severity == "medium" else [],
+        "potential_wildlife_impact": "High - immediate intervention required" if severity == "high" else
+                                    "Moderate - monitoring required" if severity == "medium" else
+                                    "Low - standard protocols sufficient",
+        "water_quality_recovery": "1-2 months" if severity == "high" else
+                                 "2-3 weeks" if severity == "medium" else
+                                 "3-7 days"
+    }
+    
+    return recommendations
+
+def send_intervention_webhook(alert_data, recommendations):
+    """Invia dati a sistemi esterni di intervento via webhook"""
+    if not WEBHOOK_ENABLED:
+        return False
+    
+    webhook_urls = {
+        "high": HIGH_PRIORITY_WEBHOOK,
+        "medium": MEDIUM_PRIORITY_WEBHOOK,
+        "low": LOW_PRIORITY_WEBHOOK
+    }
+    
+    severity = alert_data.get("severity", "low")
+    webhook_url = webhook_urls.get(severity, "")
+    
+    if not webhook_url:
+        return False
+    
+    payload = {
+        "alert": alert_data,
+        "recommendations": recommendations,
+        "timestamp": int(time.time() * 1000),
+        "source": "marine_pollution_monitoring_system"
+    }
+    
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=10)
+        logger.info(f"Webhook sent to {webhook_url}: {response.status_code}")
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Error sending webhook: {e}")
+        return False
+
 def process_alert(data, postgres_conn, redis_conn, notification_configs):
     """Processa alert e invia notifiche"""
     try:
@@ -130,7 +329,9 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 WHERE source_id = %s AND alert_time > NOW() - INTERVAL '30 minutes'
             """, (hotspot_id,))
             recent_alert = cur.fetchone()
-            if recent_alert and data.get('is_update', False) and not data.get('severity_changed', False):
+            
+            # Skip QUALSIASI alert se c'è un alert recente per questo hotspot
+            if recent_alert:
                 logger.info(f"Alert recente già presente per hotspot {hotspot_id}, skippiamo")
                 return
         
@@ -149,6 +350,9 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
         
         # Crea messaggio
         message = generate_alert_message(data, alert_type)
+        
+        # Genera raccomandazioni di intervento
+        recommendations = generate_intervention_recommendations(data)
         
         # Filtra configurazioni applicabili
         applicable_configs = filter_notification_configs(notification_configs, severity, pollutant_type, region_id)
@@ -203,6 +407,16 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                     "status": "delivered"
                 })
         
+        # Invia webhook se abilitato
+        webhook_sent = False
+        if WEBHOOK_ENABLED:
+            webhook_sent = send_intervention_webhook(data, recommendations)
+            if webhook_sent:
+                notifications_sent["webhook"] = [{
+                    "sent_at": int(time.time() * 1000),
+                    "status": "delivered"
+                }]
+        
         # Arricchisci i dettagli con informazioni di relazione
         details = dict(data)
         if parent_hotspot_id:
@@ -210,14 +424,45 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
         if derived_from:
             details['derived_from'] = derived_from
         
+        # Aggiungi le raccomandazioni ai dettagli
+        details['recommendations'] = recommendations
+        
+        # Marcare alert precedenti come sostituiti prima di inserire il nuovo
+        with postgres_conn.cursor() as cur:
+            # Trova e aggiorna gli alert precedenti per questo hotspot
+            cur.execute("""
+                UPDATE pollution_alerts
+                SET status = 'superseded', superseded_by = %s
+                WHERE source_id = %s AND status = 'active' AND alert_id != %s
+            """, (alert_id, hotspot_id, alert_id))
+            
+            updated_rows = cur.rowcount
+            if updated_rows > 0:
+                logger.info(f"Marcati {updated_rows} alert precedenti come 'superseded'")
+        
         # Salva alert nel database con stato di notifica
         with postgres_conn.cursor() as cur:
+            # Verifica prima se la tabella ha i nuovi campi status e superseded_by
+            # Se non esistono, li crea
+            try:
+                cur.execute("""
+                    ALTER TABLE pollution_alerts 
+                    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
+                    ADD COLUMN IF NOT EXISTS superseded_by TEXT DEFAULT NULL
+                """)
+                postgres_conn.commit()
+                logger.info("Verificata presenza dei campi status e superseded_by nella tabella pollution_alerts")
+            except Exception as e:
+                logger.warning(f"Errore nella verifica/creazione colonne: {e}")
+                postgres_conn.rollback()
+            
+            # Ora inserisci l'alert con i campi di raccomandazione
             cur.execute("""
                 INSERT INTO pollution_alerts (
                     alert_id, source_id, source_type, alert_type, alert_time,
                     severity, latitude, longitude, pollutant_type, risk_score,
-                    message, details, processed, notifications_sent
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    message, details, processed, notifications_sent, status, recommendations
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (alert_id) DO NOTHING
             """, (
                 alert_id,
@@ -232,12 +477,14 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 data['max_risk_score'],
                 message,
                 Json(details),
-                True,  # processed
-                Json(notifications_sent)
+                False,  # processed - impostato a False per nuovo alert
+                Json(notifications_sent),
+                'active',  # status
+                Json(recommendations)  # recommendations
             ))
             
             postgres_conn.commit()
-            logger.info(f"Alert {alert_id} salvato e processato")
+            logger.info(f"Alert {alert_id} salvato con raccomandazioni di intervento")
     
     except Exception as e:
         postgres_conn.rollback()

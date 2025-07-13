@@ -36,7 +36,10 @@ CREATE TABLE IF NOT EXISTS pollution_alerts (
     details JSONB,
     processed BOOLEAN DEFAULT FALSE,
     notifications_sent JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    status TEXT DEFAULT 'active',      -- Stato dell'alert (active, superseded, etc.)
+    superseded_by TEXT DEFAULT NULL,   -- ID dell'alert che ha sostituito questo
+    recommendations JSONB              -- Raccomandazioni di intervento
 );
 
 CREATE INDEX IF NOT EXISTS idx_pollution_alerts_source ON pollution_alerts(source_id);
@@ -45,6 +48,8 @@ CREATE INDEX IF NOT EXISTS idx_pollution_alerts_severity ON pollution_alerts(sev
 CREATE INDEX IF NOT EXISTS idx_pollution_alerts_processed ON pollution_alerts(processed);
 CREATE INDEX IF NOT EXISTS idx_pollution_alerts_parent ON pollution_alerts(parent_hotspot_id);
 CREATE INDEX IF NOT EXISTS idx_pollution_alerts_derived ON pollution_alerts(derived_from);
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_status ON pollution_alerts(status);
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_superseded ON pollution_alerts(superseded_by);
 
 -- Tabella per configurazione notifiche
 CREATE TABLE IF NOT EXISTS alert_notification_config (

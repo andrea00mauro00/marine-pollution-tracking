@@ -126,8 +126,8 @@ class PostgresClient:
     
     # ===== ALERT METHODS =====
     
-    def get_alerts(self, limit=100, days=7):
-        """Get alerts from the database"""
+    def get_alerts(self, limit=100, days=7, severity_filter=None, status_filter=None):
+        """Get alerts from the database with optional severity and status filters"""
         if not self.is_connected() and not self.reconnect():
             return []
         
@@ -138,14 +138,28 @@ class PostgresClient:
                 
                 query = """
                 SELECT alert_id, source_id, source_type, alert_type, alert_time,
-                       severity, latitude, longitude, pollutant_type, risk_score,
-                       message, parent_hotspot_id, derived_from, processed
+                    severity, latitude, longitude, pollutant_type, risk_score,
+                    message, parent_hotspot_id, derived_from, processed
                 FROM pollution_alerts
                 WHERE alert_time > %s
-                ORDER BY alert_time DESC
-                LIMIT %s
                 """
-                cursor.execute(query, (date_from, limit))
+                
+                params = [date_from]
+                
+                # Add severity filter if provided
+                if severity_filter:
+                    query += " AND severity = %s"
+                    params.append(severity_filter)
+                    
+                # Add status filter if provided
+                if status_filter:
+                    query += " AND status = %s"
+                    params.append(status_filter)
+                
+                query += " ORDER BY alert_time DESC LIMIT %s"
+                params.append(limit)
+                
+                cursor.execute(query, tuple(params))
                 alerts = cursor.fetchall()
                 
                 # Convert timestamps
@@ -193,6 +207,10 @@ class PostgresClient:
         except Exception as e:
             logging.error(f"Error getting alert details: {e}")
             return None
+        
+    def get_alert_by_id(self, alert_id):
+        """Alias for get_alert_details for backwards compatibility"""
+        return self.get_alert_details(alert_id)
     
     def get_alert_counts_by_severity(self, days=7):
         """Get alert counts grouped by severity"""
