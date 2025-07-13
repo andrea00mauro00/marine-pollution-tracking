@@ -83,7 +83,7 @@ def show_map_page(clients):
         
         # Map zoom and center controls
         st.markdown("#### View Settings")
-        zoom_level = st.slider("Zoom Level", 4, 15, 7)
+        zoom_level = st.slider("Zoom Level", 2, 15, 5)  # Start with a lower default zoom
         marker_size_multiplier = st.slider("Marker Size", 1000, 8000, 5000, step=500)
     
     # Main content
@@ -101,35 +101,76 @@ def show_map_page(clients):
         hotspots = timescale_client.get_active_hotspots(as_dataframe=False)
         debug_info["hotspots_count"] = len(hotspots) if hotspots else 0
         
-        # Apply filters
-        filtered_hotspots = [
-            h for h in hotspots 
-            if h.get('status', 'active') in hotspot_status 
-            and h.get('severity', 'low') in hotspot_severity
-        ]
+        # Apply filters - if all are selected, don't filter
+        if len(hotspot_severity) == 3 and len(hotspot_status) == 2:
+            filtered_hotspots = hotspots
+        else:
+            filtered_hotspots = [
+                h for h in hotspots 
+                if h.get('status', 'active') in hotspot_status 
+                and h.get('severity', 'low') in hotspot_severity
+            ]
         debug_info["filtered_hotspots_count"] = len(filtered_hotspots)
         
         if filtered_hotspots:
-            hotspots_df = pd.DataFrame(filtered_hotspots)
+            # Create DataFrame with validated coordinates
+            valid_hotspots = []
+            for h in filtered_hotspots:
+                try:
+                    # Determine coordinates with more robust logic
+                    lat = None
+                    lon = None
+                    
+                    if 'center_latitude' in h and h['center_latitude']:
+                        lat = float(h['center_latitude'])
+                    elif 'latitude' in h and h['latitude']:
+                        lat = float(h['latitude'])
+                    
+                    if 'center_longitude' in h and h['center_longitude']:
+                        lon = float(h['center_longitude'])
+                    elif 'longitude' in h and h['longitude']:
+                        lon = float(h['longitude'])
+                    
+                    # Include only hotspots with valid coordinates
+                    if lat is not None and lon is not None:
+                        h_copy = h.copy()
+                        h_copy['latitude'] = lat
+                        h_copy['longitude'] = lon
+                        valid_hotspots.append(h_copy)
+                except (ValueError, TypeError):
+                    # Skip hotspots with invalid data
+                    continue
+            
+            debug_info["valid_hotspots_count"] = len(valid_hotspots)
+            if valid_hotspots:
+                hotspots_df = pd.DataFrame(valid_hotspots)
     
     if show_sensors:
         # Get active sensor IDs
         active_sensor_ids = redis_client.get_active_sensors()
         debug_info["sensor_ids_count"] = len(active_sensor_ids)
         
-        # Get sensor data for each ID
-        sensors_data = []
+        # Get sensor data for each ID with validation
+        valid_sensors = []
         for sensor_id in active_sensor_ids:
             sensor_data = redis_client.get_sensor_data(sensor_id)
             if sensor_data:
                 # Apply pollution level filter
                 level = sensor_data.get('pollution_level', 'none')
                 if level in sensor_pollution_level or ('none' in sensor_pollution_level and not level):
-                    sensors_data.append(sensor_data)
+                    try:
+                        # Validate coordinates
+                        if 'latitude' in sensor_data and 'longitude' in sensor_data and sensor_data['latitude'] and sensor_data['longitude']:
+                            sensor_data['latitude'] = float(sensor_data['latitude'])
+                            sensor_data['longitude'] = float(sensor_data['longitude'])
+                            valid_sensors.append(sensor_data)
+                    except (ValueError, TypeError):
+                        # Skip sensors with invalid coordinates
+                        continue
         
-        debug_info["sensors_data_count"] = len(sensors_data)
-        if sensors_data:
-            sensors_df = pd.DataFrame(sensors_data)
+        debug_info["valid_sensors_count"] = len(valid_sensors)
+        if valid_sensors:
+            sensors_df = pd.DataFrame(valid_sensors)
     
     if show_predictions:
         # Get risk zones for the selected prediction hours
@@ -137,61 +178,68 @@ def show_map_page(clients):
         debug_info["risk_zones_count"] = len(risk_zones) if risk_zones else 0
         
         if risk_zones:
-            # Convert to DataFrame
-            predictions_df = pd.DataFrame(risk_zones)
+            # Validate prediction coordinates
+            valid_predictions = []
+            for zone in risk_zones:
+                try:
+                    # Validate coordinates
+                    if 'latitude' in zone and 'longitude' in zone and zone['latitude'] and zone['longitude']:
+                        zone['latitude'] = float(zone['latitude'])
+                        zone['longitude'] = float(zone['longitude'])
+                        valid_predictions.append(zone)
+                except (ValueError, TypeError):
+                    # Skip predictions with invalid coordinates
+                    continue
+            
+            debug_info["valid_predictions_count"] = len(valid_predictions)
+            if valid_predictions:
+                predictions_df = pd.DataFrame(valid_predictions)
+    
+    # Calculate map bounds to include all data points
+    all_lats = []
+    all_lons = []
+    
+    if not hotspots_df.empty:
+        all_lats.extend(hotspots_df['latitude'].tolist())
+        all_lons.extend(hotspots_df['longitude'].tolist())
+    
+    if not sensors_df.empty:
+        all_lats.extend(sensors_df['latitude'].tolist())
+        all_lons.extend(sensors_df['longitude'].tolist())
+    
+    if not predictions_df.empty:
+        all_lats.extend(predictions_df['latitude'].tolist())
+        all_lons.extend(predictions_df['longitude'].tolist())
     
     # Set default map center (Chesapeake Bay or center of data)
-    default_lat = 38.5
-    default_lon = -76.4
-    
-    # If we have hotspots, center on them
-    if not hotspots_df.empty and 'center_latitude' in hotspots_df.columns:
-        try:
-            hotspots_df['center_latitude'] = pd.to_numeric(hotspots_df['center_latitude'], errors='coerce')
-            hotspots_df['center_longitude'] = pd.to_numeric(hotspots_df['center_longitude'], errors='coerce')
-            default_lat = hotspots_df['center_latitude'].mean()
-            default_lon = hotspots_df['center_longitude'].mean()
-        except Exception as e:
-            st.warning(f"Could not calculate hotspot center: {e}")
-    elif not sensors_df.empty and 'latitude' in sensors_df.columns:
-        try:
-            sensors_df['latitude'] = pd.to_numeric(sensors_df['latitude'], errors='coerce')
-            sensors_df['longitude'] = pd.to_numeric(sensors_df['longitude'], errors='coerce')
-            default_lat = sensors_df['latitude'].mean()
-            default_lon = sensors_df['longitude'].mean()
-        except Exception as e:
-            st.warning(f"Could not calculate sensor center: {e}")
+    if all_lats and all_lons:
+        default_lat = sum(all_lats) / len(all_lats)
+        default_lon = sum(all_lons) / len(all_lons)
+    else:
+        default_lat = 38.5
+        default_lon = -76.4
     
     # Create map with layers
     fig = go.Figure()
     
     # Add hotspot layer
     if not hotspots_df.empty and show_hotspots:
-        # Ensure proper column names
-        if 'center_latitude' in hotspots_df.columns:
-            lat_col = 'center_latitude'
-            lon_col = 'center_longitude'
-        else:
-            lat_col = 'latitude'
-            lon_col = 'longitude'
-        
         # Create size and color scales
         if 'radius_km' in hotspots_df.columns:
-            size_col = 'radius_km'
-            hotspots_df[size_col] = pd.to_numeric(hotspots_df[size_col], errors='coerce')
+            hotspots_df['radius_km'] = pd.to_numeric(hotspots_df['radius_km'], errors='coerce')
+            hotspots_df['radius_km'].fillna(1.0, inplace=True)
             size_mult = marker_size_multiplier
         else:
             hotspots_df['size'] = 1.0
-            size_col = 'size'
             size_mult = marker_size_multiplier
         
         # Add scatter layer for hotspots
         fig.add_trace(go.Scattermapbox(
-            lat=hotspots_df[lat_col],
-            lon=hotspots_df[lon_col],
+            lat=hotspots_df['latitude'],
+            lon=hotspots_df['longitude'],
             mode='markers',
             marker=dict(
-                size=hotspots_df[size_col] * size_mult,
+                size=hotspots_df['radius_km'] * size_mult,
                 sizemode='area',
                 color=hotspots_df['severity'].map({
                     'high': 'rgba(244, 67, 54, 0.7)',
@@ -215,103 +263,89 @@ def show_map_page(clients):
     # Add sensor layer
     if not sensors_df.empty and show_sensors:
         # Ensure proper column names
-        if 'latitude' in sensors_df.columns and 'longitude' in sensors_df.columns:
-            # Convert coordinates to float
-            sensors_df['latitude'] = pd.to_numeric(sensors_df['latitude'], errors='coerce')
-            sensors_df['longitude'] = pd.to_numeric(sensors_df['longitude'], errors='coerce')
-            
-            # Determine sensor ID column - could be 'source_id', 'sensor_id', or something else
-            id_column = None
-            for possible_id in ['source_id', 'sensor_id', 'id', 'buoy_id']:
-                if possible_id in sensors_df.columns:
-                    id_column = possible_id
-                    break
-            
-            # Add scatter layer for sensors
-            fig.add_trace(go.Scattermapbox(
-                lat=sensors_df['latitude'],
-                lon=sensors_df['longitude'],
-                mode='markers',
-                marker=dict(
-                    size=12,
-                    color=sensors_df['pollution_level'].map({
-                        'high': '#F44336',
-                        'medium': '#FF9800',
-                        'low': '#4CAF50',
-                        'none': '#9E9E9E'
-                    }),
-                    symbol='triangle',
-                    opacity=0.9
-                ),
-                hovertext=sensors_df.apply(
-                    lambda row: f"ID: {row.get(id_column, 'Unknown')}<br>" +
-                                f"Temperature: {row.get('temperature', 'N/A')}°C<br>" +
-                                f"pH: {row.get('ph', 'N/A')}<br>" +
-                                f"Turbidity: {row.get('turbidity', 'N/A')}<br>" +
-                                f"Quality: {row.get('water_quality_index', 'N/A')}",
-                    axis=1
-                ),
-                hoverinfo='text',
-                name='Sensors'
-            ))
+        id_column = next((col for col in ['source_id', 'sensor_id', 'id', 'buoy_id'] if col in sensors_df.columns), 'id')
+        
+        # Add scatter layer for sensors
+        fig.add_trace(go.Scattermapbox(
+            lat=sensors_df['latitude'],
+            lon=sensors_df['longitude'],
+            mode='markers',
+            marker=dict(
+                size=12,
+                color=sensors_df['pollution_level'].map({
+                    'high': '#F44336',
+                    'medium': '#FF9800',
+                    'low': '#4CAF50',
+                    'none': '#9E9E9E'
+                }),
+                symbol='triangle',
+                opacity=0.9
+            ),
+            hovertext=sensors_df.apply(
+                lambda row: f"ID: {row.get(id_column, 'Unknown')}<br>" +
+                            f"Temperature: {row.get('temperature', 'N/A')}°C<br>" +
+                            f"pH: {row.get('ph', 'N/A')}<br>" +
+                            f"Turbidity: {row.get('turbidity', 'N/A')}<br>" +
+                            f"Quality: {row.get('water_quality_index', 'N/A')}",
+                axis=1
+            ),
+            hoverinfo='text',
+            name='Sensors'
+        ))
     
     # Add prediction layer
     if not predictions_df.empty and show_predictions:
-        # Ensure proper column names
-        if 'latitude' in predictions_df.columns and 'longitude' in predictions_df.columns:
-            # Convert coordinates to float
-            predictions_df['latitude'] = pd.to_numeric(predictions_df['latitude'], errors='coerce')
-            predictions_df['longitude'] = pd.to_numeric(predictions_df['longitude'], errors='coerce')
-            
-            if 'radius_km' in predictions_df.columns:
-                predictions_df['radius_km'] = pd.to_numeric(predictions_df['radius_km'], errors='coerce')
-            else:
-                predictions_df['radius_km'] = 1.0
-            
-            # Add scatter layer for predictions - main circles
-            fig.add_trace(go.Scattermapbox(
-                lat=predictions_df['latitude'],
-                lon=predictions_df['longitude'],
-                mode='markers',
-                marker=dict(
-                    size=predictions_df['radius_km'] * marker_size_multiplier,
-                    sizemode='area',
-                    color=predictions_df['severity'].map({
-                        'high': 'rgba(244, 67, 54, 0.3)',
-                        'medium': 'rgba(255, 152, 0, 0.3)',
-                        'low': 'rgba(76, 175, 80, 0.3)'
-                    }),
-                    opacity=0.5
-                ),
-                hovertext=predictions_df.apply(
-                    lambda row: f"Time: T+{prediction_hours}h<br>" +
-                                f"Hotspot: {row.get('hotspot_id', '')}<br>" +
-                                f"Severity: {row.get('severity', 'unknown')}<br>" +
-                                f"Confidence: {float(row.get('confidence', 0)) * 100:.1f}%",
-                    axis=1
-                ),
-                hoverinfo='text',
-                name=f'Predictions ({prediction_hours}h)'
-            ))
-            
-            # Add center points for predictions for better visibility
-            fig.add_trace(go.Scattermapbox(
-                lat=predictions_df['latitude'],
-                lon=predictions_df['longitude'],
-                mode='markers',
-                marker=dict(
-                    size=8,
-                    color=predictions_df['severity'].map({
-                        'high': '#F44336',
-                        'medium': '#FF9800',
-                        'low': '#4CAF50'
-                    }),
-                    symbol='circle',
-                    opacity=0.9
-                ),
-                hoverinfo='none',
-                showlegend=False
-            ))
+        # Ensure radius is present and valid
+        if 'radius_km' in predictions_df.columns:
+            predictions_df['radius_km'] = pd.to_numeric(predictions_df['radius_km'], errors='coerce')
+            predictions_df['radius_km'].fillna(1.0, inplace=True)
+        else:
+            predictions_df['radius_km'] = 1.0
+        
+        # Add scatter layer for predictions - main circles
+        fig.add_trace(go.Scattermapbox(
+            lat=predictions_df['latitude'],
+            lon=predictions_df['longitude'],
+            mode='markers',
+            marker=dict(
+                size=predictions_df['radius_km'] * marker_size_multiplier,
+                sizemode='area',
+                color=predictions_df['severity'].map({
+                    'high': 'rgba(244, 67, 54, 0.3)',
+                    'medium': 'rgba(255, 152, 0, 0.3)',
+                    'low': 'rgba(76, 175, 80, 0.3)'
+                }),
+                opacity=0.5
+            ),
+            hovertext=predictions_df.apply(
+                lambda row: f"Time: T+{prediction_hours}h<br>" +
+                            f"Hotspot: {row.get('hotspot_id', '')}<br>" +
+                            f"Severity: {row.get('severity', 'unknown')}<br>" +
+                            f"Confidence: {float(row.get('confidence', 0)) * 100:.1f}%",
+                axis=1
+            ),
+            hoverinfo='text',
+            name=f'Predictions ({prediction_hours}h)'
+        ))
+        
+        # Add center points for predictions for better visibility
+        fig.add_trace(go.Scattermapbox(
+            lat=predictions_df['latitude'],
+            lon=predictions_df['longitude'],
+            mode='markers',
+            marker=dict(
+                size=8,
+                color=predictions_df['severity'].map({
+                    'high': '#F44336',
+                    'medium': '#FF9800',
+                    'low': '#4CAF50'
+                }),
+                symbol='circle',
+                opacity=0.9
+            ),
+            hoverinfo='none',
+            showlegend=False
+        ))
     
     # Update map layout
     fig.update_layout(
@@ -338,7 +372,6 @@ def show_map_page(clients):
     # Display map statistics below the map
     st.markdown("### Map Statistics")
     
-    # CORRETTO: Usa solo un livello di colonne per evitare l'errore
     stats_col1, stats_col2, stats_col3 = st.columns(3)
     
     with stats_col1:
@@ -347,7 +380,6 @@ def show_map_page(clients):
         hotspot_count = len(hotspots_df) if not hotspots_df.empty else 0
         st.metric("Total Visible", hotspot_count)
         
-        # Invece di colonne nidificate, usiamo markdown per formattare
         if not hotspots_df.empty and 'severity' in hotspots_df.columns:
             severity_counts = hotspots_df['severity'].value_counts()
             high_count = severity_counts.get('high', 0)
@@ -368,7 +400,6 @@ def show_map_page(clients):
         sensor_count = len(sensors_df) if not sensors_df.empty else 0
         st.metric("Total Visible", sensor_count)
         
-        # Invece di colonne nidificate, usiamo markdown per formattare
         if not sensors_df.empty and 'pollution_level' in sensors_df.columns:
             level_counts = sensors_df['pollution_level'].value_counts()
             high_count = level_counts.get('high', 0)
@@ -390,7 +421,6 @@ def show_map_page(clients):
             prediction_count = len(predictions_df) if not predictions_df.empty else 0
             st.metric(f"T+{prediction_hours}h Predictions", prediction_count)
             
-            # Invece di colonne nidificate, usiamo markdown per formattare
             if not predictions_df.empty and 'severity' in predictions_df.columns:
                 pred_severity_counts = predictions_df['severity'].value_counts()
                 high_count = pred_severity_counts.get('high', 0)
@@ -408,6 +438,22 @@ def show_map_page(clients):
     # Debug info for troubleshooting
     with st.expander("Debug Information"):
         st.json(debug_info)
+        
+        # Add coordinate ranges for all datasets
+        if not hotspots_df.empty:
+            st.write("Hotspot Coordinate Ranges:", 
+                    f"Lat: {hotspots_df['latitude'].min():.4f} to {hotspots_df['latitude'].max():.4f}, ",
+                    f"Lon: {hotspots_df['longitude'].min():.4f} to {hotspots_df['longitude'].max():.4f}")
+            
+        if not sensors_df.empty:
+            st.write("Sensor Coordinate Ranges:", 
+                    f"Lat: {sensors_df['latitude'].min():.4f} to {sensors_df['latitude'].max():.4f}, ",
+                    f"Lon: {sensors_df['longitude'].min():.4f} to {sensors_df['longitude'].max():.4f}")
+            
+        if not predictions_df.empty:
+            st.write("Prediction Coordinate Ranges:", 
+                    f"Lat: {predictions_df['latitude'].min():.4f} to {predictions_df['latitude'].max():.4f}, ",
+                    f"Lon: {predictions_df['longitude'].min():.4f} to {predictions_df['longitude'].max():.4f}")
         
         st.subheader("Hotspots Data Preview")
         if not hotspots_df.empty:

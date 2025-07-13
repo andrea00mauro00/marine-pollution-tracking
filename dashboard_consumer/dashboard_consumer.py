@@ -35,6 +35,16 @@ ALERTS_TTL = 3600  # 1 hour
 PREDICTIONS_TTL = 7200  # 2 hours
 SPATIAL_BIN_SIZE = 0.05
 
+def sanitize_value(value):
+    """Ensures a value is safe for Redis (converts None to empty string)"""
+    if value is None:
+        return ""
+    return value
+
+def sanitize_dict(d):
+    """Ensure no None values in a dictionary by converting them to empty strings"""
+    return {k: sanitize_value(v) for k, v in d.items()}
+
 def connect_redis():
     """Connessione a Redis"""
     try:
@@ -75,7 +85,13 @@ def init_redis_counters(redis_conn):
 def safe_redis_operation(func, *args, default_value=None, log_error=True, **kwargs):
     """Esegue un'operazione Redis in modo sicuro, gestendo eccezioni e valori None"""
     try:
-        result = func(*args, **kwargs)
+        # Convert None values to empty strings for Redis operations
+        args_list = list(args)
+        for i in range(len(args_list)):
+            if args_list[i] is None:
+                args_list[i] = ''
+        
+        result = func(*args_list, **kwargs)
         return result if result is not None else default_value
     except Exception as e:
         if log_error:
@@ -93,10 +109,10 @@ def process_sensor_data(data, redis_conn):
             'timestamp': timestamp,
             'latitude': data['latitude'],
             'longitude': data['longitude'],
-            'temperature': data.get('temperature', ''),
-            'ph': data.get('ph', ''),
-            'turbidity': data.get('turbidity', ''),
-            'water_quality_index': data.get('water_quality_index', '')
+            'temperature': sanitize_value(data.get('temperature', '')),
+            'ph': sanitize_value(data.get('ph', '')),
+            'turbidity': sanitize_value(data.get('turbidity', '')),
+            'water_quality_index': sanitize_value(data.get('water_quality_index', ''))
         }
         
         # Usa operazioni individuali invece di pipeline
@@ -133,9 +149,9 @@ def process_analyzed_sensor_data(data, redis_conn):
         sensor_id = str(location['sensor_id'])  # Converti sempre in stringa
         
         # Estrai analisi inquinamento con valori predefiniti
-        level = pollution_analysis.get('level', 'unknown')
-        risk_score = pollution_analysis.get('risk_score', 0.0)
-        pollutant_type = pollution_analysis.get('pollutant_type', 'unknown')
+        level = sanitize_value(pollution_analysis.get('level', 'unknown'))
+        risk_score = sanitize_value(pollution_analysis.get('risk_score', 0.0))
+        pollutant_type = sanitize_value(pollution_analysis.get('pollutant_type', 'unknown'))
         
         # Salva in Redis con operazioni individuali
         sensor_key = f"sensors:latest:{sensor_id}"
@@ -163,12 +179,12 @@ def process_hotspot(data, redis_conn):
         hotspot_id = data['hotspot_id']
         is_update = data.get('is_update', False)
         
-        # Estrai campi di relazione
-        parent_hotspot_id = data.get('parent_hotspot_id', '')
-        derived_from = data.get('derived_from', '')
+        # Estrai campi di relazione con valore di default
+        parent_hotspot_id = data.get('parent_hotspot_id', '') or ''
+        derived_from = data.get('derived_from', '') or ''
         
         # Ottieni lo status dell'hotspot, default a 'active'
-        status = data.get('status', 'active')
+        status = sanitize_value(data.get('status', 'active'))
         
         # Verifica che i campi obbligatori esistano
         if 'location' not in data or not isinstance(data['location'], dict):
@@ -186,14 +202,14 @@ def process_hotspot(data, redis_conn):
             'center_latitude': location['center_latitude'],
             'center_longitude': location['center_longitude'],
             'radius_km': location['radius_km'],
-            'pollutant_type': data.get('pollutant_type', 'unknown'),
-            'severity': data.get('severity', 'low'),
-            'detected_at': data.get('detected_at', str(int(time.time() * 1000))),
-            'avg_risk_score': str(data.get('avg_risk_score', 0.0)),
-            'max_risk_score': str(data.get('max_risk_score', 0.0)),
-            'point_count': str(data.get('point_count', 1)),
+            'pollutant_type': sanitize_value(data.get('pollutant_type', 'unknown')),
+            'severity': sanitize_value(data.get('severity', 'low')),
+            'detected_at': sanitize_value(data.get('detected_at', str(int(time.time() * 1000)))),
+            'avg_risk_score': str(sanitize_value(data.get('avg_risk_score', 0.0))),
+            'max_risk_score': str(sanitize_value(data.get('max_risk_score', 0.0))),
+            'point_count': str(sanitize_value(data.get('point_count', 1))),
             'is_update': 'true' if is_update else 'false',
-            'original_id': data.get('original_hotspot_id', ''),
+            'original_id': sanitize_value(data.get('original_hotspot_id', '')),
             'parent_hotspot_id': parent_hotspot_id,
             'derived_from': derived_from,
             'status': status,
@@ -208,11 +224,11 @@ def process_hotspot(data, redis_conn):
         safe_redis_operation(redis_conn.sadd, "dashboard:hotspots:active", hotspot_id)
         
         # Set per severità
-        severity = data.get('severity', 'low')
+        severity = sanitize_value(data.get('severity', 'low'))
         safe_redis_operation(redis_conn.sadd, f"dashboard:hotspots:by_severity:{severity}", hotspot_id)
         
         # Set per tipo inquinante
-        pollutant_type = data.get('pollutant_type', 'unknown')
+        pollutant_type = sanitize_value(data.get('pollutant_type', 'unknown'))
         safe_redis_operation(redis_conn.sadd, f"dashboard:hotspots:by_type:{pollutant_type}", hotspot_id)
 
         # Set per status
@@ -278,7 +294,7 @@ def process_hotspot(data, redis_conn):
         # Top hotspots - Mantieni solo i 10 più critici ordinati per severità e rischio
         try:
             severity_score = {'low': 1, 'medium': 2, 'high': 3}
-            score = severity_score.get(severity, 0) * 1000 + float(data.get('max_risk_score', 0)) * 100
+            score = severity_score.get(severity, 0) * 1000 + float(sanitize_value(data.get('max_risk_score', 0))) * 100
             safe_redis_operation(redis_conn.zadd, "dashboard:hotspots:top10", {hotspot_id: score})
             safe_redis_operation(redis_conn.zremrangebyrank, "dashboard:hotspots:top10", 0, -11)  # Mantieni solo i top 10
         except Exception as e:
@@ -296,10 +312,10 @@ def process_hotspot(data, redis_conn):
                         'longitude': location['center_longitude'],
                         'radius_km': location['radius_km']
                     },
-                    'pollutant_type': data.get('pollutant_type', 'unknown'),
+                    'pollutant_type': sanitize_value(data.get('pollutant_type', 'unknown')),
                     'severity': severity,
-                    'risk_score': data.get('max_risk_score', 0),
-                    'detected_at': data.get('detected_at', int(time.time() * 1000)),
+                    'risk_score': sanitize_value(data.get('max_risk_score', 0)),
+                    'detected_at': sanitize_value(data.get('detected_at', int(time.time() * 1000))),
                     'is_update': is_update,
                     'parent_hotspot_id': parent_hotspot_id,
                     'derived_from': derived_from,
@@ -340,9 +356,9 @@ def process_prediction(data, redis_conn):
         prediction_set_id = data['prediction_set_id']
         hotspot_id = data['hotspot_id']
         
-        # Estrai campi di relazione
-        parent_hotspot_id = data.get('parent_hotspot_id')
-        derived_from = data.get('derived_from')
+        # Estrai campi di relazione con valori default
+        parent_hotspot_id = sanitize_value(data.get('parent_hotspot_id', ''))
+        derived_from = sanitize_value(data.get('derived_from', ''))
         
         # Salva riferimento al set di previsioni
         safe_redis_operation(redis_conn.sadd, f"dashboard:predictions:sets", prediction_set_id)
@@ -370,11 +386,11 @@ def process_prediction(data, redis_conn):
                     'id': prediction_id,
                     'hotspot_id': hotspot_id,
                     'hours_ahead': hours_ahead,
-                    'time': prediction.get('prediction_time', int(time.time() * 1000) + hours_ahead * 3600 * 1000),
+                    'time': sanitize_value(prediction.get('prediction_time', int(time.time() * 1000) + hours_ahead * 3600 * 1000)),
                     'location': prediction.get('location', {}),
-                    'severity': prediction.get('impact', {}).get('severity', 'unknown'),
-                    'environmental_score': prediction.get('impact', {}).get('environmental_score', 0.0),
-                    'confidence': prediction.get('confidence', 0.5),
+                    'severity': sanitize_value(prediction.get('impact', {}).get('severity', 'unknown')),
+                    'environmental_score': sanitize_value(prediction.get('impact', {}).get('environmental_score', 0.0)),
+                    'confidence': sanitize_value(prediction.get('confidence', 0.5)),
                     'parent_hotspot_id': parent_hotspot_id,
                     'derived_from': derived_from
                 })
@@ -400,12 +416,12 @@ def process_prediction(data, redis_conn):
                     if 'location' in prediction and 'longitude' in prediction['location'] and 'latitude' in prediction['location']:
                         safe_redis_operation(redis_conn.hset, risk_zone_key, "longitude", prediction['location']['longitude'])
                         safe_redis_operation(redis_conn.hset, risk_zone_key, "latitude", prediction['location']['latitude'])
-                        safe_redis_operation(redis_conn.hset, risk_zone_key, "radius_km", prediction['location'].get('radius_km', 1.0))
+                        safe_redis_operation(redis_conn.hset, risk_zone_key, "radius_km", sanitize_value(prediction['location'].get('radius_km', 1.0)))
                     
                     if 'impact' in prediction and 'severity' in prediction['impact']:
-                        safe_redis_operation(redis_conn.hset, risk_zone_key, "severity", prediction['impact']['severity'])
+                        safe_redis_operation(redis_conn.hset, risk_zone_key, "severity", sanitize_value(prediction['impact']['severity']))
                     
-                    safe_redis_operation(redis_conn.hset, risk_zone_key, "prediction_time", prediction.get('prediction_time', int(time.time() * 1000)))
+                    safe_redis_operation(redis_conn.hset, risk_zone_key, "prediction_time", sanitize_value(prediction.get('prediction_time', int(time.time() * 1000))))
                     
                     # Aggiungi a set di zone di rischio per questo intervallo di tempo
                     safe_redis_operation(redis_conn.sadd, f"dashboard:risk_zones:{hours_ahead}h", risk_id)
@@ -452,17 +468,17 @@ def process_alert(data, redis_conn):
         # Estrai ID o genera se non presente
         alert_id = data.get('alert_id', f"alert_{data['hotspot_id']}_{int(time.time())}")
         
-        # Estrai campi di relazione
-        parent_hotspot_id = data.get('parent_hotspot_id', '')
-        derived_from = data.get('derived_from', '')
+        # Estrai campi di relazione con valori default
+        parent_hotspot_id = sanitize_value(data.get('parent_hotspot_id', ''))
+        derived_from = sanitize_value(data.get('derived_from', ''))
         
         # Preparazione dati alert
         alert_data = {
             'id': alert_id,
             'hotspot_id': data['hotspot_id'],
-            'severity': data.get('severity', 'low'),
-            'pollutant_type': data.get('pollutant_type', 'unknown'),
-            'timestamp': data.get('detected_at', str(int(time.time() * 1000))),
+            'severity': sanitize_value(data.get('severity', 'low')),
+            'pollutant_type': sanitize_value(data.get('pollutant_type', 'unknown')),
+            'timestamp': sanitize_value(data.get('detected_at', str(int(time.time() * 1000)))),
             'latitude': location['center_latitude'],
             'longitude': location['center_longitude'],
             'processed': 'false',
@@ -486,11 +502,11 @@ def process_alert(data, redis_conn):
             safe_redis_operation(redis_conn.hset, alert_key, key, value)
         
         # Lista ordinata di alert attivi
-        timestamp = int(data.get('detected_at', time.time() * 1000))
+        timestamp = int(sanitize_value(data.get('detected_at', time.time() * 1000)))
         safe_redis_operation(redis_conn.zadd, "dashboard:alerts:active", {alert_id: timestamp})
         
         # Set per severità
-        severity = data.get('severity', 'low')
+        severity = sanitize_value(data.get('severity', 'low'))
         safe_redis_operation(redis_conn.sadd, f"dashboard:alerts:by_severity:{severity}", alert_id)
         
         # Aggiunta alle notifiche dashboard (limitate a 20)
@@ -498,8 +514,8 @@ def process_alert(data, redis_conn):
             notification = json.dumps({
                 'id': alert_id,
                 'message': alert_data['message'],
-                'severity': data.get('severity', 'low'),
-                'timestamp': data.get('detected_at', int(time.time() * 1000)),
+                'severity': sanitize_value(data.get('severity', 'low')),
+                'timestamp': sanitize_value(data.get('detected_at', int(time.time() * 1000))),
                 'parent_hotspot_id': parent_hotspot_id,
                 'derived_from': derived_from
             })

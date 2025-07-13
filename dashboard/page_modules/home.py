@@ -7,19 +7,17 @@ import json
 import time
 
 def show_home_page(clients):
-    """Render the home page with dashboard overview following the correct design specifications"""
+    """Render the home page with dashboard overview"""
     st.markdown("<h1 class='main-header'>Marine Pollution Monitoring Dashboard</h1>", unsafe_allow_html=True)
     
     # Get clients
     redis_client = clients["redis"]
-    postgres_client = clients["postgres"]
     timescale_client = clients["timescale"]
     
-    # ===== 1. PANNELLO RIEPILOGO STATISTICO =====
-    # Ottieni il riepilogo dalla cache Redis come specificato nel design
+    # Get dashboard summary from Redis
     summary = redis_client.get_dashboard_summary()
     
-    # Estrai metriche di riepilogo
+    # Extract summary metrics
     hotspots_count = int(summary.get('hotspots_count', 0))
     alerts_count = int(summary.get('alerts_count', 0))
     
@@ -28,7 +26,7 @@ def show_home_page(clients):
     except:
         severity_dist = {"low": 0, "medium": 0, "high": 0}
     
-    # Righe di summary cards
+    # Summary cards row
     st.markdown("<h2 class='sub-header'>System Overview</h2>", unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4)
     
@@ -50,7 +48,7 @@ def show_home_page(clients):
     
     with col4:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        # Calcola il tempo dall'ultimo aggiornamento
+        # Calculate the time since the last update
         last_updated = int(summary.get('updated_at', time.time() * 1000)) / 1000
         time_diff = time.time() - last_updated
         if time_diff < 60:
@@ -63,143 +61,147 @@ def show_home_page(clients):
         st.metric("Last Updated", update_text)
         st.markdown("</div>", unsafe_allow_html=True)
     
-    # Dividi il dashboard in due colonne
+    # Split the dashboard into two columns
     left_col, right_col = st.columns([2, 1])
     
-    # ===== 2. MAPPA MINI CON HOTSPOT CRITICI =====
+    # Left column - Main visualizations
     with left_col:
+        # Hotspot map
         st.markdown("<h2 class='sub-header'>Critical Hotspots</h2>", unsafe_allow_html=True)
         
-        # Ottieni top hotspots da Redis come specificato nel design
-        # Utilizza zrevrange con punteggi come specificato nel design doc
+        # Get top hotspots
         top_hotspots = redis_client.get_top_hotspots(count=5)
         
         if top_hotspots:
-            # Crea DataFrame per plotting
-            hotspot_df = pd.DataFrame([
-                {
-                    'id': h.get('id', ''),
-                    'latitude': float(h.get('center_latitude', h.get('latitude', 0))),
-                    'longitude': float(h.get('center_longitude', h.get('longitude', 0))),
-                    'severity': h.get('severity', 'low'),
-                    'pollutant_type': h.get('pollutant_type', 'unknown'),
-                    'radius_km': float(h.get('radius_km', 1.0)),
-                    'risk_score': float(h.get('max_risk_score', h.get('risk_score', 0.5)))
-                }
-                for h in top_hotspots
-            ])
+            # Create DataFrame for plotting with improved validation
+            valid_hotspots = []
+            for h in top_hotspots:
+                try:
+                    # Determine coordinates with more robust logic
+                    lat = None
+                    lon = None
+                    
+                    if 'center_latitude' in h and h['center_latitude']:
+                        lat = float(h['center_latitude'])
+                    elif 'latitude' in h and h['latitude']:
+                        lat = float(h['latitude'])
+                    
+                    if 'center_longitude' in h and h['center_longitude']:
+                        lon = float(h['center_longitude'])
+                    elif 'longitude' in h and h['longitude']:
+                        lon = float(h['longitude'])
+                    
+                    # Include only hotspots with valid coordinates
+                    if lat is not None and lon is not None:
+                        valid_hotspots.append({
+                            'id': h.get('id', h.get('hotspot_id', '')),
+                            'latitude': lat,
+                            'longitude': lon,
+                            'severity': h.get('severity', 'low'),
+                            'pollutant_type': h.get('pollutant_type', 'unknown'),
+                            'radius_km': float(h.get('radius_km', 1.0)),
+                            'risk_score': float(h.get('max_risk_score', h.get('risk_score', 0.5)))
+                        })
+                except (ValueError, TypeError):
+                    # Skip hotspots with invalid data
+                    continue
             
-            # Crea scatter map
-            fig = px.scatter_mapbox(
-                hotspot_df,
-                lat="latitude",
-                lon="longitude",
-                color="severity",
-                size="radius_km",
-                hover_name="id",
-                hover_data=["pollutant_type", "risk_score"],
-                color_discrete_map={"high": "#F44336", "medium": "#FF9800", "low": "#4CAF50"},
-                zoom=6,
-                height=400
-            )
-            
-            # Imposta stile mappa
-            fig.update_layout(
-                mapbox_style="open-street-map",
-                margin={"r": 0, "t": 0, "l": 0, "b": 0}
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No hotspot data available")
-        
-        # ===== 3. GRAFICI TREND DI INQUINAMENTO =====
-        st.markdown("<h2 class='sub-header'>Pollution Trends (Last 7 Days)</h2>", unsafe_allow_html=True)
-        
-        # Ottieni metriche degli hotspot dagli ultimi 7 giorni 
-        # Utilizziamo l'API del client esistente ma con parametri che rispecchiano il design
-        hotspot_trend_data = timescale_client.get_pollution_metrics(days=7, as_dataframe=True)
-        
-        if not hotspot_trend_data.empty:
-            # Converti a DataFrame con le colonne corrette
-            # Se l'API non fornisce esattamente i dati come nel design, li trasformiamo qui
-            if 'time' in hotspot_trend_data.columns:
-                hotspot_trend_data['day'] = pd.to_datetime(hotspot_trend_data['time']).dt.date
+            if valid_hotspots:
+                hotspot_df = pd.DataFrame(valid_hotspots)
                 
-                # Aggrega per giorno
-                trend_df = hotspot_trend_data.groupby('day').agg({
-                    'avg_risk_score': 'mean',
-                    'sensor_count': 'mean'  # Usiamo questo come proxy per il conteggio hotspot
-                }).reset_index()
+                # Set default map center
+                center_lat = hotspot_df['latitude'].mean()
+                center_lon = hotspot_df['longitude'].mean()
                 
-                # Crea grafico delle tendenze
-                fig = go.Figure()
+                # Create a scatter map
+                fig = px.scatter_mapbox(
+                    hotspot_df,
+                    lat="latitude",
+                    lon="longitude",
+                    color="severity",
+                    size="radius_km",
+                    hover_name="id",
+                    hover_data=["pollutant_type", "risk_score"],
+                    color_discrete_map={"high": "#F44336", "medium": "#FF9800", "low": "#4CAF50"},
+                    size_max=15,
+                    height=400
+                )
                 
-                # Aggiungi linea per conteggio sensori/hotspot
-                fig.add_trace(go.Scatter(
-                    x=trend_df['day'],
-                    y=trend_df['sensor_count'],
-                    mode='lines+markers',
-                    name='Sensor Count',
-                    line=dict(color='#FF9800')
-                ))
-                
-                # Aggiungi linea per rischio medio
-                fig.add_trace(go.Scatter(
-                    x=trend_df['day'],
-                    y=trend_df['avg_risk_score'],
-                    mode='lines+markers',
-                    name='Avg Risk Score',
-                    line=dict(color='#F44336'),
-                    yaxis='y2'
-                ))
-                
-                # Aggiorna layout
+                # Set the map style and center
                 fig.update_layout(
-                    title="Pollution Trends Over Time",
-                    xaxis_title="Date",
-                    yaxis=dict(
-                        title="Sensor Count",
-                        titlefont=dict(color="#FF9800"),
-                        tickfont=dict(color="#FF9800")
+                    mapbox=dict(
+                        style="open-street-map",
+                        center=dict(lat=center_lat, lon=center_lon),
+                        zoom=5  # Lower zoom to see more area
                     ),
-                    yaxis2=dict(
-                        title="Risk Score",
-                        titlefont=dict(color="#F44336"),
-                        tickfont=dict(color="#F44336"),
-                        anchor="x",
-                        overlaying="y",
-                        side="right"
-                    ),
-                    legend=dict(
-                        orientation="h",
-                        yanchor="bottom",
-                        y=1.02,
-                        xanchor="right",
-                        x=1
-                    )
+                    margin={"r": 0, "t": 0, "l": 0, "b": 0}
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No trend data available in correct format")
+                st.info("No hotspot coordinates available for mapping")
         else:
-            st.info("No trend data available for the last 7 days")
+            st.info("No hotspot data available")
+        
+        # Sensor metrics over time
+        st.markdown("<h2 class='sub-header'>Sensor Metrics (Last 24 Hours)</h2>", unsafe_allow_html=True)
+        
+        # Get sensor metrics
+        sensor_metrics = timescale_client.get_sensor_metrics_by_hour(hours=24, as_dataframe=True)
+        
+        if not sensor_metrics.empty:
+            # Create line chart for metrics
+            fig = go.Figure()
+            
+            # Add different metrics
+            if 'avg_water_quality_index' in sensor_metrics.columns:
+                fig.add_trace(go.Scatter(
+                    x=sensor_metrics['hour'],
+                    y=sensor_metrics['avg_water_quality_index'],
+                    mode='lines',
+                    name='Water Quality Index'
+                ))
+            
+            if 'avg_risk_score' in sensor_metrics.columns:
+                fig.add_trace(go.Scatter(
+                    x=sensor_metrics['hour'],
+                    y=sensor_metrics['avg_risk_score'],
+                    mode='lines',
+                    name='Risk Score'
+                ))
+            
+            # Update layout
+            fig.update_layout(
+                title="Average Water Quality and Risk",
+                xaxis_title="Time",
+                yaxis_title="Value",
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1
+                )
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No sensor metrics available")
     
-    # Colonna destra - Alert e previsioni
+    # Right column - Alerts and stats
     with right_col:
-        # ===== 4. SEVERITÀ HOTSPOT =====
+        # Severity breakdown
         st.markdown("<h2 class='sub-header'>Hotspot Severity</h2>", unsafe_allow_html=True)
         
-        # Crea grafico a torta per distribuzione gravità
+        # Create pie chart for severity distribution
         fig = go.Figure(data=[go.Pie(
             labels=list(severity_dist.keys()),
             values=list(severity_dist.values()),
             hole=.3,
-            marker_colors=['#4CAF50', '#FF9800', '#F44336']  # Verde per low, arancione per medium, rosso per high
+            marker_colors=['#4CAF50', '#FF9800', '#F44336']  # Green for low, orange for medium, red for high
         )])
         
-        # Aggiorna layout
+        # Update layout
         fig.update_layout(
             showlegend=True,
             margin=dict(t=0, b=0, l=0, r=0),
@@ -208,10 +210,10 @@ def show_home_page(clients):
         
         st.plotly_chart(fig, use_container_width=True)
         
-        # ===== 5. ALERT RECENTI =====
+        # Recent alerts
         st.markdown("<h2 class='sub-header'>Recent Alerts</h2>", unsafe_allow_html=True)
         
-        # Ottieni notifiche recenti da Redis come specificato nel design
+        # Get recent notifications
         notifications = redis_client.get_recent_notifications(count=5)
         
         if notifications:
@@ -230,15 +232,14 @@ def show_home_page(clients):
         else:
             st.info("No recent alerts")
         
-        # ===== 6. PREVISIONI CRITICHE =====
+        # Upcoming predictions
         st.markdown("<h2 class='sub-header'>Upcoming Critical Predictions</h2>", unsafe_allow_html=True)
         
-        # Ottieni previsioni per le prossime 24 ore con alto impatto ambientale
-        # Utilizziamo l'API esistente ma filtriamo per previsioni critiche
-        all_predictions = timescale_client.get_predictions(hours_ahead=24, as_dataframe=False)
+        # Get predictions for next 24 hours with high environmental impact
+        predictions = timescale_client.get_predictions(hours_ahead=24, as_dataframe=False)
         
-        # Filtra per alto impatto ambientale (environmental_score > 0.7) come specificato nel design
-        high_impact_predictions = [p for p in all_predictions if float(p.get('environmental_score', 0)) > 0.7][:5]
+        # Filter for high severity predictions
+        high_impact_predictions = [p for p in predictions if p.get('severity') == 'high'][:3]
         
         if high_impact_predictions:
             for prediction in high_impact_predictions:
@@ -248,7 +249,7 @@ def show_home_page(clients):
                 pollutant = prediction.get('pollutant_type', 'unknown')
                 confidence = prediction.get('confidence', 0) * 100
                 
-                # Formatta l'orario di previsione
+                # Format prediction time
                 try:
                     prediction_datetime = datetime.fromisoformat(prediction_time.replace('Z', '+00:00'))
                     time_str = prediction_datetime.strftime('%Y-%m-%d %H:%M')
