@@ -145,5 +145,5 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Pianifica job per aggiornamento stato
-CREATE EXTENSION IF NOT EXISTS pg_cron;
-SELECT cron.schedule('0 * * * *', 'SELECT update_hotspot_status()');
+--CREATE EXTENSION IF NOT EXISTS pg_cron;
+--SELECT cron.schedule('0 * * * *', 'SELECT update_hotspot_status()');

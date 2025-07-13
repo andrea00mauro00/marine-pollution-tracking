@@ -9,7 +9,7 @@ class MinioClient:
     
     def __init__(self):
         # Get configuration from environment variables
-        self.endpoint = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
+        self.endpoint = os.environ.get("MINIO_ENDPOINT", "minio:9000")
         self.access_key = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
         self.secret_key = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
         self.secure = os.environ.get("MINIO_SECURE", "false").lower() == "true"
@@ -80,6 +80,92 @@ class MinioClient:
             return [obj.object_name for obj in objects]
         except Exception as e:
             logging.error(f"Error listing files in {bucket}/{prefix}: {e}")
+            return []
+    
+    def get_satellite_images(self, limit=10):
+        """List recent satellite images"""
+        if not self.client:
+            return []
+            
+        try:
+            # List objects in the bronze bucket with satellite prefix
+            objects = self.client.list_objects("bronze", prefix="satellite/", recursive=True)
+            
+            # Convert to list and sort by last modified date
+            object_list = sorted(
+                [obj for obj in objects],
+                key=lambda x: x.last_modified,
+                reverse=True
+            )[:limit]
+            
+            # Format results
+            result = []
+            for obj in object_list:
+                result.append({
+                    "name": obj.object_name.split("/")[-1],
+                    "path": f"bronze/{obj.object_name}",
+                    "size": obj.size,
+                    "last_modified": obj.last_modified.isoformat()
+                })
+            
+            return result
+        except Exception as e:
+            logging.error(f"Error listing satellite images: {e}")
+            return []
+    
+    def get_processed_images(self, limit=10):
+        """List recent processed images"""
+        if not self.client:
+            return []
+            
+        try:
+            # List objects in the silver bucket with processed prefix
+            objects = self.client.list_objects("silver", prefix="processed/", recursive=True)
+            
+            # Convert to list and sort by last modified date
+            object_list = sorted(
+                [obj for obj in objects],
+                key=lambda x: x.last_modified,
+                reverse=True
+            )[:limit]
+            
+            # Format results
+            result = []
+            for obj in object_list:
+                result.append({
+                    "name": obj.object_name.split("/")[-1],
+                    "path": f"silver/{obj.object_name}",
+                    "size": obj.size,
+                    "last_modified": obj.last_modified.isoformat()
+                })
+            
+            return result
+        except Exception as e:
+            logging.error(f"Error listing processed images: {e}")
+            return []
+    
+    def get_model_files(self):
+        """List ML model files"""
+        if not self.client:
+            return []
+            
+        try:
+            # List objects in the models bucket
+            objects = self.client.list_objects("models", recursive=True)
+            
+            # Format results
+            result = []
+            for obj in objects:
+                result.append({
+                    "name": obj.object_name.split("/")[-1],
+                    "path": f"models/{obj.object_name}",
+                    "size": obj.size,
+                    "last_modified": obj.last_modified.isoformat()
+                })
+            
+            return result
+        except Exception as e:
+            logging.error(f"Error listing model files: {e}")
             return []
     
     def upload_file(self, bucket, object_name, data, content_type=None):

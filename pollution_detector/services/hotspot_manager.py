@@ -6,6 +6,7 @@ import math
 import logging
 import time
 import hashlib
+import uuid
 from datetime import datetime, timedelta
 from common.redis_keys import *  # Importa le chiavi standardizzate
 
@@ -217,8 +218,47 @@ class HotspotManager:
         
         return False
     
+    def _acquire_lock(self, lock_name, timeout_seconds=10):
+        """Acquista un lock distribuito usando Redis"""
+        lock_key = f"locks:hotspot:{lock_name}"
+        lock_value = str(uuid.uuid4())  # Valore univoco per identificare chi possiede il lock
+        
+        # Carica configurazione
+        retry_count = int(self.redis_client.get("config:locks:retry_count") or 3)
+        retry_delay = int(self.redis_client.get("config:locks:retry_delay") or 100) / 1000.0
+        
+        # Prova più volte ad acquisire il lock
+        for attempt in range(retry_count):
+            # Prova ad acquisire il lock
+            acquired = self.redis_client.set(lock_key, lock_value, nx=True, ex=timeout_seconds)
+            if acquired:
+                return lock_value
+                
+            # Attendi prima di riprovare
+            if attempt < retry_count - 1:
+                time.sleep(retry_delay)
+        
+        return None
+
+    def _release_lock(self, lock_name, lock_value):
+        """Rilascia un lock distribuito solo se sei tu il proprietario"""
+        lock_key = f"locks:hotspot:{lock_name}"
+        
+        # Script Lua per rilascio sicuro (rilascia solo se il valore corrisponde)
+        release_script = """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('del', KEYS[1])
+        else
+            return 0
+        end
+        """
+        
+        # Esegui lo script
+        script = self.redis_client.register_script(release_script)
+        return script(keys=[lock_key], args=[lock_value])
+    
     def create_or_update_hotspot(self, hotspot_data):
-        """Crea nuovo hotspot o aggiorna esistente"""
+        """Crea nuovo hotspot o aggiorna esistente con lock distribuito"""
         try:
             self._ensure_connections()
             
@@ -227,18 +267,44 @@ class HotspotManager:
             radius_km = hotspot_data["location"]["radius_km"]
             pollutant_type = hotspot_data["pollutant_type"]
             
-            # Cerca hotspot esistente
-            existing_hotspot_id = self.find_matching_hotspot(
-                center_lat, center_lon, radius_km, pollutant_type
-            )
+            # Crea un lock_name basato sulle coordinate e il tipo di inquinante
+            # (approssima le coordinate per ridurre i conflitti non necessari)
+            lat_bin = math.floor(center_lat * 100) / 100
+            lon_bin = math.floor(center_lon * 100) / 100
+            lock_name = f"{lat_bin}:{lon_bin}:{pollutant_type}"
             
-            if existing_hotspot_id:
-                # Aggiorna hotspot esistente
-                return self._update_hotspot(existing_hotspot_id, hotspot_data)
-            else:
-                # Crea nuovo hotspot
-                return self._create_hotspot(hotspot_data)
+            # Acquista il lock
+            lock_value = self._acquire_lock(lock_name)
+            if not lock_value:
+                logger.warning(f"Non è stato possibile acquisire il lock per {lock_name}, potenziale duplicazione")
+                # Proviamo comunque a cercare un hotspot esistente
+                existing_hotspot_id = self.find_matching_hotspot(
+                    center_lat, center_lon, radius_km, pollutant_type
+                )
                 
+                if existing_hotspot_id:
+                    # Se troviamo un match, aggiorniamolo
+                    return self._update_hotspot(existing_hotspot_id, hotspot_data)
+                else:
+                    # Altrimenti, restituiamo i dati originali
+                    return hotspot_data
+                
+            try:
+                # Cerca hotspot esistente
+                existing_hotspot_id = self.find_matching_hotspot(
+                    center_lat, center_lon, radius_km, pollutant_type
+                )
+                
+                if existing_hotspot_id:
+                    # Aggiorna hotspot esistente
+                    return self._update_hotspot(existing_hotspot_id, hotspot_data)
+                else:
+                    # Crea nuovo hotspot
+                    return self._create_hotspot(hotspot_data)
+            finally:
+                # Rilascia il lock in ogni caso
+                self._release_lock(lock_name, lock_value)
+                    
         except Exception as e:
             logger.error(f"Errore in create_or_update_hotspot: {e}")
             # Restituisci i dati originali in caso di errore

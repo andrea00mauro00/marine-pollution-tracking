@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import json
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -45,10 +46,9 @@ class TimescaleClient:
             return False
             
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.close()
-            return True
+            with self.conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                return True
         except Exception:
             return False
     
@@ -62,256 +62,387 @@ class TimescaleClient:
         self.conn = self._connect()
         return self.is_connected()
     
-    def get_sensor_data(self, source_id=None, hours=24):
+    # ===== SENSOR MEASUREMENTS METHODS =====
+    
+    def get_sensor_measurements(self, source_id=None, hours=24, as_dataframe=True):
         """Get sensor measurements for a specific source or all sources"""
+        if not self.is_connected() and not self.reconnect():
+            return pd.DataFrame() if as_dataframe else []
+        
         try:
-            if not self.conn and not self.reconnect():
-                return self._get_mock_sensor_data(source_id, hours)
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # Calculate time range
+                end_time = datetime.now()
+                start_time = end_time - timedelta(hours=hours)
                 
-            cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-            
-            # Calculate time range
-            end_time = datetime.now()
-            start_time = end_time - timedelta(hours=hours)
-            
-            if source_id:
+                # Build query
                 query = """
-                SELECT * FROM sensor_measurements
-                WHERE source_id = %s AND time >= %s AND time <= %s
-                ORDER BY time DESC
-                """
-                cursor.execute(query, (source_id, start_time, end_time))
-            else:
-                query = """
-                SELECT * FROM sensor_measurements
+                SELECT time, source_type, source_id, latitude, longitude,
+                       temperature, ph, turbidity, wave_height, microplastics,
+                       water_quality_index, pollution_level, pollutant_type, risk_score
+                FROM sensor_measurements
                 WHERE time >= %s AND time <= %s
-                ORDER BY time DESC
                 """
-                cursor.execute(query, (start_time, end_time))
-            
-            measurements = cursor.fetchall()
-            cursor.close()
-            
-            # Convert to DataFrame
-            if measurements:
-                df = pd.DataFrame(measurements)
-                # Ensure 'time' column is datetime type
-                if 'time' in df.columns:
-                    df['time'] = pd.to_datetime(df['time'])
-                return df
-            else:
-                return self._get_mock_sensor_data(source_id, hours)
-        
+                
+                params = [start_time, end_time]
+                if source_id:
+                    query += " AND source_id = %s"
+                    params.append(source_id)
+                
+                query += " ORDER BY time DESC"
+                
+                cursor.execute(query, tuple(params))
+                measurements = cursor.fetchall()
+                
+                if as_dataframe:
+                    if measurements:
+                        df = pd.DataFrame(measurements)
+                        # Convert timestamp to datetime
+                        if 'time' in df.columns:
+                            df['time'] = pd.to_datetime(df['time'])
+                        return df
+                    else:
+                        return pd.DataFrame()
+                else:
+                    # Convert timestamps for JSON serialization
+                    for m in measurements:
+                        if m['time']:
+                            m['time'] = m['time'].isoformat()
+                    return measurements
         except Exception as e:
-            logging.error(f"Error fetching sensor data: {e}")
-            return self._get_mock_sensor_data(source_id, hours)
+            logging.error(f"Error getting sensor measurements: {e}")
+            return pd.DataFrame() if as_dataframe else []
     
-    def get_sensor_metrics_by_hour(self, hours=24):
+    def get_sensor_metrics_by_hour(self, hours=24, as_dataframe=True):
         """Get aggregated sensor metrics by hour"""
+        if not self.is_connected() and not self.reconnect():
+            return pd.DataFrame() if as_dataframe else []
+        
         try:
-            if not self.conn and not self.reconnect():
-                return self._get_mock_hourly_metrics(hours)
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # Calculate time range
+                end_time = datetime.now()
+                start_time = end_time - timedelta(hours=hours)
                 
-            cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-            
-            # Calculate time range
-            end_time = datetime.now()
-            start_time = end_time - timedelta(hours=hours)
-            
-            query = """
-            SELECT 
-                time_bucket('1 hour', time) AS hour,
-                AVG(ph) AS avg_ph,
-                AVG(turbidity) AS avg_turbidity,
-                AVG(temperature) AS avg_temperature,
-                AVG(microplastics) AS avg_microplastics,
-                AVG(water_quality_index) AS avg_wqi,
-                COUNT(*) AS count
-            FROM sensor_measurements
-            WHERE time >= %s AND time <= %s
-            GROUP BY hour
-            ORDER BY hour
-            """
-            
-            cursor.execute(query, (start_time, end_time))
-            rows = cursor.fetchall()
-            cursor.close()
-            
-            if rows:
-                df = pd.DataFrame(rows)
-                # Ensure 'hour' column is datetime type
-                if 'hour' in df.columns:
-                    df['hour'] = pd.to_datetime(df['hour'])
-                return df
-            else:
-                return self._get_mock_hourly_metrics(hours)
-        
+                query = """
+                SELECT 
+                    time_bucket('1 hour', time) AS hour,
+                    COUNT(DISTINCT source_id) AS sensor_count,
+                    AVG(temperature) AS avg_temperature,
+                    AVG(ph) AS avg_ph,
+                    AVG(turbidity) AS avg_turbidity,
+                    AVG(microplastics) AS avg_microplastics,
+                    AVG(water_quality_index) AS avg_water_quality_index,
+                    AVG(risk_score) AS avg_risk_score
+                FROM sensor_measurements
+                WHERE time >= %s AND time <= %s
+                GROUP BY hour
+                ORDER BY hour
+                """
+                
+                cursor.execute(query, (start_time, end_time))
+                rows = cursor.fetchall()
+                
+                if as_dataframe:
+                    if rows:
+                        df = pd.DataFrame(rows)
+                        # Convert timestamp to datetime
+                        if 'hour' in df.columns:
+                            df['hour'] = pd.to_datetime(df['hour'])
+                        return df
+                    else:
+                        return pd.DataFrame()
+                else:
+                    # Convert timestamps for JSON serialization
+                    for r in rows:
+                        if r['hour']:
+                            r['hour'] = r['hour'].isoformat()
+                    return rows
         except Exception as e:
-            logging.error(f"Error fetching hourly metrics: {e}")
-            return self._get_mock_hourly_metrics(hours)
+            logging.error(f"Error getting sensor metrics: {e}")
+            return pd.DataFrame() if as_dataframe else []
     
-    def get_pollution_hotspots(self, days=7):
-        """Get pollution hotspots from the database"""
+    def get_pollution_metrics(self, region=None, days=7, as_dataframe=True):
+        """Get pollution metrics by region"""
+        if not self.is_connected() and not self.reconnect():
+            return pd.DataFrame() if as_dataframe else []
+        
         try:
-            if not self.conn and not self.reconnect():
-                return self._get_mock_hotspots()
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # Calculate time range
+                end_time = datetime.now()
+                start_time = end_time - timedelta(days=days)
                 
-            cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-            
-            # Calculate time range
-            end_time = datetime.now()
-            start_time = end_time - timedelta(days=days)
-            
-            query = """
-            SELECT 
-                id, 
-                name, 
-                lat, 
-                lon, 
-                pollutant_type, 
-                severity_level AS level, 
-                radius, 
-                detected_at, 
-                updated_at
-            FROM pollution_hotspots
-            WHERE detected_at >= %s
-            ORDER BY severity_level DESC, detected_at DESC
-            """
-            
-            cursor.execute(query, (start_time,))
-            hotspots = cursor.fetchall()
-            cursor.close()
-            
-            # Convert to DataFrame
-            if hotspots:
-                df = pd.DataFrame(hotspots)
-                return df
-            else:
-                return self._get_mock_hotspots()
-        
+                # Build query
+                query = """
+                SELECT time, region, avg_risk_score, max_risk_score, 
+                       pollutant_types, sensor_count, affected_area_km2
+                FROM pollution_metrics
+                WHERE time >= %s AND time <= %s
+                """
+                
+                params = [start_time, end_time]
+                if region:
+                    query += " AND region = %s"
+                    params.append(region)
+                
+                query += " ORDER BY time DESC"
+                
+                cursor.execute(query, tuple(params))
+                metrics = cursor.fetchall()
+                
+                if as_dataframe:
+                    if metrics:
+                        df = pd.DataFrame(metrics)
+                        # Convert timestamp to datetime
+                        if 'time' in df.columns:
+                            df['time'] = pd.to_datetime(df['time'])
+                        return df
+                    else:
+                        return pd.DataFrame()
+                else:
+                    # Convert timestamps and JSON for serialization
+                    for m in metrics:
+                        if m['time']:
+                            m['time'] = m['time'].isoformat()
+                        if m['pollutant_types']:
+                            m['pollutant_types'] = json.loads(m['pollutant_types'])
+                    return metrics
         except Exception as e:
-            logging.error(f"Error fetching pollution hotspots: {e}")
-            return self._get_mock_hotspots()
+            logging.error(f"Error getting pollution metrics: {e}")
+            return pd.DataFrame() if as_dataframe else []
     
-    def get_satellite_images_metadata(self, limit=20):
-        """Get satellite image metadata"""
+    # ===== HOTSPOT METHODS =====
+    
+    def get_active_hotspots(self, status=None, as_dataframe=True):
+        """Get active hotspots from the database"""
+        if not self.is_connected() and not self.reconnect():
+            return pd.DataFrame() if as_dataframe else []
+        
         try:
-            if not self.conn and not self.reconnect():
-                return self._get_mock_satellite_metadata(limit)
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # Build query
+                query = """
+                SELECT hotspot_id, center_latitude, center_longitude, radius_km,
+                       pollutant_type, severity, status, first_detected_at,
+                       last_updated_at, update_count, avg_risk_score, max_risk_score,
+                       parent_hotspot_id, derived_from
+                FROM active_hotspots
+                """
                 
-            cursor = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-            
-            query = """
-            SELECT 
-                id, 
-                filename, 
-                capture_date, 
-                location_name, 
-                lat, 
-                lon, 
-                has_pollution, 
-                pollution_score,
-                storage_path,
-                thumbnail_path
-            FROM satellite_images
-            ORDER BY capture_date DESC
-            LIMIT %s
-            """
-            
-            cursor.execute(query, (limit,))
-            images = cursor.fetchall()
-            cursor.close()
-            
-            # Convert to DataFrame
-            if images:
-                df = pd.DataFrame(images)
-                return df
-            else:
-                return self._get_mock_satellite_metadata(limit)
-        
+                params = []
+                if status:
+                    query += " WHERE status = %s"
+                    params.append(status)
+                
+                query += " ORDER BY severity DESC, last_updated_at DESC"
+                
+                cursor.execute(query, tuple(params))
+                hotspots = cursor.fetchall()
+                
+                if as_dataframe:
+                    if hotspots:
+                        df = pd.DataFrame(hotspots)
+                        # Convert timestamps to datetime
+                        for col in ['first_detected_at', 'last_updated_at']:
+                            if col in df.columns:
+                                df[col] = pd.to_datetime(df[col])
+                        return df
+                    else:
+                        return pd.DataFrame()
+                else:
+                    # Convert timestamps for JSON serialization
+                    for h in hotspots:
+                        if h['first_detected_at']:
+                            h['first_detected_at'] = h['first_detected_at'].isoformat()
+                        if h['last_updated_at']:
+                            h['last_updated_at'] = h['last_updated_at'].isoformat()
+                    return hotspots
         except Exception as e:
-            logging.error(f"Error fetching satellite image metadata: {e}")
-            return self._get_mock_satellite_metadata(limit)
+            logging.error(f"Error getting active hotspots: {e}")
+            return pd.DataFrame() if as_dataframe else []
     
-    def _get_mock_sensor_data(self, source_id=None, hours=24):
-        """Generate mock sensor data when database is unavailable"""
-        # Create time range
-        end_time = datetime.now()
-        timestamps = pd.date_range(end=end_time, periods=hours*4, freq='15min')
+    def get_hotspot_versions(self, hotspot_id, as_dataframe=True):
+        """Get version history for a hotspot"""
+        if not self.is_connected() and not self.reconnect():
+            return pd.DataFrame() if as_dataframe else []
         
-        # Generate random source IDs if not specified
-        if source_id:
-            source_ids = [source_id] * len(timestamps)
-        else:
-            # Generate 5 random source IDs
-            random_sources = [f"sensor_{i:03d}" for i in range(1, 6)]
-            source_ids = np.random.choice(random_sources, len(timestamps))
-        
-        # Generate random measurements
-        data = {
-            'time': timestamps,
-            'source_id': source_ids,
-            'ph': np.random.uniform(6.5, 8.5, len(timestamps)),
-            'temperature': np.random.uniform(15, 25, len(timestamps)),
-            'turbidity': np.random.uniform(0, 10, len(timestamps)),
-            'microplastics': np.random.uniform(0, 5, len(timestamps)),
-            'water_quality_index': np.random.uniform(50, 100, len(timestamps))
-        }
-        
-        return pd.DataFrame(data)
+        try:
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                query = """
+                SELECT version_id, hotspot_id, center_latitude, center_longitude,
+                       radius_km, severity, risk_score, detected_at, 
+                       is_significant_change, version_time
+                FROM hotspot_versions
+                WHERE hotspot_id = %s
+                ORDER BY detected_at
+                """
+                
+                cursor.execute(query, (hotspot_id,))
+                versions = cursor.fetchall()
+                
+                if as_dataframe:
+                    if versions:
+                        df = pd.DataFrame(versions)
+                        # Convert timestamps to datetime
+                        for col in ['detected_at', 'version_time']:
+                            if col in df.columns:
+                                df[col] = pd.to_datetime(df[col])
+                        return df
+                    else:
+                        return pd.DataFrame()
+                else:
+                    # Convert timestamps for JSON serialization
+                    for v in versions:
+                        if v['detected_at']:
+                            v['detected_at'] = v['detected_at'].isoformat()
+                        if v['version_time']:
+                            v['version_time'] = v['version_time'].isoformat()
+                    return versions
+        except Exception as e:
+            logging.error(f"Error getting hotspot versions: {e}")
+            return pd.DataFrame() if as_dataframe else []
     
-    def _get_mock_hourly_metrics(self, hours=24):
-        """Generate mock hourly metrics when database is unavailable"""
-        # Create hourly time range
-        end_time = datetime.now().replace(minute=0, second=0, microsecond=0)
-        hourly_timestamps = pd.date_range(end=end_time, periods=hours, freq='H')
+    def get_hotspot_details(self, hotspot_id):
+        """Get detailed information about a hotspot"""
+        if not self.is_connected() and not self.reconnect():
+            return None
         
-        # Generate random aggregated metrics
-        data = {
-            'hour': hourly_timestamps,
-            'avg_ph': np.random.uniform(6.8, 8.2, hours),
-            'avg_turbidity': np.random.uniform(1, 8, hours),
-            'avg_temperature': np.random.uniform(18, 22, hours),
-            'avg_microplastics': np.random.uniform(0.5, 3, hours),
-            'avg_wqi': np.random.uniform(60, 90, hours),
-            'count': np.random.randint(10, 50, hours)
-        }
-        
-        return pd.DataFrame(data)
+        try:
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                query = """
+                SELECT hotspot_id, center_latitude, center_longitude, radius_km,
+                       pollutant_type, severity, status, first_detected_at,
+                       last_updated_at, last_significant_update_at, update_count, 
+                       avg_risk_score, max_risk_score, parent_hotspot_id, 
+                       derived_from, source_data
+                FROM active_hotspots
+                WHERE hotspot_id = %s
+                """
+                
+                cursor.execute(query, (hotspot_id,))
+                hotspot = cursor.fetchone()
+                
+                if not hotspot:
+                    return None
+                
+                # Convert JSON and timestamps
+                if hotspot['source_data']:
+                    hotspot['source_data'] = json.loads(hotspot['source_data'])
+                if hotspot['first_detected_at']:
+                    hotspot['first_detected_at'] = hotspot['first_detected_at'].isoformat()
+                if hotspot['last_updated_at']:
+                    hotspot['last_updated_at'] = hotspot['last_updated_at'].isoformat()
+                if hotspot['last_significant_update_at']:
+                    hotspot['last_significant_update_at'] = hotspot['last_significant_update_at'].isoformat()
+                
+                return hotspot
+        except Exception as e:
+            logging.error(f"Error getting hotspot details: {e}")
+            return None
     
-    def _get_mock_hotspots(self):
-        """Generate mock pollution hotspots when database is unavailable"""
-        # Generate random hotspots in the Chesapeake Bay area
-        num_hotspots = 8
-        
-        # Base coordinates for Chesapeake Bay
-        base_lat, base_lon = 38.5, -76.4
-        
-        # Generate random timestamps within the last week
-        now = datetime.now()
-        detected_times = [now - timedelta(days=np.random.uniform(0, 7)) for _ in range(num_hotspots)]
-        
-        # Generate hotspot data
-        data = {
-            'id': [f"hotspot_{i:03d}" for i in range(1, num_hotspots+1)],
-            'name': [f"Pollution Hotspot {i}" for i in range(1, num_hotspots+1)],
-            'lat': [base_lat + np.random.uniform(-1, 1) for _ in range(num_hotspots)],
-            'lon': [base_lon + np.random.uniform(-1, 1) for _ in range(num_hotspots)],
-            'pollutant_type': np.random.choice(['oil', 'plastic', 'chemical', 'sewage'], num_hotspots),
-            'level': np.random.choice(['high', 'medium', 'low'], num_hotspots, p=[0.2, 0.3, 0.5]),
-            'radius': np.random.uniform(0.5, 3, num_hotspots),
-            'detected_at': detected_times,
-            'updated_at': detected_times
-        }
-        
-        return pd.DataFrame(data)
+    # ===== PREDICTION METHODS =====
     
-    def _get_mock_satellite_metadata(self, limit=20):
-        """Generate mock satellite image metadata when database is unavailable"""
-        # Do NOT generate mock data for satellite images
-        # Return an empty DataFrame instead
-        return pd.DataFrame(columns=[
-            'id', 'filename', 'capture_date', 'location_name', 
-            'lat', 'lon', 'has_pollution', 'pollution_score',
-            'storage_path', 'thumbnail_path'
-        ])
+    def get_predictions(self, hotspot_id=None, hours_ahead=None, as_dataframe=True):
+        """Get predictions, optionally filtered by hotspot and time horizon"""
+        if not self.is_connected() and not self.reconnect():
+            return pd.DataFrame() if as_dataframe else []
+        
+        try:
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # Build query
+                query = """
+                SELECT prediction_id, hotspot_id, prediction_set_id, hours_ahead,
+                       prediction_time, center_latitude, center_longitude, radius_km,
+                       area_km2, pollutant_type, surface_concentration, 
+                       dissolved_concentration, evaporated_concentration,
+                       environmental_score, severity, priority_score, confidence,
+                       parent_hotspot_id, derived_from, generated_at
+                FROM pollution_predictions
+                WHERE prediction_time > NOW()
+                """
+                
+                params = []
+                if hotspot_id:
+                    query += " AND hotspot_id = %s"
+                    params.append(hotspot_id)
+                
+                if hours_ahead:
+                    query += " AND hours_ahead = %s"
+                    params.append(hours_ahead)
+                
+                query += " ORDER BY prediction_time"
+                
+                cursor.execute(query, tuple(params))
+                predictions = cursor.fetchall()
+                
+                if as_dataframe:
+                    if predictions:
+                        df = pd.DataFrame(predictions)
+                        # Convert timestamps to datetime
+                        for col in ['prediction_time', 'generated_at']:
+                            if col in df.columns:
+                                df[col] = pd.to_datetime(df[col])
+                        return df
+                    else:
+                        return pd.DataFrame()
+                else:
+                    # Convert timestamps for JSON serialization
+                    for p in predictions:
+                        if p['prediction_time']:
+                            p['prediction_time'] = p['prediction_time'].isoformat()
+                        if p['generated_at']:
+                            p['generated_at'] = p['generated_at'].isoformat()
+                    return predictions
+        except Exception as e:
+            logging.error(f"Error getting predictions: {e}")
+            return pd.DataFrame() if as_dataframe else []
+    
+    def get_prediction_set(self, prediction_set_id, as_dataframe=True):
+        """Get all predictions in a prediction set"""
+        if not self.is_connected() and not self.reconnect():
+            return pd.DataFrame() if as_dataframe else []
+        
+        try:
+            with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                query = """
+                SELECT prediction_id, hotspot_id, prediction_set_id, hours_ahead,
+                       prediction_time, center_latitude, center_longitude, radius_km,
+                       area_km2, pollutant_type, surface_concentration, 
+                       dissolved_concentration, evaporated_concentration,
+                       environmental_score, severity, priority_score, confidence,
+                       parent_hotspot_id, derived_from, generated_at
+                FROM pollution_predictions
+                WHERE prediction_set_id = %s
+                ORDER BY hours_ahead
+                """
+                
+                cursor.execute(query, (prediction_set_id,))
+                predictions = cursor.fetchall()
+                
+                if as_dataframe:
+                    if predictions:
+                        df = pd.DataFrame(predictions)
+                        # Convert timestamps to datetime
+                        for col in ['prediction_time', 'generated_at']:
+                            if col in df.columns:
+                                df[col] = pd.to_datetime(df[col])
+                        return df
+                    else:
+                        return pd.DataFrame()
+                else:
+                    # Convert timestamps for JSON serialization
+                    for p in predictions:
+                        if p['prediction_time']:
+                            p['prediction_time'] = p['prediction_time'].isoformat()
+                        if p['generated_at']:
+                            p['generated_at'] = p['generated_at'].isoformat()
+                    return predictions
+        except Exception as e:
+            logging.error(f"Error getting prediction set: {e}")
+            return pd.DataFrame() if as_dataframe else []
+    
+    def close(self):
+        """Close the database connection"""
+        if self.conn:
+            self.conn.close()

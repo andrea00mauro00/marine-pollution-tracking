@@ -280,18 +280,22 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                 max_risk_score = data['max_risk_score']
                 # Usa stesso formato di spatial hash di HotspotManager
                 spatial_hash = f"{math.floor(float(lat)/SPATIAL_BIN_SIZE)}:{math.floor(float(lon)/SPATIAL_BIN_SIZE)}"
+                
+                # Imposta stato iniziale a 'active'
+                data["status"] = "active"
 
                 timescale_cur.execute("""
                     INSERT INTO active_hotspots (
                         hotspot_id, center_latitude, center_longitude, radius_km,
-                        pollutant_type, severity, first_detected_at, last_updated_at,
+                        pollutant_type, severity, status, first_detected_at, last_updated_at,
                         update_count, avg_risk_score, max_risk_score, source_data, spatial_hash
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s)
                     ON CONFLICT (hotspot_id) DO UPDATE SET
                         center_latitude   = EXCLUDED.center_latitude,
                         center_longitude  = EXCLUDED.center_longitude,
                         radius_km         = EXCLUDED.radius_km,
                         severity          = EXCLUDED.severity,
+                        status            = EXCLUDED.status,
                         last_updated_at   = EXCLUDED.last_updated_at,
                         update_count      = active_hotspots.update_count + 1,
                         avg_risk_score    = EXCLUDED.avg_risk_score,
@@ -300,7 +304,7 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                         spatial_hash      = EXCLUDED.spatial_hash
                 """, (
                     hotspot_id, lat, lon, radius,
-                    pollutant_type, severity,
+                    pollutant_type, severity, 'active',
                     detected_at, detected_at,
                     avg_risk_score, max_risk_score,
                     Json(data), spatial_hash
@@ -316,14 +320,20 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
             else:
                 # Aggiornamento hotspot - Prima legge dati correnti
                 timescale_cur.execute("""
-                    SELECT center_latitude, center_longitude, radius_km, severity, max_risk_score
+                    SELECT center_latitude, center_longitude, radius_km, severity, max_risk_score, status
                     FROM active_hotspots WHERE hotspot_id = %s
                 """, (hotspot_id,))
                 
                 old_data = timescale_cur.fetchone()
                 
                 if old_data:
-                    old_lat, old_lon, old_radius, old_severity, old_risk = old_data
+                    old_lat, old_lon, old_radius, old_severity, old_risk, old_status = old_data
+                    
+                    # Determina lo stato dell'hotspot
+                    status = old_status
+                    # Riattiva se ci sono cambiamenti significativi o di severità
+                    if data.get('is_significant_change', False) or data.get('severity_changed', False):
+                        status = 'active'
                     
                     # Salva versione precedente in TimescaleDB
                     timescale_cur.execute("""
@@ -353,6 +363,7 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                             center_longitude = %s,
                             radius_km = %s,
                             severity = %s,
+                            status = %s,
                             last_updated_at = %s,
                             update_count = update_count + 1,
                             avg_risk_score = %s,
@@ -365,6 +376,7 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                         new_lon,
                         data['location']['radius_km'],
                         data['severity'],
+                        status,
                         detected_at,
                         data['avg_risk_score'],
                         max(old_risk, data['max_risk_score']),
@@ -373,6 +385,9 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                         hotspot_id
                     ))
                     timescale_modified = True
+                    
+                    # Aggiorna lo stato nei dati
+                    data["status"] = status
                     
                     # Assicurati che i campi di relazione siano impostati per aggiornamenti
                     if "parent_hotspot_id" not in data:
@@ -402,7 +417,8 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                     'is_significant': data.get('is_significant_change', False),
                     'parent_hotspot_id': data.get('parent_hotspot_id', None),
                     'derived_from': data.get('derived_from', None),
-                    'original_id': data.get('original_hotspot_id', None)
+                    'original_id': data.get('original_hotspot_id', None),
+                    'status': data.get('status', 'active')  # Include status in event data
                 })
             ))
             postgres_modified = True
@@ -413,7 +429,7 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
         if postgres_modified:
             postgres_conn.commit()
             
-        logger.info(f"Salvato hotspot {hotspot_id} (update: {is_update})")
+        logger.info(f"Salvato hotspot {hotspot_id} (update: {is_update}, status: {data.get('status', 'active')})")
         
     except Exception as e:
         # Rollback both connections in case of error

@@ -339,11 +339,18 @@ services:
       context: ./storage_consumer
     container_name: storage_consumer
     depends_on:
-      - kafka
-      - timescaledb
-      - minio
-      - create_buckets
-      - setup_database
+      kafka:
+        condition: service_started
+      timescaledb:
+        condition: service_started
+      postgres:
+        condition: service_started
+      minio:
+        condition: service_started
+      create_buckets:
+        condition: service_completed_successfully
+      setup_database:
+        condition: service_completed_successfully
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - TIMESCALE_HOST=timescaledb
@@ -373,9 +380,12 @@ services:
       context: ./dashboard_consumer
     container_name: dashboard_consumer
     depends_on:
-      - kafka
-      - redis
-      - setup_database
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+      setup_database:
+        condition: service_completed_successfully
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - REDIS_HOST=redis
@@ -392,10 +402,14 @@ services:
       context: ./alert_manager
     container_name: alert_manager
     depends_on:
-      - kafka
-      - redis
-      - postgres
-      - setup_database
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_started
+      setup_database:
+        condition: service_completed_successfully
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - REDIS_HOST=redis
