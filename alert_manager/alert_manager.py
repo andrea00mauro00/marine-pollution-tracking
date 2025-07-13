@@ -8,6 +8,9 @@ import psycopg2
 from psycopg2.extras import Json
 from datetime import datetime
 from kafka import KafkaConsumer
+import sys
+sys.path.append('/opt/flink/usrlib')
+from common.redis_keys import *  # Importa le chiavi standardizzate
 
 # Configurazione logging
 logging.basicConfig(
@@ -110,6 +113,10 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
         severity = data.get('severity', 'medium')  # Default a medium se non specificato
         pollutant_type = data.get('pollutant_type', 'unknown')  # Default a unknown se non specificato
         
+        # Estrai campi di relazione
+        parent_hotspot_id = data.get('parent_hotspot_id')
+        derived_from = data.get('derived_from')
+        
         # Verifica se esiste già record in database
         with postgres_conn.cursor() as cur:
             cur.execute("SELECT alert_id FROM pollution_alerts WHERE alert_id = %s", (alert_id,))
@@ -170,7 +177,7 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
         notifications_sent = {"email": []}
         
         for recipient in list(email_recipients):
-            cooldown_key = f"alert:cooldown:{hotspot_id}:{recipient}"
+            cooldown_key = alert_cooldown_key(hotspot_id, recipient)
             
             # Verifica se in cooldown
             if redis_conn.exists(cooldown_key):
@@ -196,6 +203,13 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                     "status": "delivered"
                 })
         
+        # Arricchisci i dettagli con informazioni di relazione
+        details = dict(data)
+        if parent_hotspot_id:
+            details['parent_hotspot_id'] = parent_hotspot_id
+        if derived_from:
+            details['derived_from'] = derived_from
+        
         # Salva alert nel database con stato di notifica
         with postgres_conn.cursor() as cur:
             cur.execute("""
@@ -217,7 +231,7 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 pollutant_type,
                 data['max_risk_score'],
                 message,
-                Json(data),
+                Json(details),
                 True,  # processed
                 Json(notifications_sent)
             ))

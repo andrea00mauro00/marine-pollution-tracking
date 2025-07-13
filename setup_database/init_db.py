@@ -172,51 +172,78 @@ def init_redis():
         
         # Pulisci tutte le chiavi esistenti
         existing_keys = r.keys("hotspot:*") + r.keys("spatial:*") + r.keys("config:*") + \
-                        r.keys("counters:*") + r.keys("cache:*") + r.keys("dashboard:*") + \
-                        r.keys("alert:*")
+                        r.keys("counters:*") + r.keys("dashboard:*") + r.keys("alert:*") + \
+                        r.keys("locks:*")  # Aggiunto locks:*
         if existing_keys:
             r.delete(*existing_keys)
             logger.info(f"Rimosse {len(existing_keys)} chiavi Redis esistenti")
         
-        # Configurazione sistema (esistente)
-        r.set("config:hotspot:spatial_bin_size", "0.05")     # Dimensione griglia spaziale in gradi (~5km)
-        r.set("config:hotspot:ttl_hours", "72")              # Tempo di vita massimo hotspot attivi
-        r.set("config:alert:cooldown_minutes:low", "60")     # Cooldown per alert a bassa priorità
-        r.set("config:alert:cooldown_minutes:medium", "30")  # Cooldown per alert a media priorità
-        r.set("config:alert:cooldown_minutes:high", "15")    # Cooldown per alert ad alta priorità
-        r.set("config:prediction:min_interval_minutes", "30") # Intervallo minimo tra previsioni
+        # Configurazione sistema
+        r.set("config:hotspot:spatial_bin_size", "0.05")       # Dimensione griglia spaziale in gradi (~5km)
+        r.set("config:hotspot:ttl_hours", "72")                # Tempo di vita massimo hotspot attivi
+        r.set("config:alert:cooldown_minutes:low", "60")       # Cooldown per alert a bassa priorità
+        r.set("config:alert:cooldown_minutes:medium", "30")    # Cooldown per alert a media priorità
+        r.set("config:alert:cooldown_minutes:high", "15")      # Cooldown per alert ad alta priorità
+        r.set("config:prediction:min_interval_minutes", "30")  # Intervallo minimo tra previsioni
         
-        # Nuove configurazioni per cache e dashboard
+        # Configurazioni per cache e dashboard
         r.set("config:cache:dashboard_refresh_seconds", "60")  # Intervallo aggiornamento dashboard
-        r.set("config:cache:alerts_ttl", "3600")             # TTL per cache alert (1 ora)
-        r.set("config:cache:sensor_data_ttl", "1800")        # TTL per dati sensori (30 minuti)
-        r.set("config:cache:predictions_ttl", "7200")        # TTL per previsioni (2 ore)
-        r.set("config:dashboard:max_items", "50")            # Numero massimo elementi in liste dashboard
+        r.set("config:cache:alerts_ttl", "3600")               # TTL per cache alert (1 ora)
+        r.set("config:cache:sensor_data_ttl", "1800")          # TTL per dati sensori (30 minuti)
+        r.set("config:cache:predictions_ttl", "7200")          # TTL per previsioni (2 ore)
+        r.set("config:dashboard:max_items", "50")              # Numero massimo elementi in liste dashboard
         
-        # Inizializza contatori (esistenti)
-        r.set("counters:hotspots:total", "0")
-        r.set("counters:alerts:total", "0")
-        r.set("counters:predictions:total", "0")
+        # Configurazioni per lock distribuiti (nuove)
+        r.set("config:locks:hotspot_ttl", "10")                # TTL per lock hotspot (10 secondi)
+        r.set("config:locks:retry_count", "3")                 # Numero tentativi per acquisire lock
+        r.set("config:locks:retry_delay", "100")               # Delay tra tentativi (ms)
         
-        # Nuovi contatori per dashboard e alert
-        r.set("counters:alerts:active", "0")                # Alert attivi
-        r.set("counters:alerts:by_severity:high", "0")      # Alert per severità
+        # Inizializza contatori
+        r.set("counters:hotspots:total", "0")                  # Totale hotspot rilevati
+        r.set("counters:alerts:total", "0")                    # Totale alert generati
+        r.set("counters:predictions:total", "0")               # Totale prediction sets generati
+        r.set("counters:alerts:active", "0")                   # Alert attivi
+        r.set("counters:alerts:by_severity:high", "0")         # Alert per severità
         r.set("counters:alerts:by_severity:medium", "0")
         r.set("counters:alerts:by_severity:low", "0")
-        r.set("counters:hotspots:active", "0")              # Hotspot attivi
+        r.set("counters:hotspots:active", "0")                 # Hotspot attivi
+        r.set("counters:hotspots:inactive", "0")               # Hotspot inattivi
         
-        # Crea strutture di base per tracciamento spaziale (esistente)
+        # Crea strutture di base per tracciamento
         r.sadd("hotspot:indices", "spatial")
-        
-        # Strutture per dashboard
         r.sadd("dashboard:indices", "hotspots", "alerts", "predictions")
         
-        # Impostazione TTL (esistente)
-        r.set("config:cache:hotspot_metadata_ttl", "86400")  # 24 ore
+        # Impostazione TTL
+        r.set("config:cache:hotspot_metadata_ttl", "86400")    # 24 ore
         
-        # Verifica configurazione
-        logger.info(f"✅ Configurazioni impostate: {r.keys('config:*')}")
-        logger.info(f"✅ Contatori inizializzati: {r.keys('counters:*')}")
+        # Script Lua per lock distribuiti
+        acquire_lock_script = """
+        local lock_key = KEYS[1]
+        local lock_value = ARGV[1]
+        local ttl = tonumber(ARGV[2])
+        
+        if redis.call('setnx', lock_key, lock_value) == 1 then
+            redis.call('expire', lock_key, ttl)
+            return 1
+        else
+            return 0
+        end
+        """
+        
+        release_lock_script = """
+        local lock_key = KEYS[1]
+        local lock_value = ARGV[1]
+        
+        if redis.call('get', lock_key) == lock_value then
+            return redis.call('del', lock_key)
+        else
+            return 0
+        end
+        """
+        
+        # Registra script in Redis
+        r.set("scripts:acquire_lock", acquire_lock_script)
+        r.set("scripts:release_lock", release_lock_script)
         
         logger.info("✅ Strutture Redis inizializzate con successo")
         

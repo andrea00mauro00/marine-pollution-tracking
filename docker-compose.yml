@@ -274,6 +274,8 @@ services:
       - REDIS_PORT=6379
     networks:
       - marine_net
+    volumes:
+      - ./common:/opt/flink/usrlib/common
     restart: on-failure
 
   ml_prediction_job:
@@ -293,6 +295,8 @@ services:
       # Database connections
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+    volumes:
+      - ./common:/opt/flink/usrlib/common
     networks:
       - marine_net
     restart: on-failure
@@ -358,6 +362,8 @@ services:
       - HOTSPOTS_TOPIC=pollution_hotspots
       - PREDICTIONS_TOPIC=pollution_predictions
       - ALERTS_TOPIC=sensor_alerts
+    volumes:
+      - ./common:/opt/flink/usrlib/common
     networks:
       - marine_net
     restart: on-failure
@@ -414,6 +420,8 @@ services:
       - WEBHOOK_ENABLED=false
       # Regional configuration
       - REGIONAL_CONFIG={"upper_bay":{"email_recipients":["upperchesapeake@example.com"]}}
+    volumes:
+      - ./common:/opt/flink/usrlib/common
     networks:
       - marine_net
     restart: on-failure

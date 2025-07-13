@@ -7,6 +7,7 @@ import logging
 import time
 import hashlib
 from datetime import datetime, timedelta
+from common.redis_keys import *  # Importa le chiavi standardizzate
 
 # Configurazione logging
 logging.basicConfig(
@@ -110,7 +111,7 @@ class HotspotManager:
                 for delta_lon in [-1, 0, 1]:
                     current_lat_bin = lat_bin + delta_lat
                     current_lon_bin = lon_bin + delta_lon
-                    key = f"spatial:{current_lat_bin}:{current_lon_bin}"
+                    key = spatial_bin_key(current_lat_bin, current_lon_bin)
                     
                     bin_results = self.redis_client.smembers(key)
                     if bin_results:
@@ -121,15 +122,15 @@ class HotspotManager:
             # 2. Per ogni ID, verifica sovrapposizione spaziale
             for hotspot_id in nearby_hotspot_ids:
                 # Prova formato dashboard_consumer
-                alt_key = f"hotspot:{hotspot_id}"
-                hotspot_data = self.redis_client.hgetall(alt_key)
+                hotspot_hash_key = hotspot_key(hotspot_id)
+                hotspot_data = self.redis_client.hgetall(hotspot_hash_key)
                 if hotspot_data:
                     # Converti da hash Redis a dizionario Python
                     hotspot_data = {k.decode('utf-8'): v.decode('utf-8') for k, v in hotspot_data.items()}
                 else:
                     # Fallback a vecchio formato metadata
-                    hotspot_key = f"hotspot:{hotspot_id}:metadata"
-                    hotspot_data_bytes = self.redis_client.get(hotspot_key)
+                    hotspot_meta_key = hotspot_metadata_key(hotspot_id)
+                    hotspot_data_bytes = self.redis_client.get(hotspot_meta_key)
                     if not hotspot_data_bytes:
                         continue
                     # Formato JSON serializzato
@@ -306,8 +307,11 @@ class HotspotManager:
                 
             self.timescale_conn.commit()
             
-            # Marca come nuovo
+            # Aggiungi campi di relazione
             hotspot_data["is_new"] = True
+            hotspot_data["parent_hotspot_id"] = None
+            hotspot_data["derived_from"] = None
+            
             logger.info(f"Creato nuovo hotspot: {hotspot_id}")
             return hotspot_data
             
@@ -342,8 +346,16 @@ class HotspotManager:
             update_time = datetime.fromtimestamp(new_data["detected_at"]/1000)
             update_count = existing_data["update_count"] + 1
             
-            # Conserva l'ID originale!
+            # Conserva l'ID originale
+            original_id = new_data.get("hotspot_id")
             new_data["hotspot_id"] = existing_id
+            
+            # Aggiungi campi di relazione
+            new_data["parent_hotspot_id"] = existing_id
+            
+            # Se questo è un hotspot rilevato come duplicato (ha un ID originale diverso)
+            if original_id != existing_id:
+                new_data["derived_from"] = original_id
             
             # Determina se ci sono cambiamenti significativi
             old_severity = existing_data["severity"]
@@ -414,7 +426,8 @@ class HotspotManager:
                             "movement_distance": movement_distance,
                             "radius_change": radius_change,
                             "old_severity": old_severity,
-                            "new_severity": new_severity
+                            "new_severity": new_severity,
+                            "original_id": original_id if original_id != existing_id else None
                         })
                     ))
             

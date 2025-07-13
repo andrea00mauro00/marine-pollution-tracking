@@ -26,6 +26,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 from collections import deque
 
+import sys
+sys.path.append('/opt/flink/usrlib')
 
 # Import for PyFlink
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
@@ -35,6 +37,9 @@ from pyflink.datastream.functions import MapFunction, FilterFunction, KeyedProce
 from pyflink.common import WatermarkStrategy, Time, TypeInformation
 from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
 from pyflink.common.typeinfo import Types
+
+# Import Redis keys
+from common.redis_keys import *  # Importa chiavi standardizzate
 
 # Configure logging
 logging.basicConfig(
@@ -367,6 +372,10 @@ class PollutionSpreadPredictor(MapFunction):
             risk_score = hotspot.get("avg_risk_score", 0.5)
             timestamp = hotspot.get("detected_at", int(time.time() * 1000))
             
+            # Extract relationship fields
+            parent_hotspot_id = hotspot.get("parent_hotspot_id")
+            derived_from = hotspot.get("derived_from")
+            
             # Check if this is an update to an existing hotspot
             is_update = hotspot.get("is_update", False)
             is_significant = hotspot.get("is_significant_change", False)
@@ -420,7 +429,7 @@ class PollutionSpreadPredictor(MapFunction):
             
             # Create full prediction output
             output = {
-                "prediction_set_id": prediction_set_id,
+                "prediction_set_id": prediction_set_id,  # Use deterministic ID
                 "hotspot_id": hotspot_id,
                 "pollutant_type": pollutant_type,
                 "severity": severity,
@@ -442,12 +451,15 @@ class PollutionSpreadPredictor(MapFunction):
                     },
                     "ecosystem_types": list(ecosystem_types.keys())
                 },
-                "predictions": predictions
+                "predictions": predictions,
+                # Include relationship fields
+                "parent_hotspot_id": parent_hotspot_id,
+                "derived_from": derived_from
             }
             
-            # Store prediction timestamp in Redis - usando la stessa chiave di should_generate_predictions
+            # Store prediction timestamp in Redis using standardized key
             if self.redis_client:
-                self.redis_client.set(f"hotspot:{hotspot_id}:last_prediction", int(time.time() * 1000))
+                self.redis_client.set(hotspot_prediction_key(hotspot_id), int(time.time() * 1000))
                 logger.info(f"Updated prediction timestamp for hotspot {hotspot_id}")
             
             logger.info(f"Generated prediction {prediction_set_id} for hotspot {hotspot_id}")
@@ -982,7 +994,7 @@ def generate_prediction_set_id(hotspot_id, timestamp):
 def should_generate_predictions(hotspot_id, redis_client):
     """Verifica se è necessario generare nuove previsioni"""
     # Controlla quando sono state generate le ultime previsioni
-    last_prediction_time = redis_client.get(f"hotspot:{hotspot_id}:last_prediction")
+    last_prediction_time = redis_client.get(hotspot_prediction_key(hotspot_id))
     
     if last_prediction_time:
         # Converti da stringa a timestamp

@@ -2,10 +2,11 @@ import os
 import json
 import time
 import logging
-import redis
 import math
+import redis
 from datetime import datetime
 from kafka import KafkaConsumer
+from common.redis_keys import *  # Importa le chiavi standardizzate
 
 # Configurazione logging
 logging.basicConfig(
@@ -66,15 +67,16 @@ def process_sensor_data(data, redis_conn):
         p = redis_conn.pipeline()
         
         # Hash con ultimo dato
+        sensor_key = f"sensors:latest:{sensor_id}"
         for key, value in sensor_data.items():
             if value != '':
-                p.hset(f"sensors:latest:{sensor_id}", key, value)
+                p.hset(sensor_key, key, value)
                 
         # Set con sensori attivi
         p.sadd("dashboard:sensors:active", sensor_id)
         
         # Impostazione TTL
-        p.expire(f"sensors:latest:{sensor_id}", SENSOR_DATA_TTL)
+        p.expire(sensor_key, SENSOR_DATA_TTL)
         
         # Esegui pipeline
         p.execute()
@@ -98,15 +100,16 @@ def process_analyzed_sensor_data(data, redis_conn):
         p = redis_conn.pipeline()
         
         # Aggiungi dettagli analisi al sensore
-        p.hset(f"sensors:latest:{sensor_id}", "pollution_level", level)
-        p.hset(f"sensors:latest:{sensor_id}", "risk_score", risk_score)
-        p.hset(f"sensors:latest:{sensor_id}", "pollutant_type", pollutant_type)
+        sensor_key = f"sensors:latest:{sensor_id}"
+        p.hset(sensor_key, "pollution_level", level)
+        p.hset(sensor_key, "risk_score", risk_score)
+        p.hset(sensor_key, "pollutant_type", pollutant_type)
         
         # Aggiungi a set per livello di inquinamento
         p.sadd(f"dashboard:sensors:by_level:{level}", sensor_id)
         
         # Aggiorna TTL
-        p.expire(f"sensors:latest:{sensor_id}", SENSOR_DATA_TTL)
+        p.expire(sensor_key, SENSOR_DATA_TTL)
         p.expire(f"dashboard:sensors:by_level:{level}", SENSOR_DATA_TTL)
         
         # Esegui pipeline
@@ -122,6 +125,10 @@ def process_hotspot(data, redis_conn):
         hotspot_id = data['hotspot_id']
         is_update = data.get('is_update', False)
         
+        # Estrai campi di relazione
+        parent_hotspot_id = data.get('parent_hotspot_id', '')
+        derived_from = data.get('derived_from', '')
+        
         # Preparazione dati hotspot
         hotspot_data = {
             'id': hotspot_id,
@@ -135,15 +142,18 @@ def process_hotspot(data, redis_conn):
             'max_risk_score': str(data['max_risk_score']),
             'point_count': str(data.get('point_count', 1)),
             'is_update': 'true' if is_update else 'false',
-            'original_id': data.get('original_hotspot_id', '')
+            'original_id': data.get('original_hotspot_id', ''),
+            'parent_hotspot_id': parent_hotspot_id,
+            'derived_from': derived_from
         }
         
         # Salva in Redis
         p = redis_conn.pipeline()
         
         # Hash con dettagli hotspot
+        hkey = hotspot_key(hotspot_id)
         for key, value in hotspot_data.items():
-            p.hset(f"hotspot:{hotspot_id}", key, value)
+            p.hset(hkey, key, value)
         
         # Set con hotspot attivi
         p.sadd("dashboard:hotspots:active", hotspot_id)
@@ -161,13 +171,13 @@ def process_hotspot(data, redis_conn):
         # Usa esattamente lo stesso metodo di binning di HotspotManager
         lat_bin = math.floor(lat / SPATIAL_BIN_SIZE)
         lon_bin = math.floor(lon / SPATIAL_BIN_SIZE)
-        spatial_key = f"spatial:{lat_bin}:{lon_bin}"
+        spatial_key = spatial_bin_key(lat_bin, lon_bin)
         
         # Usa questo formato standard
         p.sadd(spatial_key, hotspot_id)
         
         # Imposta TTL
-        p.expire(f"hotspot:{hotspot_id}", HOTSPOT_METADATA_TTL)
+        p.expire(hkey, HOTSPOT_METADATA_TTL)
         p.expire(f"dashboard:hotspots:by_severity:{data['severity']}", HOTSPOT_METADATA_TTL)
         p.expire(f"dashboard:hotspots:by_type:{data['pollutant_type']}", HOTSPOT_METADATA_TTL)
         p.expire(spatial_key, HOTSPOT_METADATA_TTL)
@@ -200,9 +210,11 @@ def process_hotspot(data, redis_conn):
                 'severity': data['severity'],
                 'risk_score': data['max_risk_score'],
                 'detected_at': data['detected_at'],
-                'is_update': is_update
+                'is_update': is_update,
+                'parent_hotspot_id': parent_hotspot_id,
+                'derived_from': derived_from
             })
-            redis_conn.set(f"dashboard:hotspot:json:{hotspot_id}", hotspot_json, ex=HOTSPOT_METADATA_TTL)
+            redis_conn.set(dashboard_hotspot_key(hotspot_id), hotspot_json, ex=HOTSPOT_METADATA_TTL)
         
         # Aggiorna il riepilogo hotspot ogni 10 hotspot
         if int(redis_conn.get("counters:hotspots:total") or 0) % 10 == 0:
@@ -217,6 +229,10 @@ def process_prediction(data, redis_conn):
     try:
         prediction_set_id = data['prediction_set_id']
         hotspot_id = data['hotspot_id']
+        
+        # Estrai campi di relazione
+        parent_hotspot_id = data.get('parent_hotspot_id')
+        derived_from = data.get('derived_from')
         
         # Salva riferimento al set di previsioni
         redis_conn.sadd(f"dashboard:predictions:sets", prediction_set_id)
@@ -241,11 +257,14 @@ def process_prediction(data, redis_conn):
                 'location': prediction['location'],
                 'severity': prediction['impact']['severity'],
                 'environmental_score': prediction['impact']['environmental_score'],
-                'confidence': prediction['confidence']
+                'confidence': prediction['confidence'],
+                'parent_hotspot_id': parent_hotspot_id,
+                'derived_from': derived_from
             })
             
             # Salva la previsione
-            p.set(f"dashboard:prediction:{prediction_id}", prediction_json, ex=PREDICTIONS_TTL)
+            prediction_key = dashboard_prediction_key(prediction_id)
+            p.set(prediction_key, prediction_json, ex=PREDICTIONS_TTL)
             
             # Aggiungi alla lista delle previsioni per questo hotspot
             p.zadd(f"dashboard:predictions:for_hotspot:{hotspot_id}", {prediction_id: hours_ahead})
@@ -295,6 +314,10 @@ def process_alert(data, redis_conn):
         # Estrai ID o genera se non presente
         alert_id = data.get('alert_id', f"alert_{data['hotspot_id']}_{int(time.time())}")
         
+        # Estrai campi di relazione
+        parent_hotspot_id = data.get('parent_hotspot_id', '')
+        derived_from = data.get('derived_from', '')
+        
         # Preparazione dati alert
         alert_data = {
             'id': alert_id,
@@ -304,7 +327,9 @@ def process_alert(data, redis_conn):
             'timestamp': data['detected_at'],
             'latitude': data['location']['center_latitude'],
             'longitude': data['location']['center_longitude'],
-            'processed': 'false'
+            'processed': 'false',
+            'parent_hotspot_id': parent_hotspot_id,
+            'derived_from': derived_from
         }
         
         # Crea messaggio di alert
@@ -321,8 +346,9 @@ def process_alert(data, redis_conn):
         p = redis_conn.pipeline()
         
         # Hash con dettagli alert
+        alert_key = f"alert:{alert_id}"
         for key, value in alert_data.items():
-            p.hset(f"alert:{alert_id}", key, value)
+            p.hset(alert_key, key, value)
         
         # Lista ordinata di alert attivi
         timestamp = int(data['detected_at'])
@@ -336,13 +362,15 @@ def process_alert(data, redis_conn):
             'id': alert_id,
             'message': alert_data['message'],
             'severity': data['severity'],
-            'timestamp': data['detected_at']
+            'timestamp': data['detected_at'],
+            'parent_hotspot_id': parent_hotspot_id,
+            'derived_from': derived_from
         })
         p.lpush("dashboard:notifications", notification)
         p.ltrim("dashboard:notifications", 0, 19)  # Mantieni solo le ultime 20
         
         # Imposta TTL
-        p.expire(f"alert:{alert_id}", ALERTS_TTL)
+        p.expire(alert_key, ALERTS_TTL)
         p.expire(f"dashboard:alerts:by_severity:{data['severity']}", ALERTS_TTL)
         p.expire("dashboard:notifications", ALERTS_TTL)
         

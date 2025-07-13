@@ -18,10 +18,15 @@ import math
 import traceback
 import pickle
 import numpy as np
-import hashlib
+import hashlib  # Aggiunto per ID deterministici
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict, deque
+
+# Aggiungi queste righe all'inizio del file
+import sys
+sys.path.append('/opt/flink/usrlib')
+
 
 # PyFlink imports
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
@@ -32,8 +37,9 @@ from pyflink.common import WatermarkStrategy, Time, TypeInformation
 from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
 from pyflink.common.typeinfo import Types
 
-# Import HotspotManager
+# Import HotspotManager e chiavi Redis standardizzate
 from services.hotspot_manager import HotspotManager
+from common.redis_keys import *  # Importa chiavi standardizzate
 
 # Configure logging
 logging.basicConfig(
@@ -121,7 +127,13 @@ class PollutionEventDetector(MapFunction):
             
             # If risk score exceeds threshold, create event data
             if risk_score >= self.risk_threshold:
-                event_id = str(uuid.uuid4())
+                # Genera un ID deterministico basato su caratteristiche dell'evento
+                # Rende più facile tracciare lo stesso evento tra diversi componenti
+                lat_rounded = round(location["latitude"], 3)
+                lon_rounded = round(location["longitude"], 3)
+                time_bucket = (int(time.time() * 1000) // (30 * 60 * 1000)) * (30 * 60 * 1000)
+                id_base = f"{lat_rounded}_{lon_rounded}_{pollutant_type}_{time_bucket}"
+                event_id = f"event-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
                 
                 # Find environmental region
                 region_id = self._get_environmental_region(location["latitude"], location["longitude"])
@@ -293,6 +305,10 @@ class AlertExtractor(MapFunction):
                 is_significant = data.get("is_significant_change", False)
                 severity_changed = data.get("severity_changed", False)
                 
+                # Estrai campi di relazione
+                parent_hotspot_id = data.get("parent_hotspot_id")
+                derived_from = data.get("derived_from")
+                
                 # Extract location for logging
                 location = data.get("location", {})
                 latitude = location.get("center_latitude", location.get("latitude", "unknown"))
@@ -307,7 +323,7 @@ class AlertExtractor(MapFunction):
                 
                 # Check cooldown if Redis is available
                 if self.redis_client and is_update:
-                    cooldown_key = f"alert:cooldown:hotspot:{hotspot_id}"
+                    cooldown_key = alert_cooldown_key(hotspot_id)
                     
                     # Skip if in cooldown (only for updates, not new hotspots)
                     if self.redis_client.exists(cooldown_key):
@@ -596,7 +612,12 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
     
     def _create_single_point_hotspot(self, point):
         """Create a test hotspot from a single point"""
-        hotspot_id = f"test-hotspot-{uuid.uuid4()}"
+        # Genera ID deterministico per il singolo punto
+        lat_rounded = round(point["latitude"], 3)
+        lon_rounded = round(point["longitude"], 3)
+        time_bucket = (int(time.time() * 1000) // (30 * 60 * 1000)) * (30 * 60 * 1000)
+        id_base = f"{lat_rounded}_{lon_rounded}_{point['pollutant_type']}_{time_bucket}"
+        hotspot_id = f"hotspot-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
         
         hotspot = {
             "hotspot_id": hotspot_id,
@@ -617,7 +638,9 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             "points": [point],
             "environmental_reference": point.get("environmental_reference", {}),
             "confidence_score": 0.5,  # Medium confidence for testing
-            "test_generated": True  # Flag indicating this is a test hotspot
+            "test_generated": True,  # Flag indicating this is a test hotspot
+            "parent_hotspot_id": None,  # Campi di relazione
+            "derived_from": None       # Campi di relazione
         }
         
         return hotspot
@@ -691,7 +714,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         
         return clusters
     
-    # Sostituire il metodo esistente _analyze_cluster con questo:
+    # Analyze cluster method con ID deterministico
     def _analyze_cluster(self, cluster_id, points):
         """Calculate cluster characteristics"""
         # Extract coordinates
@@ -766,7 +789,9 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             "source_diversity": len(source_counts),
             "time_span_hours": time_span_hours,
             "points": points,
-            "environmental_reference": environmental_reference
+            "environmental_reference": environmental_reference,
+            "parent_hotspot_id": None,  # Inizialmente nullo, sarà impostato da HotspotManager
+            "derived_from": None        # Inizialmente nullo, sarà impostato da HotspotManager
         }
         
         return hotspot

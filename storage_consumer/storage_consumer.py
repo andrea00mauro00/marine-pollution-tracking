@@ -8,6 +8,10 @@ from datetime import datetime, timedelta
 import psycopg2
 from psycopg2.extras import Json
 from kafka import KafkaConsumer
+import sys
+sys.path.append('/opt/flink/usrlib')
+from common.redis_keys import *  # Importa le chiavi standardizzate
+
 
 # Configurazione logging
 logging.basicConfig(
@@ -257,6 +261,8 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                 logger.info(f"Rilevato duplicato spaziale: {hotspot_id} -> {existing_id}")
                 data['is_update'] = True
                 data['original_hotspot_id'] = hotspot_id
+                data['parent_hotspot_id'] = existing_id
+                data['derived_from'] = hotspot_id
                 hotspot_id = existing_id
                 data['hotspot_id'] = existing_id
                 is_update = True
@@ -300,6 +306,12 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                     Json(data), spatial_hash
                 ))
                 timescale_modified = True
+                
+                # Assicurati che i campi di relazione siano nulli per nuovi hotspot
+                if "parent_hotspot_id" not in data:
+                    data["parent_hotspot_id"] = None
+                if "derived_from" not in data:
+                    data["derived_from"] = None
                 
             else:
                 # Aggiornamento hotspot - Prima legge dati correnti
@@ -361,6 +373,10 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                         hotspot_id
                     ))
                     timescale_modified = True
+                    
+                    # Assicurati che i campi di relazione siano impostati per aggiornamenti
+                    if "parent_hotspot_id" not in data:
+                        data["parent_hotspot_id"] = hotspot_id
         
         # --- POSTGRES OPERATIONS (hotspot_evolution) ---
         with postgres_conn.cursor() as postgres_cur:
@@ -381,9 +397,13 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                 data['location']['radius_km'],
                 data['severity'],
                 data['max_risk_score'],
-                Json({'source': 'detection'} if not is_update else 
-                    {'is_significant': data.get('is_significant_change', False),
-                     'original_id': data.get('original_hotspot_id', None)})
+                Json({
+                    'source': 'detection',
+                    'is_significant': data.get('is_significant_change', False),
+                    'parent_hotspot_id': data.get('parent_hotspot_id', None),
+                    'derived_from': data.get('derived_from', None),
+                    'original_id': data.get('original_hotspot_id', None)
+                })
             ))
             postgres_modified = True
         
@@ -409,6 +429,10 @@ def process_pollution_predictions(data, timescale_conn):
         prediction_set_id = data['prediction_set_id']
         hotspot_id = data['hotspot_id']
         generated_at = datetime.fromtimestamp(data['generated_at'] / 1000)
+        
+        # Estrai campi di relazione
+        parent_hotspot_id = data.get('parent_hotspot_id')
+        derived_from = data.get('derived_from')
         
         # Verifica se questo set di previsioni esiste già
         with timescale_conn.cursor() as cur:
@@ -439,7 +463,7 @@ def process_pollution_predictions(data, timescale_conn):
                         environmental_score, severity, priority_score,
                         confidence, prediction_data, generated_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (prediction_id) DO NOTHING
+                    ON CONFLICT (prediction_id, prediction_time) DO NOTHING
                 """, (
                     prediction_id,
                     hotspot_id,
@@ -458,7 +482,11 @@ def process_pollution_predictions(data, timescale_conn):
                     prediction['impact']['severity'],
                     prediction['remediation']['priority_score'],
                     prediction['confidence'],
-                    Json(prediction),
+                    Json({
+                        **prediction,
+                        'parent_hotspot_id': parent_hotspot_id,
+                        'derived_from': derived_from
+                    }),
                     generated_at
                 ))
             
@@ -499,6 +527,17 @@ def process_sensor_alerts(data, postgres_conn):
             # Crea messaggio descrittivo
             message = f"Alert {alert_type.upper()}: {data['severity'].upper()} level {data['pollutant_type']} detected"
             
+            # Estrai campi di relazione
+            parent_hotspot_id = data.get('parent_hotspot_id')
+            derived_from = data.get('derived_from')
+            
+            # Arricchisci i dettagli con informazioni di relazione
+            details = dict(data)
+            if parent_hotspot_id:
+                details['parent_hotspot_id'] = parent_hotspot_id
+            if derived_from:
+                details['derived_from'] = derived_from
+            
             cur.execute("""
                 INSERT INTO pollution_alerts (
                     alert_id, source_id, source_type, alert_type, alert_time,
@@ -517,7 +556,7 @@ def process_sensor_alerts(data, postgres_conn):
                 data['pollutant_type'],
                 data['max_risk_score'],
                 message,
-                Json(data),
+                Json(details),
                 False,  # processed
                 Json({})  # notifications_sent
             ))
