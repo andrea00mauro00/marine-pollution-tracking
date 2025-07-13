@@ -38,3 +38,9 @@ CREATE TABLE IF NOT EXISTS alert_notification_config (
 
 CREATE INDEX IF NOT EXISTS idx_alert_notification_config_region ON alert_notification_config(region_id);
 CREATE INDEX IF NOT EXISTS idx_alert_notification_config_severity ON alert_notification_config(severity_level);
+
+-- Indice GIN su JSONB per query avanzate
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_details ON pollution_alerts USING GIN (details);
+
+-- Indice temporale per dashboard
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_creation ON pollution_alerts(creation_time);

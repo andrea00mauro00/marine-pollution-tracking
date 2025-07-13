@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import math
 import uuid
 from datetime import datetime, timedelta
 import psycopg2
@@ -42,6 +43,9 @@ HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
 PREDICTIONS_TOPIC = os.environ.get("PREDICTIONS_TOPIC", "pollution_predictions")
 ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
 
+# Spatial bin size (deve corrispondere a quello di HotspotManager)
+SPATIAL_BIN_SIZE = 0.05
+
 def connect_timescaledb():
     """Crea connessione a TimescaleDB"""
     try:
@@ -73,8 +77,84 @@ def connect_postgres():
     except Exception as e:
         logger.error(f"Errore connessione a PostgreSQL: {e}")
         raise
-   
 
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calcola distanza tra due punti in km"""
+    # Converti in radianti
+    lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
+    
+    # Formula haversine
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    r = 6371  # Raggio della terra in km
+    
+    return c * r
+
+def is_same_pollutant_type(type1, type2):
+    """Verifica se due tipi di inquinanti sono considerati equivalenti"""
+    if type1 == type2:
+        return True
+    
+    # Mappa di sinonimi per i tipi di inquinanti
+    synonyms = {
+        "oil": ["oil_spill", "crude_oil", "petroleum"],
+        "chemical": ["chemical_spill", "toxic_chemicals"],
+        "sewage": ["waste_water", "sewage_discharge"],
+        "plastic": ["microplastics", "plastic_debris"],
+        "algae": ["algal_bloom", "red_tide"]
+    }
+    
+    # Controlla se i tipi sono sinonimi
+    for category, types in synonyms.items():
+        if (type1 == category or type1 in types) and (type2 == category or type2 in types):
+            return True
+    
+    return False
+
+def check_spatial_duplicate(lat, lon, radius_km, pollutant_type, conn, max_distance=5.0):
+    """Verifica se esiste un hotspot simile nel raggio specificato"""
+    try:
+        with conn.cursor() as cur:
+            # Query spaziale per trovare potenziali match
+            cur.execute("""
+                SELECT hotspot_id, center_latitude, center_longitude, radius_km, pollutant_type
+                FROM active_hotspots
+                WHERE 
+                    -- Filtro veloce con raggio approssimativo
+                    center_latitude BETWEEN %s - %s AND %s + %s
+                    AND center_longitude BETWEEN %s - %s AND %s + %s
+                    AND last_updated_at > NOW() - INTERVAL '24 hours'
+            """, (
+                float(lat), max_distance/111.0, float(lat), max_distance/111.0,
+                float(lon), max_distance/(111.0*math.cos(math.radians(float(lat)))), 
+                float(lon), max_distance/(111.0*math.cos(math.radians(float(lat))))
+            ))
+            
+            potential_matches = cur.fetchall()
+            
+            for match in potential_matches:
+                hotspot_id, match_lat, match_lon, match_radius, match_pollutant = match
+                
+                # Calcola distanza precisa
+                distance = haversine_distance(lat, lon, match_lat, match_lon)
+                
+                # Verifica se lo stesso tipo di inquinante
+                if not is_same_pollutant_type(pollutant_type, match_pollutant):
+                    continue
+                
+                # Se sufficientemente vicino, è un duplicato
+                combined_radius = float(radius_km) + float(match_radius)
+                if distance <= combined_radius * 1.2:  # 20% margine di tolleranza
+                    return True, hotspot_id
+            
+            # Nessun match trovato
+            return False, None
+            
+    except Exception as e:
+        logger.error(f"Errore nel controllo duplicati spaziali: {e}")
+        return False, None
 
 def process_buoy_data(data, timescale_conn):
     """Processa dati dalle boe"""
@@ -162,6 +242,24 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
         hotspot_id = data['hotspot_id']
         is_update = data.get('is_update', False)
         detected_at = datetime.fromtimestamp(data['detected_at'] / 1000)
+
+        # Se non è già un update, verifica se è un duplicato spaziale
+        if not is_update:
+            is_duplicate, existing_id = check_spatial_duplicate(
+                data['location']['center_latitude'],
+                data['location']['center_longitude'],
+                data['location']['radius_km'],
+                data['pollutant_type'],
+                timescale_conn
+            )
+            
+            if is_duplicate:
+                logger.info(f"Rilevato duplicato spaziale: {hotspot_id} -> {existing_id}")
+                data['is_update'] = True
+                data['original_hotspot_id'] = hotspot_id
+                hotspot_id = existing_id
+                data['hotspot_id'] = existing_id
+                is_update = True
         
         # --- TIMESCALE OPERATIONS (active_hotspots and hotspot_versions) ---
         with timescale_conn.cursor() as timescale_cur:
@@ -174,7 +272,8 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                 pollutant_type = data['pollutant_type']
                 avg_risk_score = data['avg_risk_score']
                 max_risk_score = data['max_risk_score']
-                spatial_hash = generate_spatial_hash(lat, lon)
+                # Usa stesso formato di spatial hash di HotspotManager
+                spatial_hash = f"{math.floor(float(lat)/SPATIAL_BIN_SIZE)}:{math.floor(float(lon)/SPATIAL_BIN_SIZE)}"
 
                 timescale_cur.execute("""
                     INSERT INTO active_hotspots (
@@ -190,9 +289,9 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                         last_updated_at   = EXCLUDED.last_updated_at,
                         update_count      = active_hotspots.update_count + 1,
                         avg_risk_score    = EXCLUDED.avg_risk_score,
-                        max_risk_score    = EXCLUDED.max_risk_score,
+                        max_risk_score    = GREATEST(active_hotspots.max_risk_score, EXCLUDED.max_risk_score),
                         source_data       = EXCLUDED.source_data,
-                        spatial_hash      = EXCLUDED.spatial_hash;
+                        spatial_hash      = EXCLUDED.spatial_hash
                 """, (
                     hotspot_id, lat, lon, radius,
                     pollutant_type, severity,
@@ -232,6 +331,10 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                     ))
                     
                     # Aggiorna hotspot in TimescaleDB
+                    new_lat = data['location']['center_latitude']
+                    new_lon = data['location']['center_longitude']
+                    spatial_hash = f"{math.floor(float(new_lat)/SPATIAL_BIN_SIZE)}:{math.floor(float(new_lon)/SPATIAL_BIN_SIZE)}"
+                    
                     timescale_cur.execute("""
                         UPDATE active_hotspots
                         SET center_latitude = %s,
@@ -246,15 +349,15 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                             spatial_hash = %s
                         WHERE hotspot_id = %s
                     """, (
-                        data['location']['center_latitude'],
-                        data['location']['center_longitude'],
+                        new_lat,
+                        new_lon,
                         data['location']['radius_km'],
                         data['severity'],
                         detected_at,
                         data['avg_risk_score'],
-                        data['max_risk_score'],
+                        max(old_risk, data['max_risk_score']),
                         Json(data),
-                        generate_spatial_hash(data['location']['center_latitude'], data['location']['center_longitude']),
+                        spatial_hash,
                         hotspot_id
                     ))
                     timescale_modified = True
@@ -279,7 +382,8 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
                 data['severity'],
                 data['max_risk_score'],
                 Json({'source': 'detection'} if not is_update else 
-                    {'is_significant': data.get('is_significant_change', False)})
+                    {'is_significant': data.get('is_significant_change', False),
+                     'original_id': data.get('original_hotspot_id', None)})
             ))
             postgres_modified = True
         
@@ -306,6 +410,17 @@ def process_pollution_predictions(data, timescale_conn):
         hotspot_id = data['hotspot_id']
         generated_at = datetime.fromtimestamp(data['generated_at'] / 1000)
         
+        # Verifica se questo set di previsioni esiste già
+        with timescale_conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM pollution_predictions 
+                WHERE prediction_set_id = %s
+            """, (prediction_set_id,))
+            
+            if cur.fetchone()[0] > 0:
+                logger.info(f"Set di previsioni {prediction_set_id} già esistente, skip")
+                return
+        
         # Processa ogni previsione nel set
         with timescale_conn.cursor() as cur:
             for prediction in data['predictions']:
@@ -324,6 +439,7 @@ def process_pollution_predictions(data, timescale_conn):
                         environmental_score, severity, priority_score,
                         confidence, prediction_data, generated_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (prediction_id) DO NOTHING
                 """, (
                     prediction_id,
                     hotspot_id,
@@ -364,6 +480,12 @@ def process_sensor_alerts(data, postgres_conn):
             # Genera alert_id se non presente
             alert_id = data.get('alert_id', f"alert_{str(uuid.uuid4())}")
             source_id = data['hotspot_id']
+            
+            # Verifica se l'alert esiste già
+            cur.execute("SELECT alert_id FROM pollution_alerts WHERE alert_id = %s", (alert_id,))
+            if cur.fetchone():
+                logger.info(f"Alert {alert_id} già presente, skip")
+                return
             
             # Determina tipo di alert
             alert_type = 'new'
@@ -406,10 +528,6 @@ def process_sensor_alerts(data, postgres_conn):
         postgres_conn.rollback()
         logger.error(f"Errore processamento alert: {e}")
 
-def generate_spatial_hash(lat, lon, precision=2):
-    """Genera hash spaziale semplice per indicizzazione"""
-    return f"{round(lat, precision)}:{round(lon, precision)}"
-
 def deserialize_message(message):
     """Deserializza messaggi Kafka supportando sia JSON che formati binari"""
     try:
@@ -421,7 +539,6 @@ def deserialize_message(message):
         try:
             # Se il messaggio inizia con byte magico 0x00 (Schema Registry)
             if message[0] == 0:
-                # Log e skip per ora (implementazione completa richiederebbe client Schema Registry)
                 logger.warning("Rilevato messaggio Schema Registry, non supportato nella versione attuale")
                 return None
             else:
@@ -477,7 +594,6 @@ def main():
                     process_pollution_predictions(data, timescale_conn)
                 elif topic == ALERTS_TOPIC:
                     process_sensor_alerts(data, postgres_conn)
-                # Gli altri topic sono gestiti in versioni future
                 
                 # Commit dell'offset solo se elaborazione riuscita
                 consumer.commit()

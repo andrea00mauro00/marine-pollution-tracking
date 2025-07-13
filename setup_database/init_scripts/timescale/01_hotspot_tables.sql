@@ -108,3 +108,42 @@ CREATE TABLE IF NOT EXISTS archived_hotspots (
 CREATE INDEX IF NOT EXISTS idx_archived_hotspots_location ON archived_hotspots USING gist (
   ST_SetSRID(ST_MakePoint(center_longitude, center_latitude), 4326)
 );
+
+-- Politiche di retention per TimescaleDB
+SELECT add_retention_policy('sensor_measurements', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT add_retention_policy('pollution_metrics', INTERVAL '90 days', if_not_exists => TRUE);
+
+-- Indici aggiuntivi per JSONB
+CREATE INDEX IF NOT EXISTS idx_active_hotspots_source_data ON active_hotspots USING GIN (source_data);
+
+-- Funzione per archiviazione automatica hotspot
+CREATE OR REPLACE FUNCTION archive_old_hotspots() RETURNS INTEGER AS $$
+DECLARE
+  archived_count INTEGER;
+BEGIN
+  -- Sposta hotspot vecchi in archivio
+  INSERT INTO archived_hotspots (
+    hotspot_id, center_latitude, center_longitude, radius_km, 
+    pollutant_type, severity, first_detected_at, last_updated_at, 
+    total_updates, max_risk_score, summary_data
+  )
+  SELECT 
+    hotspot_id, center_latitude, center_longitude, radius_km, 
+    pollutant_type, severity, first_detected_at, last_updated_at, 
+    update_count, max_risk_score, source_data
+  FROM active_hotspots
+  WHERE last_updated_at < NOW() - INTERVAL '7 days';
+  
+  GET DIAGNOSTICS archived_count = ROW_COUNT;
+  
+  -- Elimina hotspot archiviati dalla tabella attivi
+  DELETE FROM active_hotspots
+  WHERE last_updated_at < NOW() - INTERVAL '7 days';
+  
+  RETURN archived_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Crea job di archiviazione (richiede estensione pg_cron)
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+SELECT cron.schedule('0 0 * * *', 'SELECT archive_old_hotspots()');

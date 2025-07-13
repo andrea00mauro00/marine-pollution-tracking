@@ -18,6 +18,7 @@ import math
 import traceback
 import pickle
 import numpy as np
+import hashlib
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict, deque
@@ -690,6 +691,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         
         return clusters
     
+    # Sostituire il metodo esistente _analyze_cluster con questo:
     def _analyze_cluster(self, cluster_id, points):
         """Calculate cluster characteristics"""
         # Extract coordinates
@@ -735,9 +737,20 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Determine severity
         severity = "high" if avg_risk > HIGH_RISK_THRESHOLD else "medium" if avg_risk > MEDIUM_RISK_THRESHOLD else "low"
         
-        # Create hotspot data - CORRETTO per usare center_latitude/center_longitude
+        # Genera ID deterministico
+        # Arrotonda coordinate e timestamp per stabilità
+        lat_rounded = round(center_latitude, 2)
+        lon_rounded = round(center_longitude, 2)
+        current_time = int(time.time() * 1000)
+        time_bucket = (current_time // (30 * 60 * 1000)) * (30 * 60 * 1000)
+        
+        # Crea ID base usando le caratteristiche fisiche
+        id_base = f"{lat_rounded}_{lon_rounded}_{dominant_pollutant}_{time_bucket}"
+        deterministic_id = f"hotspot-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
+        
+        # Create hotspot data
         hotspot = {
-            "hotspot_id": f"hotspot-{uuid.uuid4()}",
+            "hotspot_id": deterministic_id,  # ID deterministico
             "cluster_id": cluster_id,
             "detected_at": int(time.time() * 1000),
             "location": {

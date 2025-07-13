@@ -110,15 +110,25 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
         severity = data.get('severity', 'medium')  # Default a medium se non specificato
         pollutant_type = data.get('pollutant_type', 'unknown')  # Default a unknown se non specificato
         
-        # Determina regione (semplificata per questo esempio)
-        region_id = data.get('environmental_reference', {}).get('region_id', 'default')
-        
         # Verifica se esiste già record in database
         with postgres_conn.cursor() as cur:
             cur.execute("SELECT alert_id FROM pollution_alerts WHERE alert_id = %s", (alert_id,))
             if cur.fetchone():
                 logger.info(f"Alert {alert_id} già presente in database, skippiamo")
                 return
+            
+            # Verifica anche per hotspot_id (per evitare troppe notifiche per stesso hotspot)
+            cur.execute("""
+                SELECT alert_id FROM pollution_alerts 
+                WHERE source_id = %s AND alert_time > NOW() - INTERVAL '30 minutes'
+            """, (hotspot_id,))
+            recent_alert = cur.fetchone()
+            if recent_alert and data.get('is_update', False) and not data.get('severity_changed', False):
+                logger.info(f"Alert recente già presente per hotspot {hotspot_id}, skippiamo")
+                return
+        
+        # Determina regione (semplificata per questo esempio)
+        region_id = data.get('environmental_reference', {}).get('region_id', 'default')
         
         # Determina tipo di alert
         alert_type = 'new'
@@ -194,6 +204,7 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                     severity, latitude, longitude, pollutant_type, risk_score,
                     message, details, processed, notifications_sent
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (alert_id) DO NOTHING
             """, (
                 alert_id,
                 hotspot_id,

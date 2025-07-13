@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import redis
+import math
 from datetime import datetime
 from kafka import KafkaConsumer
 
@@ -31,6 +32,7 @@ SENSOR_DATA_TTL = 3600  # 1 hour
 HOTSPOT_METADATA_TTL = 86400  # 24 hours
 ALERTS_TTL = 3600  # 1 hour
 PREDICTIONS_TTL = 7200  # 2 hours
+SPATIAL_BIN_SIZE = 0.05
 
 def connect_redis():
     """Connessione a Redis"""
@@ -132,7 +134,8 @@ def process_hotspot(data, redis_conn):
             'avg_risk_score': str(data['avg_risk_score']),
             'max_risk_score': str(data['max_risk_score']),
             'point_count': str(data.get('point_count', 1)),
-            'is_update': 'true' if is_update else 'false'
+            'is_update': 'true' if is_update else 'false',
+            'original_id': data.get('original_hotspot_id', '')
         }
         
         # Salva in Redis
@@ -151,15 +154,23 @@ def process_hotspot(data, redis_conn):
         # Set per tipo inquinante
         p.sadd(f"dashboard:hotspots:by_type:{data['pollutant_type']}", hotspot_id)
         
-        # Hash spaziale semplificato
-        spatial_hash = f"{round(data['location']['center_latitude'], 2)}:{round(data['location']['center_longitude'], 2)}"
-        p.sadd(f"spatial:{spatial_hash}", hotspot_id)
+        # Calcolo standardizzato degli hash spaziali
+        lat = float(data['location']['center_latitude'])
+        lon = float(data['location']['center_longitude'])
+        
+        # Usa esattamente lo stesso metodo di binning di HotspotManager
+        lat_bin = math.floor(lat / SPATIAL_BIN_SIZE)
+        lon_bin = math.floor(lon / SPATIAL_BIN_SIZE)
+        spatial_key = f"spatial:{lat_bin}:{lon_bin}"
+        
+        # Usa questo formato standard
+        p.sadd(spatial_key, hotspot_id)
         
         # Imposta TTL
         p.expire(f"hotspot:{hotspot_id}", HOTSPOT_METADATA_TTL)
         p.expire(f"dashboard:hotspots:by_severity:{data['severity']}", HOTSPOT_METADATA_TTL)
         p.expire(f"dashboard:hotspots:by_type:{data['pollutant_type']}", HOTSPOT_METADATA_TTL)
-        p.expire(f"spatial:{spatial_hash}", HOTSPOT_METADATA_TTL)
+        p.expire(spatial_key, HOTSPOT_METADATA_TTL)
         
         # Aggiorna contatori
         if not is_update:
@@ -188,7 +199,8 @@ def process_hotspot(data, redis_conn):
                 'pollutant_type': data['pollutant_type'],
                 'severity': data['severity'],
                 'risk_score': data['max_risk_score'],
-                'detected_at': data['detected_at']
+                'detected_at': data['detected_at'],
+                'is_update': is_update
             })
             redis_conn.set(f"dashboard:hotspot:json:{hotspot_id}", hotspot_json, ex=HOTSPOT_METADATA_TTL)
         

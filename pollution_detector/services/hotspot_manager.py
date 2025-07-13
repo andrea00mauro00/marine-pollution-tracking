@@ -5,6 +5,7 @@ import json
 import math
 import logging
 import time
+import hashlib
 from datetime import datetime, timedelta
 
 # Configurazione logging
@@ -42,7 +43,7 @@ class HotspotManager:
         self.timescale_conn = None
         self.redis_client = None
         
-        # Configirazione
+        # Configurazione
         self.spatial_bin_size = 0.05  # Circa 5km
         
         # Inizializza connessioni
@@ -73,57 +74,153 @@ class HotspotManager:
         except Exception as e:
             logger.error(f"Errore nella connessione ai database: {e}")
             raise
+            
+    def _ensure_connections(self):
+        """Verifica e ripristina le connessioni ai database se necessario"""
+        try:
+            if self.pg_conn is None or self.pg_conn.closed:
+                self.pg_conn = psycopg2.connect(**self.pg_config)
+                logger.info("Riconnesso a PostgreSQL")
+                
+            if self.timescale_conn is None or self.timescale_conn.closed:
+                self.timescale_conn = psycopg2.connect(**self.timescale_config)
+                logger.info("Riconnesso a TimescaleDB")
+                
+            if self.redis_client is None:
+                self.redis_client = redis.Redis(**self.redis_config)
+                self.redis_client.ping()
+                logger.info("Riconnesso a Redis")
+                
+        except Exception as e:
+            logger.error(f"Errore nella riconnessione ai database: {e}")
+            raise
     
     def find_matching_hotspot(self, latitude, longitude, radius_km, pollutant_type):
         """Trova hotspot esistente che corrisponde spazialmente"""
         try:
+            self._ensure_connections()
+            
             # 1. Lookup rapido in Redis usando bin spaziali
             lat_bin = math.floor(latitude / self.spatial_bin_size)
             lon_bin = math.floor(longitude / self.spatial_bin_size)
-            key = f"spatial:{lat_bin}:{lon_bin}"
             
-            nearby_hotspot_ids = self.redis_client.smembers(key)
+            # Cerca nei bin adiacenti (9 bin totali)
+            nearby_hotspot_ids = set()
+            for delta_lat in [-1, 0, 1]:
+                for delta_lon in [-1, 0, 1]:
+                    current_lat_bin = lat_bin + delta_lat
+                    current_lon_bin = lon_bin + delta_lon
+                    key = f"spatial:{current_lat_bin}:{current_lon_bin}"
+                    
+                    bin_results = self.redis_client.smembers(key)
+                    if bin_results:
+                        nearby_hotspot_ids.update([hid.decode('utf-8') for hid in bin_results])
             
-            # Converti da byte a string
-            nearby_hotspot_ids = [hid.decode('utf-8') for hid in nearby_hotspot_ids]
-            
-            logger.info(f"Trovati {len(nearby_hotspot_ids)} potenziali hotspot in bin ({lat_bin},{lon_bin})")
+            logger.info(f"Trovati {len(nearby_hotspot_ids)} potenziali hotspot in bin spaziali")
             
             # 2. Per ogni ID, verifica sovrapposizione spaziale
             for hotspot_id in nearby_hotspot_ids:
-                hotspot_key = f"hotspot:{hotspot_id}:metadata"
-                hotspot_data_bytes = self.redis_client.get(hotspot_key)
+                # Prova formato dashboard_consumer
+                alt_key = f"hotspot:{hotspot_id}"
+                hotspot_data = self.redis_client.hgetall(alt_key)
+                if hotspot_data:
+                    # Converti da hash Redis a dizionario Python
+                    hotspot_data = {k.decode('utf-8'): v.decode('utf-8') for k, v in hotspot_data.items()}
+                else:
+                    # Fallback a vecchio formato metadata
+                    hotspot_key = f"hotspot:{hotspot_id}:metadata"
+                    hotspot_data_bytes = self.redis_client.get(hotspot_key)
+                    if not hotspot_data_bytes:
+                        continue
+                    # Formato JSON serializzato
+                    hotspot_data = json.loads(hotspot_data_bytes.decode('utf-8'))
                 
-                if not hotspot_data_bytes:
-                    continue
-                    
-                hotspot_data = json.loads(hotspot_data_bytes.decode('utf-8'))
+                # Estrai coordinate, gestendo diversi formati
+                h_lat = float(hotspot_data.get("center_latitude", hotspot_data.get("latitude", 0)))
+                h_lon = float(hotspot_data.get("center_longitude", hotspot_data.get("longitude", 0)))
+                h_radius = float(hotspot_data.get("radius_km", 5.0))
+                h_pollutant = hotspot_data.get("pollutant_type", "unknown")
                 
                 # Calcola sovrapposizione
                 distance = self._haversine_distance(
-                    latitude, longitude,
-                    hotspot_data["center_latitude"], 
-                    hotspot_data["center_longitude"]
+                    latitude, longitude, h_lat, h_lon
                 )
                 
-                # Se la distanza è minore della somma dei raggi, c'è sovrapposizione
-                combined_radius = radius_km + hotspot_data["radius_km"]
-                if distance <= combined_radius * 0.8:  # 80% della somma per essere conservativi
+                # Criterio più flessibile (120% invece di 80%)
+                combined_radius = radius_km + h_radius
+                if distance <= combined_radius * 1.2:  # 20% margine di tolleranza
                     # Verifica anche tipo di inquinante
-                    if pollutant_type == hotspot_data["pollutant_type"]:
+                    if self._is_same_pollutant_type(pollutant_type, h_pollutant):
                         logger.info(f"Trovato match: hotspot {hotspot_id} a distanza {distance:.2f}km")
                         return hotspot_id
             
+            # 3. Fallback: Se non trovato in Redis, cerca nel database
+            if not nearby_hotspot_ids:
+                try:
+                    with self.timescale_conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT hotspot_id, center_latitude, center_longitude, radius_km, pollutant_type
+                            FROM active_hotspots
+                            WHERE 
+                                center_latitude BETWEEN %s - %s AND %s + %s
+                                AND center_longitude BETWEEN %s - %s AND %s + %s
+                                AND last_updated_at > NOW() - INTERVAL '24 hours'
+                        """, (
+                            latitude, 5.0/111.0, latitude, 5.0/111.0,
+                            longitude, 5.0/(111.0*math.cos(math.radians(latitude))), 
+                            longitude, 5.0/(111.0*math.cos(math.radians(latitude)))
+                        ))
+                        
+                        for record in cur.fetchall():
+                            db_id, db_lat, db_lon, db_radius, db_pollutant = record
+                            
+                            # Calcola distanza
+                            distance = self._haversine_distance(
+                                latitude, longitude, db_lat, db_lon
+                            )
+                            
+                            # Verifica sovrapposizione
+                            combined_radius = radius_km + db_radius
+                            if distance <= combined_radius * 1.2:  # 20% margine
+                                if self._is_same_pollutant_type(pollutant_type, db_pollutant):
+                                    logger.info(f"Trovato match nel database: hotspot {db_id}")
+                                    return db_id
+                except Exception as db_error:
+                    logger.error(f"Errore nella ricerca database: {db_error}")
+            
             logger.info(f"Nessun hotspot corrispondente trovato per ({latitude}, {longitude})")
             return None
-            
+                
         except Exception as e:
             logger.error(f"Errore nella ricerca di hotspot corrispondenti: {e}")
             return None
     
+    def _is_same_pollutant_type(self, type1, type2):
+        """Verifica se due tipi di inquinanti sono considerati equivalenti"""
+        if type1 == type2:
+            return True
+        
+        # Mappa di sinonimi per i tipi di inquinanti
+        synonyms = {
+            "oil": ["oil_spill", "crude_oil", "petroleum"],
+            "chemical": ["chemical_spill", "toxic_chemicals"],
+            "sewage": ["waste_water", "sewage_discharge"],
+            "plastic": ["microplastics", "plastic_debris"],
+            "algae": ["algal_bloom", "red_tide"]
+        }
+        
+        # Controlla se i tipi sono sinonimi
+        for category, types in synonyms.items():
+            if (type1 == category or type1 in types) and (type2 == category or type2 in types):
+                return True
+        
+        return False
+    
     def create_or_update_hotspot(self, hotspot_data):
         """Crea nuovo hotspot o aggiorna esistente"""
         try:
+            self._ensure_connections()
+            
             center_lat = hotspot_data["location"]["center_latitude"]
             center_lon = hotspot_data["location"]["center_longitude"]
             radius_km = hotspot_data["location"]["radius_km"]
@@ -147,7 +244,7 @@ class HotspotManager:
             return hotspot_data
     
     def _create_hotspot(self, hotspot_data):
-        """Crea nuovo hotspot nel database e in Redis"""
+        """Crea nuovo hotspot nel database"""
         try:
             hotspot_id = hotspot_data["hotspot_id"]
             center_lat = hotspot_data["location"]["center_latitude"]
@@ -159,15 +256,26 @@ class HotspotManager:
                     INSERT INTO active_hotspots (
                         hotspot_id, center_latitude, center_longitude, radius_km,
                         pollutant_type, severity, first_detected_at, last_updated_at,
-                        avg_risk_score, max_risk_score, source_data, spatial_hash
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        update_count, avg_risk_score, max_risk_score, source_data, spatial_hash
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s)
+                    ON CONFLICT (hotspot_id) DO UPDATE SET
+                        center_latitude   = EXCLUDED.center_latitude,
+                        center_longitude  = EXCLUDED.center_longitude,
+                        radius_km         = EXCLUDED.radius_km,
+                        severity          = EXCLUDED.severity,
+                        last_updated_at   = EXCLUDED.last_updated_at,
+                        update_count      = active_hotspots.update_count + 1,
+                        avg_risk_score    = EXCLUDED.avg_risk_score,
+                        max_risk_score    = GREATEST(active_hotspots.max_risk_score, EXCLUDED.max_risk_score),
+                        source_data       = EXCLUDED.source_data,
+                        spatial_hash      = EXCLUDED.spatial_hash
                 """, (
                     hotspot_id, center_lat, center_lon, hotspot_data["location"]["radius_km"],
                     hotspot_data["pollutant_type"], hotspot_data["severity"],
                     datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
                     datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
                     hotspot_data["avg_risk_score"], hotspot_data["max_risk_score"],
-                    json.dumps(hotspot_data), f"{math.floor(center_lat/0.05)}:{math.floor(center_lon/0.05)}"
+                    json.dumps(hotspot_data), f"{math.floor(center_lat/self.spatial_bin_size)}:{math.floor(center_lon/self.spatial_bin_size)}"
                 ))
                 
                 # Inserisci anche la prima versione
@@ -197,29 +305,6 @@ class HotspotManager:
                 ))
                 
             self.timescale_conn.commit()
-            
-            # Cache in Redis
-            lat_bin = math.floor(center_lat / self.spatial_bin_size)
-            lon_bin = math.floor(center_lon / self.spatial_bin_size)
-            self.redis_client.sadd(f"spatial:{lat_bin}:{lon_bin}", hotspot_id)
-            
-            # Metadata cache
-            self.redis_client.set(
-                f"hotspot:{hotspot_id}:metadata",
-                json.dumps({
-                    "hotspot_id": hotspot_id,
-                    "center_latitude": center_lat,
-                    "center_longitude": center_lon,
-                    "radius_km": hotspot_data["location"]["radius_km"],
-                    "pollutant_type": hotspot_data["pollutant_type"],
-                    "severity": hotspot_data["severity"],
-                    "update_count": 1
-                }),
-                ex=86400  # 24 ore di cache
-            )
-            
-            # Incrementa contatore
-            self.redis_client.incr("counters:hotspots:total")
             
             # Marca come nuovo
             hotspot_data["is_new"] = True
@@ -288,14 +373,17 @@ class HotspotManager:
                     UPDATE active_hotspots 
                     SET center_latitude = %s, center_longitude = %s, radius_km = %s,
                         severity = %s, last_updated_at = %s, update_count = %s,
-                        avg_risk_score = %s, max_risk_score = %s, source_data = %s
+                        avg_risk_score = %s, max_risk_score = %s, source_data = %s,
+                        spatial_hash = %s
                     WHERE hotspot_id = %s
                 """, (
                     center_lat, center_lon, new_data["location"]["radius_km"],
                     new_severity, update_time, update_count,
                     new_data["avg_risk_score"], 
                     max(existing_data["max_risk_score"], new_data["max_risk_score"]),
-                    json.dumps(new_data), existing_id
+                    json.dumps(new_data),
+                    f"{math.floor(center_lat/self.spatial_bin_size)}:{math.floor(center_lon/self.spatial_bin_size)}",
+                    existing_id
                 ))
                 
                 # Inserisci nuova versione se ci sono cambiamenti significativi
@@ -331,33 +419,6 @@ class HotspotManager:
                     ))
             
             self.timescale_conn.commit()
-            
-            # Aggiorna Redis
-            # Aggiorna posizione spaziale se necessario
-            old_lat_bin = math.floor(prev_lat / self.spatial_bin_size)
-            old_lon_bin = math.floor(prev_lon / self.spatial_bin_size)
-            new_lat_bin = math.floor(center_lat / self.spatial_bin_size)
-            new_lon_bin = math.floor(center_lon / self.spatial_bin_size)
-            
-            if old_lat_bin != new_lat_bin or old_lon_bin != new_lon_bin:
-                self.redis_client.srem(f"spatial:{old_lat_bin}:{old_lon_bin}", existing_id)
-                self.redis_client.sadd(f"spatial:{new_lat_bin}:{new_lon_bin}", existing_id)
-            
-            # Aggiorna metadati
-            self.redis_client.set(
-                f"hotspot:{existing_id}:metadata",
-                json.dumps({
-                    "hotspot_id": existing_id,
-                    "center_latitude": center_lat,
-                    "center_longitude": center_lon,
-                    "radius_km": new_data["location"]["radius_km"],
-                    "pollutant_type": new_data["pollutant_type"],
-                    "severity": new_severity,
-                    "update_count": update_count,
-                    "last_updated": update_time.isoformat()
-                }),
-                ex=86400  # 24 ore
-            )
             
             # Aggiungi flag per indicare tipo di update
             new_data["is_update"] = True

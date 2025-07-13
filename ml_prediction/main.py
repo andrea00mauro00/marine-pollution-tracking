@@ -21,9 +21,11 @@ import random
 import numpy as np
 import pickle
 import redis
+import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 from collections import deque
+
 
 # Import for PyFlink
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
@@ -372,27 +374,12 @@ class PollutionSpreadPredictor(MapFunction):
             
             # Skip insignificant updates
             if is_update and not (is_significant or severity_changed):
-                # Retrieve last prediction time from Redis
-                last_prediction_key = f"prediction:last_time:{hotspot_id}"
-                last_prediction_time = self.redis_client.get(last_prediction_key)
-                
-                if last_prediction_time:
-                    last_time = int(last_prediction_time.decode('utf-8'))
-                    current_time = int(time.time() * 1000)
-                    
-                    # Load minimum interval from Redis configuration or use default (30 minutes)
-                    min_interval_minutes = 30
-                    try:
-                        config_val = self.redis_client.get("config:prediction:min_interval_minutes")
-                        if config_val:
-                            min_interval_minutes = int(config_val.decode('utf-8'))
-                    except Exception as e:
-                        logger.warning(f"Error loading config from Redis: {e}")
-                    
-                    # If we've done a prediction recently, skip
-                    if (current_time - last_time) < min_interval_minutes * 60 * 1000:
-                        logger.info(f"Skipping prediction for recently updated hotspot {hotspot_id} without significant changes")
-                        return None
+                if not should_generate_predictions(hotspot_id, self.redis_client):
+                    logger.info(f"Skipping prediction for recently updated hotspot {hotspot_id} without significant changes")
+                    return None
+            
+            # Generate deterministic prediction set ID
+            prediction_set_id = generate_prediction_set_id(hotspot_id, int(time.time() * 1000))   
             
             # Skip invalid hotspots
             if not hotspot_id or not location:
@@ -420,7 +407,6 @@ class PollutionSpreadPredictor(MapFunction):
             ecosystem_types = self._identify_ecosystem_types(center_latitude, center_longitude, radius_km)
             
             # Generate predictions
-            prediction_set_id = str(uuid.uuid4())
             predictions = []
             
             # Generate predictions for each time interval
@@ -459,9 +445,9 @@ class PollutionSpreadPredictor(MapFunction):
                 "predictions": predictions
             }
             
-            # Store prediction timestamp in Redis
+            # Store prediction timestamp in Redis - usando la stessa chiave di should_generate_predictions
             if self.redis_client:
-                self.redis_client.set(f"prediction:last_time:{hotspot_id}", int(time.time() * 1000))
+                self.redis_client.set(f"hotspot:{hotspot_id}:last_prediction", int(time.time() * 1000))
                 logger.info(f"Updated prediction timestamp for hotspot {hotspot_id}")
             
             logger.info(f"Generated prediction {prediction_set_id} for hotspot {hotspot_id}")
@@ -985,6 +971,30 @@ class PollutionSpreadPredictor(MapFunction):
             "direction": direction,
             "speed": speed
         }
+
+def generate_prediction_set_id(hotspot_id, timestamp):
+    """Genera ID deterministico per un set di previsioni"""
+    # Arrotonda il timestamp all'ora più vicina
+    hour_bucket = int(timestamp / (60 * 60 * 1000)) * (60 * 60 * 1000)
+    id_base = f"{hotspot_id}_{hour_bucket}"
+    return f"pred-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
+
+def should_generate_predictions(hotspot_id, redis_client):
+    """Verifica se è necessario generare nuove previsioni"""
+    # Controlla quando sono state generate le ultime previsioni
+    last_prediction_time = redis_client.get(f"hotspot:{hotspot_id}:last_prediction")
+    
+    if last_prediction_time:
+        # Converti da stringa a timestamp
+        last_time = int(last_prediction_time.decode('utf-8'))
+        current_time = int(time.time() * 1000)
+        
+        # Genera nuove previsioni solo se sono passate almeno 2 ore
+        if (current_time - last_time) < (2 * 60 * 60 * 1000):
+            return False
+    
+    return True
+
 
 def wait_for_services():
     """Wait for Kafka to be available"""
