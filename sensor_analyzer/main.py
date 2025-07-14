@@ -428,7 +428,7 @@ class SensorAnalyzer(MapFunction):
                     deviation_score = 0.0
                 
                 # Combine statistical anomaly (z-score) with absolute threshold violation
-                parameter_scores["ph_deviation"] = max(min(z_score / 3.0, 1.0), deviation_score)
+                parameter_scores["ph_deviation"] = max(min(z_score / 2.0, 1.0), deviation_score)
                 
                 # Record anomaly if significant
                 if parameter_scores["ph_deviation"] > 0.3:
@@ -464,7 +464,7 @@ class SensorAnalyzer(MapFunction):
                 else:
                     deviation_score = 0.0
                 
-                parameter_scores["turbidity"] = max(min(z_score / 3.0, 1.0), deviation_score)
+                parameter_scores["turbidity"] = max(min(z_score / 2.0, 1.0), deviation_score)
                 
                 if parameter_scores["turbidity"] > 0.3:
                     anomalies["turbidity"] = {
@@ -501,7 +501,7 @@ class SensorAnalyzer(MapFunction):
                 else:
                     deviation_score = 0.0
                 
-                parameter_scores["temperature_anomaly"] = max(min(z_score / 3.0, 1.0), deviation_score)
+                parameter_scores["temperature_anomaly"] = max(min(z_score / 2.0, 1.0), deviation_score)
                 
                 if parameter_scores["temperature_anomaly"] > 0.3:
                     anomalies["temperature"] = {
@@ -591,7 +591,7 @@ class SensorAnalyzer(MapFunction):
             z_score = abs(value - mean_val) / std_val
             
             # Incorporate z-score into parameter score if it indicates a stronger anomaly
-            statistical_score = min(z_score / 3.0, 1.0)
+            statistical_score = min(z_score / 2.0, 1.0)
             if param_name in parameter_scores:
                 parameter_scores[param_name] = max(parameter_scores[param_name], statistical_score)
             else:

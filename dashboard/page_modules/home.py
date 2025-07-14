@@ -1,348 +1,877 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import json
 import time
+import math
 
 def show_home_page(clients):
-    """Render the home page with dashboard overview"""
+    """
+    Render the main dashboard home page using individual clients
+    
+    Args:
+        clients: Dictionary with individual database clients (redis, timescale, postgres, minio)
+    """
+    # Extract individual clients
+    redis_client = clients.get("redis")
+    timescale_client = clients.get("timescale")
+    postgres_client = clients.get("postgres")
+    minio_client = clients.get("minio", None)
+    
+    # Custom CSS for styling
+    st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: 700;
+        color: #0f6cbd;
+        margin-bottom: 1rem;
+        text-align: center;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        font-weight: 600;
+        color: #0f6cbd;
+        margin-top: 1rem;
+        margin-bottom: 0.5rem;
+        border-bottom: 1px solid #e0e0e0;
+        padding-bottom: 0.3rem;
+    }
+    .metric-card {
+        background-color: white;
+        border-radius: 5px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        padding: 1rem;
+        border-left: 4px solid #0f6cbd;
+        margin-bottom: 1rem;
+    }
+    .water-metric-card {
+        background-color: white;
+        border-radius: 5px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        padding: 1rem;
+        margin-bottom: 1rem;
+    }
+    .water-quality-excellent {
+        border-left: 4px solid #4CAF50;
+    }
+    .water-quality-good {
+        border-left: 4px solid #8BC34A;
+    }
+    .water-quality-moderate {
+        border-left: 4px solid #FFC107;
+    }
+    .water-quality-poor {
+        border-left: 4px solid #FF9800;
+    }
+    .water-quality-critical {
+        border-left: 4px solid #F44336;
+    }
+    .alert-card {
+        background-color: white;
+        border-radius: 5px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        padding: 0.8rem;
+        margin-bottom: 0.8rem;
+        border-left: 4px solid #f44336;
+    }
+    .prediction-card {
+        background-color: white;
+        border-radius: 5px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        padding: 0.8rem;
+        margin-bottom: 0.8rem;
+        border-left: 4px solid #ff9800;
+    }
+    .status-high {
+        background-color: #f44336;
+        color: white;
+        padding: 3px 6px;
+        border-radius: 3px;
+        font-size: 0.8rem;
+        font-weight: bold;
+    }
+    .status-medium {
+        background-color: #ff9800;
+        color: white;
+        padding: 3px 6px;
+        border-radius: 3px;
+        font-size: 0.8rem;
+        font-weight: bold;
+    }
+    .status-low {
+        background-color: #4caf50;
+        color: white;
+        padding: 3px 6px;
+        border-radius: 3px;
+        font-size: 0.8rem;
+        font-weight: bold;
+    }
+    .data-status-badge {
+        position: absolute;
+        top: 5px;
+        right: 5px;
+        font-size: 0.7rem;
+        padding: 2px 5px;
+        border-radius: 3px;
+    }
+    .data-real {
+        background-color: #4CAF50;
+        color: white;
+    }
+    .data-estimated {
+        background-color: #FFC107;
+        color: black;
+    }
+    .top-spacing {
+        margin-top: 1.5rem;
+    }
+    .loading-spinner {
+        text-align: center;
+        margin: 2rem 0;
+    }
+    .metrics-container {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    .metric-box {
+        flex: 1;
+        min-width: 200px;
+        position: relative;
+    }
+    .water-metrics-container {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        margin-bottom: 1.5rem;
+        margin-top: 1.5rem;
+    }
+    .water-metric-box {
+        flex: 1;
+        min-width: 150px;
+        position: relative;
+    }
+    .timestamp-display {
+        text-align: center;
+        font-size: 0.8rem;
+        color: #666;
+        margin-bottom: 1rem;
+        padding: 5px;
+        background-color: #f5f5f5;
+        border-radius: 3px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Dashboard header
     st.markdown("<h1 class='main-header'>Marine Pollution Monitoring Dashboard</h1>", unsafe_allow_html=True)
     
-    # Get clients
-    redis_client = clients["redis"]
-    timescale_client = clients["timescale"]
-    postgres_client = clients["postgres"]  # Added to access alerts with recommendations
+    # Display current time
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.markdown(f"<div class='timestamp-display'>Current Time: {current_time}</div>", unsafe_allow_html=True)
     
-    # Get dashboard summary from Redis
-    summary = redis_client.get_dashboard_summary()
+    # --- KEY METRICS SECTION ---
     
-    # Extract summary metrics
-    hotspots_count = int(summary.get('hotspots_count', 0))
-    alerts_count = int(summary.get('alerts_count', 0))
+    # Get dashboard summary data from Redis
+    with st.spinner("Loading dashboard summary..."):
+        summary = None
+        data_source = "estimated"  # Default to estimated
+        
+        if redis_client:
+            try:
+                summary = redis_client.get_dashboard_summary()
+                data_source = "real"  # Redis data is considered real-time
+            except Exception as e:
+                st.warning(f"Could not get summary from Redis: {str(e)}")
+                summary = None
     
+    # If Redis fails, try to get basic metrics directly from other sources
+    if not summary:
+        summary = {}
+        
+        # Try to get hotspot metrics from TimescaleDB
+        if timescale_client:
+            try:
+                dashboard_data = timescale_client.get_dashboard_summary()
+                if dashboard_data and "active_hotspots" in dashboard_data:
+                    active_hotspots = dashboard_data["active_hotspots"]
+                    summary["hotspots_count"] = active_hotspots.get("active_hotspots", 0)
+                    summary["severity_distribution"] = {
+                        "high": active_hotspots.get("high_severity", 0),
+                        "medium": active_hotspots.get("medium_severity", 0),
+                        "low": active_hotspots.get("low_severity", 0)
+                    }
+                    summary["updated_at"] = int(time.time() * 1000)
+                    data_source = "real"  # TimescaleDB data is considered real but not real-time
+            except Exception as e:
+                st.warning(f"Could not get dashboard summary from TimescaleDB: {str(e)}")
+        
+        # Try to get alert count from PostgreSQL
+        if postgres_client:
+            try:
+                alerts = postgres_client.get_alerts(limit=100, days=1)
+                if alerts:
+                    summary["alerts_count"] = len(alerts)
+                    
+                    # Count alerts by severity
+                    severity_counts = {"high": 0, "medium": 0, "low": 0}
+                    for alert in alerts:
+                        severity = alert.get("severity")
+                        if severity in severity_counts:
+                            severity_counts[severity] += 1
+                    
+                    summary["alerts_by_severity"] = severity_counts
+            except Exception as e:
+                st.warning(f"Could not get alerts from PostgreSQL: {str(e)}")
+    
+    # Format summary data for display
+    hotspots_count = int(summary.get("hotspots_count", 0))
+    alerts_count = int(summary.get("alerts_count", 0))
+    
+    # Get severity distribution
     try:
-        severity_dist = json.loads(summary.get('severity_distribution', '{"low": 0, "medium": 0, "high": 0}'))
+        if isinstance(summary.get("severity_distribution"), str):
+            severity_dist = json.loads(summary.get("severity_distribution", '{"low": 0, "medium": 0, "high": 0}'))
+        else:
+            severity_dist = summary.get("severity_distribution", {"low": 0, "medium": 0, "high": 0})
     except:
         severity_dist = {"low": 0, "medium": 0, "high": 0}
     
-    # Summary cards row
-    st.markdown("<h2 class='sub-header'>System Overview</h2>", unsafe_allow_html=True)
+    high_severity = severity_dist.get("high", 0)
+    medium_severity = severity_dist.get("medium", 0)
+    low_severity = severity_dist.get("low", 0)
+    
+    # Get alert severity distribution - implementazione migliorata come in alerts.py
+    severity_counts = {"high": 0, "medium": 0, "low": 0}
+
+    # Se abbiamo già recuperato gli alerts, riutilizziamoli per il conteggio
+    if 'alerts' in locals() and alerts:
+        for alert in alerts:
+            sev = alert.get("severity")
+            if sev in severity_counts:
+                severity_counts[sev] += 1
+    # Altrimenti, se possiamo recuperarli dal client postgres
+    elif postgres_client:
+        try:
+            pg_alerts = postgres_client.get_alerts(days=1, status_filter="active")
+            for alert in pg_alerts:
+                sev = alert.get("severity")
+                if sev in severity_counts:
+                    severity_counts[sev] += 1
+        except Exception as e:
+            st.warning(f"Could not get alert counts from PostgreSQL: {str(e)}", icon="⚠️")
+
+    # Usa i conteggi calcolati
+    high_alerts = severity_counts["high"]
+    medium_alerts = severity_counts["medium"]
+    low_alerts = severity_counts["low"]
+    
+    # Calculate time since last update
+    last_updated = summary.get("updated_at", int(time.time() * 1000))
+    if isinstance(last_updated, str):
+        try:
+            last_updated = int(last_updated)
+        except ValueError:
+            last_updated = int(time.time() * 1000)
+    
+    time_diff = time.time() - (last_updated / 1000)
+    if time_diff < 60:
+        update_text = f"{int(time_diff)} seconds ago"
+    elif time_diff < 3600:
+        update_text = f"{int(time_diff / 60)} minutes ago"
+    else:
+        update_text = f"{int(time_diff / 3600)} hours ago"
+    
+    # Get active sensors count
+    active_sensors = 0
+    if redis_client:
+        try:
+            active_sensors = len(redis_client.get_active_sensors())
+        except:
+            # Try fallback to TimescaleDB if available
+            if timescale_client:
+                try:
+                    # This is an example query, adjust to match your actual client methods
+                    sensor_data = timescale_client.execute_query("""
+                        SELECT COUNT(DISTINCT source_id) as count
+                        FROM sensor_measurements
+                        WHERE time > NOW() - INTERVAL '24 hours'
+                    """)
+                    if sensor_data and len(sensor_data) > 0:
+                        active_sensors = sensor_data[0].get("count", 0)
+                except Exception as e:
+                    pass
+    
+    # FIRST ROW: System Metrics
+    st.markdown("<h2 class='sub-header'>System Metrics</h2>", unsafe_allow_html=True)
+    
+    # Usa le colonne native di Streamlit per la prima riga
     col1, col2, col3, col4 = st.columns(4)
     
+    # Metric 1: Active Hotspots
     with col1:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.metric("Active Hotspots", hotspots_count)
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(f"""
+            <div class='metric-card'>
+                <h3 style='margin:0;font-size:0.9rem;color:#666;'>Active Hotspots</h3>
+                <div style='font-size:2rem;font-weight:bold;'>{hotspots_count}</div>
+                <div style='font-size:0.8rem;margin-top:5px;'>
+                    <span class="status-high">{high_severity} High</span> 
+                    <span class="status-medium" style='margin-left:5px;'>{medium_severity} Medium</span>
+                    <span class="status-low" style='margin-left:5px;'>{low_severity} Low</span>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
     
+    # Metric 2: Active Alerts
     with col2:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.metric("Active Alerts", alerts_count)
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(f"""
+            <div class='metric-card'>
+                <h3 style='margin:0;font-size:0.9rem;color:#666;'>Active Alerts</h3>
+                <div style='font-size:2rem;font-weight:bold;'>{alerts_count}</div>
+                <div style='font-size:0.8rem;margin-top:5px;'>
+                    <span class="status-high">{high_alerts} High</span> 
+                    <span class="status-medium" style='margin-left:5px;'>{medium_alerts} Medium</span>
+                    <span class="status-low" style='margin-left:5px;'>{low_alerts} Low</span>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
     
+    # Metric 3: Active Sensors
     with col3:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        active_sensors = len(redis_client.get_active_sensors())
-        st.metric("Active Sensors", active_sensors)
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(f"""
+            <div class='metric-card'>
+                <h3 style='margin:0;font-size:0.9rem;color:#666;'>Active Sensors</h3>
+                <div style='font-size:2rem;font-weight:bold;'>{active_sensors}</div>
+                <div style='font-size:0.8rem;margin-top:5px;'>
+                    Monitoring marine conditions
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
     
+    # Metric 4: Last Updated
     with col4:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        # Calculate the time since the last update
-        last_updated = int(summary.get('updated_at', time.time() * 1000)) / 1000
-        time_diff = time.time() - last_updated
-        if time_diff < 60:
-            update_text = f"{int(time_diff)} seconds ago"
-        elif time_diff < 3600:
-            update_text = f"{int(time_diff / 60)} minutes ago"
-        else:
-            update_text = f"{int(time_diff / 3600)} hours ago"
+        st.markdown(f"""
+            <div class='metric-card'>
+                <h3 style='margin:0;font-size:0.9rem;color:#666;'>Last Updated</h3>
+                <div style='font-size:1.3rem;font-weight:bold;'>{update_text}</div>
+                <div style='font-size:0.8rem;margin-top:5px;'>
+                    Dashboard refresh available
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+    
+    # --- SECOND ROW: WATER QUALITY METRICS ---
+    # Get water quality metrics from TimescaleDB
+    water_metrics = None
+    if timescale_client:
+        try:
+            # Try to get average water quality metrics from the last 24 hours
+            water_metrics_query = """
+                SELECT 
+                    AVG(water_quality_index) as avg_wqi,
+                    AVG(ph) as avg_ph,
+                    AVG(turbidity) as avg_turbidity,
+                    AVG(temperature) as avg_temperature,
+                    AVG(microplastics) as avg_microplastics
+                FROM sensor_measurements
+                WHERE time > NOW() - INTERVAL '24 hours'
+            """
+            water_metrics = timescale_client.execute_query(water_metrics_query)
+            
+            if not water_metrics or len(water_metrics) == 0:
+                water_metrics = None
+        except Exception as e:
+            st.warning(f"Could not get water quality metrics: {str(e)}")
+    
+    # Show water quality metrics if available
+    if water_metrics:
+        metrics = water_metrics[0]
         
-        st.metric("Last Updated", update_text)
-        st.markdown("</div>", unsafe_allow_html=True)
+        # Function to determine water quality class based on value
+        def get_wqi_class(wqi):
+            if wqi >= 90: return "excellent"
+            elif wqi >= 70: return "good"
+            elif wqi >= 50: return "moderate"
+            elif wqi >= 25: return "poor"
+            else: return "critical"
+        
+        def get_ph_class(ph):
+            if 6.5 <= ph <= 8.5: return "excellent"
+            elif 6.0 <= ph <= 9.0: return "good"
+            elif 5.5 <= ph <= 9.5: return "moderate"
+            elif 5.0 <= ph <= 10.0: return "poor"
+            else: return "critical"
+        
+        def get_turbidity_class(turbidity):
+            if turbidity < 1: return "excellent"
+            elif turbidity < 5: return "good"
+            elif turbidity < 10: return "moderate"
+            elif turbidity < 20: return "poor"
+            else: return "critical"
+        
+        def get_microplastics_class(mp):
+            if mp < 0.1: return "excellent"
+            elif mp < 0.5: return "good"
+            elif mp < 1.0: return "moderate"
+            elif mp < 5.0: return "poor"
+            else: return "critical"
+        
+        def get_temperature_class(temp):
+            # Simplified classification (would depend on specific marine environment)
+            if 15 <= temp <= 25: return "excellent"
+            elif 10 <= temp <= 30: return "good"
+            elif 5 <= temp <= 35: return "moderate"
+            else: return "poor"
+        
+        # Get metrics values with fallbacks
+        avg_wqi = float(metrics.get("avg_wqi", 0) or 0)
+        avg_ph = float(metrics.get("avg_ph", 0) or 0)
+        avg_turbidity = float(metrics.get("avg_turbidity", 0) or 0)
+        avg_temperature = float(metrics.get("avg_temperature", 0) or 0)
+        avg_microplastics = float(metrics.get("avg_microplastics", 0) or 0)
+        
+        # Get quality classes
+        wqi_class = get_wqi_class(avg_wqi)
+        ph_class = get_ph_class(avg_ph)
+        turbidity_class = get_turbidity_class(avg_turbidity)
+        temperature_class = get_temperature_class(avg_temperature)
+        microplastics_class = get_microplastics_class(avg_microplastics)
+        
+        # Display water quality metrics
+        st.markdown("<h2 class='sub-header'>Water Quality Metrics (24h Average)</h2>", unsafe_allow_html=True)
+        
+        # Usa le colonne native di Streamlit per la seconda riga
+        wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
+        
+        # Water Quality Index
+        with wcol1:
+            st.markdown(f"""
+                <div class='water-metric-card water-quality-{wqi_class}'>
+                    <h3 style='margin:0;font-size:0.9rem;color:#666;'>Water Quality Index</h3>
+                    <div style='font-size:1.8rem;font-weight:bold;'>{avg_wqi:.1f}</div>
+                    <div style='font-size:0.8rem;margin-top:5px;color:#666;'>
+                        Scale: 0-100 (higher is better)
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        # pH Value
+        with wcol2:
+            st.markdown(f"""
+                <div class='water-metric-card water-quality-{ph_class}'>
+                    <h3 style='margin:0;font-size:0.9rem;color:#666;'>pH Level</h3>
+                    <div style='font-size:1.8rem;font-weight:bold;'>{avg_ph:.1f}</div>
+                    <div style='font-size:0.8rem;margin-top:5px;color:#666;'>
+                        Optimal range: 6.5-8.5
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        # Turbidity
+        with wcol3:
+            st.markdown(f"""
+                <div class='water-metric-card water-quality-{turbidity_class}'>
+                    <h3 style='margin:0;font-size:0.9rem;color:#666;'>Turbidity</h3>
+                    <div style='font-size:1.8rem;font-weight:bold;'>{avg_turbidity:.1f} NTU</div>
+                    <div style='font-size:0.8rem;margin-top:5px;color:#666;'>
+                        Lower values indicate clearer water
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        # Temperature
+        with wcol4:
+            st.markdown(f"""
+                <div class='water-metric-card water-quality-{temperature_class}'>
+                    <h3 style='margin:0;font-size:0.9rem;color:#666;'>Temperature</h3>
+                    <div style='font-size:1.8rem;font-weight:bold;'>{avg_temperature:.1f}°C</div>
+                    <div style='font-size:0.8rem;margin-top:5px;color:#666;'>
+                        Optimal range depends on region
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        # Microplastics
+        with wcol5:
+            st.markdown(f"""
+                <div class='water-metric-card water-quality-{microplastics_class}'>
+                    <h3 style='margin:0;font-size:0.9rem;color:#666;'>Microplastics</h3>
+                    <div style='font-size:1.8rem;font-weight:bold;'>{avg_microplastics:.2f} p/m³</div>
+                    <div style='font-size:0.8rem;margin-top:5px;color:#666;'>
+                        Particles per cubic meter
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
     
-    # Split the dashboard into two columns
-    left_col, right_col = st.columns([2, 1])
+    # --- MAIN DASHBOARD CONTENT ---
     
-    # Left column - Main visualizations
+    # Split dashboard into two columns with a 7:3 ratio
+    left_col, right_col = st.columns([7, 3])
+    
+    # --- LEFT COLUMN: Maps and Primary Visualizations ---
     with left_col:
-        # Hotspot map
-        st.markdown("<h2 class='sub-header'>Critical Hotspots</h2>", unsafe_allow_html=True)
+        # Interactive Hotspot Map
+        st.markdown("<h2 class='sub-header'>Pollution Hotspot Map</h2>", unsafe_allow_html=True)
         
-        # Get top hotspots
-        top_hotspots = redis_client.get_top_hotspots(count=20)
+        # Get map data
+        hotspots = []
+        hotspot_data = []
         
-        if top_hotspots:
-            # Create DataFrame for plotting with improved validation
-            valid_hotspots = []
-            for h in top_hotspots:
+        # Try to get hotspots from Redis
+        with st.spinner("Loading map data..."):
+            if redis_client:
                 try:
-                    # Determine coordinates with more robust logic
-                    lat = None
-                    lon = None
+                    # Get active hotspots
+                    hotspot_ids = redis_client.get_active_hotspots()
                     
-                    if 'center_latitude' in h and h['center_latitude']:
-                        lat = float(h['center_latitude'])
-                    elif 'latitude' in h and h['latitude']:
-                        lat = float(h['latitude'])
+                    if hotspot_ids:
+                        for hotspot_id in hotspot_ids:
+                            hotspot_data = redis_client.get_hotspot_data(hotspot_id)
+                            if hotspot_data:
+                                hotspots.append(hotspot_data)
+                except Exception as e:
+                    st.warning(f"Could not get hotspots from Redis: {str(e)}")
+            
+            # If no hotspots from Redis, try TimescaleDB
+            if not hotspots and timescale_client:
+                try:
+                    db_hotspots = timescale_client.get_active_hotspots()
+                    if db_hotspots:
+                        hotspots = db_hotspots
+                except Exception as e:
+                    st.warning(f"Could not get hotspots from TimescaleDB: {str(e)}")
+        
+        if hotspots:
+            # Convert to DataFrame for plotting
+            hotspot_data = []
+            for h in hotspots:
+                try:
+                    lat = float(h.get("center_latitude", h.get("latitude", 0)))
+                    lon = float(h.get("center_longitude", h.get("longitude", 0)))
+                    radius = float(h.get("radius_km", 1))
+                    risk = float(h.get("max_risk_score", h.get("risk_score", 0.5)))
                     
-                    if 'center_longitude' in h and h['center_longitude']:
-                        lon = float(h['center_longitude'])
-                    elif 'longitude' in h and h['longitude']:
-                        lon = float(h['longitude'])
-                    
-                    # Include only hotspots with valid coordinates
-                    if lat is not None and lon is not None:
-                        valid_hotspots.append({
-                            'id': h.get('id', h.get('hotspot_id', '')),
-                            'latitude': lat,
-                            'longitude': lon,
-                            'severity': h.get('severity', 'low'),
-                            'pollutant_type': h.get('pollutant_type', 'unknown'),
-                            'radius_km': float(h.get('radius_km', 1.0)),
-                            'risk_score': float(h.get('max_risk_score', h.get('risk_score', 0.5)))
+                    if lat != 0 and lon != 0:
+                        hotspot_data.append({
+                            "id": h.get("hotspot_id", h.get("id", "")),
+                            "latitude": lat,
+                            "longitude": lon,
+                            "severity": h.get("severity", "low"),
+                            "pollutant_type": h.get("pollutant_type", "unknown").replace("_", " ").title(),
+                            "radius_km": radius,
+                            "risk_score": risk
                         })
                 except (ValueError, TypeError):
-                    # Skip hotspots with invalid data
                     continue
             
-            if valid_hotspots:
-                hotspot_df = pd.DataFrame(valid_hotspots)
+            if hotspot_data:
+                df = pd.DataFrame(hotspot_data)
+                min_radius = 0.5
+                df['radius_km'] = df['radius_km'].apply(lambda r: max(r, min_radius))       
                 
-                # Set default map center
-                center_lat = hotspot_df['latitude'].mean()
-                center_lon = hotspot_df['longitude'].mean()
+                # Set map center to the average of hotspot locations
+                center_lat = df["latitude"].mean()
+                center_lon = df["longitude"].mean()
                 
                 # Create a scatter map
                 fig = px.scatter_mapbox(
-                    hotspot_df,
+                    df,
                     lat="latitude",
                     lon="longitude",
                     color="severity",
                     size="radius_km",
                     hover_name="id",
-                    hover_data=["pollutant_type", "risk_score"],
-                    color_discrete_map={"high": "#F44336", "medium": "#FF9800", "low": "#4CAF50"},
+                    hover_data={
+                        "pollutant_type": True,
+                        "severity": True,
+                        "risk_score": ":.2f",
+                        "radius_km": ":.1f",
+                        "latitude": False,
+                        "longitude": False
+                    },
+                    color_discrete_map={
+                        "high": "#e53935",
+                        "medium": "#ff9800",
+                        "low": "#4caf50"
+                    },
                     size_max=15,
-                    height=400
+                    opacity=0.8,
+                    height=400,
+                    title="Current Pollution Hotspots"
                 )
                 
-                # Set the map style and center
+                # Update map style and layout
                 fig.update_layout(
                     mapbox=dict(
                         style="open-street-map",
                         center=dict(lat=center_lat, lon=center_lon),
-                        zoom=5  # Lower zoom to see more area
+                        zoom=5
                     ),
-                    margin={"r": 0, "t": 0, "l": 0, "b": 0}
+                    margin=dict(r=0, t=30, l=0, b=0),
+                    legend=dict(
+                        title="Severity",
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="center",
+                        x=0.5
+                    )
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No hotspot coordinates available for mapping")
+                st.info("No geographic data available for mapping")
         else:
-            st.info("No hotspot data available")
+            st.info("No hotspot data available for mapping")
         
-        # Sensor metrics over time
-        st.markdown("<h2 class='sub-header'>Sensor Metrics (Last 24 Hours)</h2>", unsafe_allow_html=True)
+        # Pollution Trend Analysis
+        st.markdown("<h2 class='sub-header'>Pollution Trend Analysis</h2>", unsafe_allow_html=True)
         
-        # Get sensor metrics
-        sensor_metrics = timescale_client.get_sensor_metrics_by_hour(hours=24, as_dataframe=True)
+        # Get sensor metrics over time
+        sensor_metrics_trend = None
+        if timescale_client:
+            try:
+                # Try to get sensor metrics by hour for last 24 hours
+                sensor_metrics_query = """
+                    SELECT 
+                        time_bucket('1 hour', time) as hour,
+                        AVG(water_quality_index) as avg_wqi,
+                        AVG(risk_score) as avg_risk,
+                        MAX(risk_score) as max_risk
+                    FROM sensor_measurements
+                    WHERE time > NOW() - INTERVAL '24 hours'
+                    GROUP BY hour
+                    ORDER BY hour
+                """
+                sensor_metrics_trend = timescale_client.execute_query(sensor_metrics_query)
+            except Exception as e:
+                try:
+                    # Fallback to different method if available
+                    sensor_metrics_trend = timescale_client.get_sensor_metrics_by_hour(hours=24)
+                except:
+                    st.warning("Could not get sensor metrics trend")
         
-        if not sensor_metrics.empty:
-            # Create line chart for metrics
-            fig = go.Figure()
+        if sensor_metrics_trend:
+            # Convert to DataFrame
+            trend_df = pd.DataFrame(sensor_metrics_trend)
             
-            # Add different metrics
-            if 'avg_water_quality_index' in sensor_metrics.columns:
-                fig.add_trace(go.Scatter(
-                    x=sensor_metrics['hour'],
-                    y=sensor_metrics['avg_water_quality_index'],
-                    mode='lines',
-                    name='Water Quality Index'
-                ))
-            
-            if 'avg_risk_score' in sensor_metrics.columns:
-                fig.add_trace(go.Scatter(
-                    x=sensor_metrics['hour'],
-                    y=sensor_metrics['avg_risk_score'],
-                    mode='lines',
-                    name='Risk Score'
-                ))
-            
-            # Update layout
-            fig.update_layout(
-                title="Average Water Quality and Risk",
-                xaxis_title="Time",
-                yaxis_title="Value",
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
+            if 'hour' in trend_df.columns:
+                # Ensure hour column is datetime
+                trend_df['hour'] = pd.to_datetime(trend_df['hour'])
+                
+                # Create a dual-axis figure for water quality and risk
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                
+                # Add water quality index if available
+                if 'avg_wqi' in trend_df.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=trend_df['hour'],
+                            y=trend_df['avg_wqi'],
+                            name="Water Quality Index",
+                            line=dict(color="#4CAF50", width=2)
+                        ),
+                        secondary_y=True
+                    )
+                
+                # Add risk scores - Ensure they are visible even if WQI is not available
+                if 'avg_risk' in trend_df.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=trend_df['hour'],
+                            y=trend_df['avg_risk'],
+                            name="Average Risk",
+                            line=dict(color="#1976D2", width=2)
+                        ),
+                        secondary_y=False
+                    )
+                
+                if 'max_risk' in trend_df.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=trend_df['hour'],
+                            y=trend_df['max_risk'],
+                            name="Maximum Risk",
+                            line=dict(color="#D32F2F", width=2, dash='dot')
+                        ),
+                        secondary_y=False
+                    )
+                
+                # Update layout
+                fig.update_layout(
+                    title="Water Quality and Risk Trend (Last 24 Hours)",
+                    xaxis_title="Time",
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="center",
+                        x=0.5
+                    ),
+                    hovermode="x unified"
                 )
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
+                
+                # Ensure both y-axes are visible regardless of data availability
+                fig.update_yaxes(
+                    title_text="Risk Score", 
+                    secondary_y=False,
+                    range=[0, trend_df['max_risk'].max() * 1.1 if 'max_risk' in trend_df.columns else 1]
+                )
+                
+                fig.update_yaxes(
+                    title_text="Water Quality Index", 
+                    secondary_y=True,
+                    range=[0, 100]
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Insufficient time series data for trend analysis")
         else:
-            st.info("No sensor metrics available")
-    
-    # Right column - Alerts and stats
+            st.info("No sensor metrics trend data available")
+
+    # --- RIGHT COLUMN: Alerts and Pollutant Distribution ---
     with right_col:
-        # Severity breakdown
-        st.markdown("<h2 class='sub-header'>Hotspot Severity</h2>", unsafe_allow_html=True)
+        # Recent Critical Alerts
+        st.markdown("<h2 class='sub-header'>Critical Alerts</h2>", unsafe_allow_html=True)
         
-        # Create pie chart for severity distribution
-        fig = go.Figure(data=[go.Pie(
-            labels=list(severity_dist.keys()),
-            values=list(severity_dist.values()),
-            hole=.3,
-            marker_colors=['#4CAF50', '#FF9800', '#F44336']  # Green for low, orange for medium, red for high
-        )])
+        # Get recent alerts
+        alerts = None
+        with st.spinner("Loading alerts..."):
+            if postgres_client:
+                try:
+                    # Try to get high severity alerts first
+                    alerts = postgres_client.get_alerts(limit=5, days=1, severity_filter="high")
+                    if not alerts:
+                        # Fallback to any alerts
+                        alerts = postgres_client.get_alerts(limit=5, days=1)
+                except Exception as e:
+                    st.warning(f"Could not get alerts from PostgreSQL: {str(e)}")
+            
+            # If no alerts from PostgreSQL, try Redis
+            if not alerts and redis_client:
+                try:
+                    alerts = redis_client.get_active_alerts(limit=5)
+                except Exception as e:
+                    st.warning(f"Could not get alerts from Redis: {str(e)}")
         
-        # Update layout
-        fig.update_layout(
-            showlegend=True,
-            margin=dict(t=0, b=0, l=0, r=0),
-            height=300
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Recent alerts
-        st.markdown("<h2 class='sub-header'>Recent Alerts</h2>", unsafe_allow_html=True)
-        
-        # Get recent notifications
-        notifications = redis_client.get_recent_notifications(count=5)
-        
-        if notifications:
-            for notification in notifications:
-                severity = notification.get('severity', 'medium')
-                severity_class = f"status-{severity.lower()}"
-                message = notification.get('message', 'Alert notification')
-                timestamp = datetime.fromtimestamp(int(notification.get('timestamp', time.time() * 1000)) / 1000).strftime('%Y-%m-%d %H:%M')
+        if alerts:
+            for alert in alerts:
+                severity = alert.get("severity", "medium")
+                alert_time = alert.get("alert_time", alert.get("timestamp", ""))
+                
+                # Format timestamp
+                if isinstance(alert_time, str) and alert_time:
+                    try:
+                        alert_datetime = datetime.fromisoformat(alert_time.replace('Z', '+00:00'))
+                        alert_time = alert_datetime.strftime("%Y-%m-%d %H:%M")
+                    except (ValueError, TypeError):
+                        alert_time = alert_time
+                elif isinstance(alert_time, (int, float)):
+                    try:
+                        # Convert timestamp to datetime
+                        alert_datetime = datetime.fromtimestamp(alert_time / 1000 if alert_time > 1e10 else alert_time)
+                        alert_time = alert_datetime.strftime("%Y-%m-%d %H:%M")
+                    except (ValueError, TypeError):
+                        alert_time = str(alert_time)
+                
+                message = alert.get("message", "Alert notification")
+                alert_id = alert.get("alert_id", alert.get("id", ""))
                 
                 st.markdown(f"""
-                <div class='card'>
-                    <div><span class='{severity_class}'>{severity.upper()}</span> - {timestamp}</div>
-                    <div>{message}</div>
+                <div class='alert-card'>
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <span class="status-{severity}">{severity.upper()}</span>
+                        <span style="font-size:0.8rem;color:#666;">{alert_time}</span>
+                    </div>
+                    <div style="margin-top:5px;font-size:0.9rem;">{message}</div>
+                    <div style="margin-top:8px;text-align:right;">
+                        <a href="?page=alerts&alert_id={alert_id}" target="_self" style="font-size:0.8rem;">View details</a>
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
         else:
             st.info("No recent alerts")
         
-        # NUOVA SEZIONE: Critical Response Actions
-        st.markdown("<h2 class='sub-header'>Critical Response Actions</h2>", unsafe_allow_html=True)
+        # Pollutant Type Distribution (Pie Chart)
+        st.markdown("<h2 class='sub-header top-spacing'>Pollutant Distribution</h2>", unsafe_allow_html=True)
         
-        # Add CSS for recommended actions
-        st.markdown("""
-        <style>
-        .immediate-action {
-            padding: 8px 12px;
-            border-radius: 4px;
-            margin-bottom: 8px;
-            background-color: #fee2e2;
-            border-left: 4px solid #ef4444;
-        }
-        .resource-note {
-            padding: 6px 10px;
-            margin-top: 4px;
-            font-size: 0.85em;
-            color: #4b5563;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-        
-        # Get recent active alerts with high severity from PostgreSQL
-        critical_alerts = postgres_client.get_alerts(
-            limit=3, 
-            days=1, 
-            severity_filter=["high", "medium"],
-            status_filter=["active"]
-        )
-        
-        if critical_alerts:
-            for alert in critical_alerts:
-                severity = alert.get('severity', 'medium')
-                pollutant_type = alert.get('pollutant_type', 'unknown')
-                
-                # Extract recommendations from alert
-                recommendations = None
-                
-                # Check recommendations directly
-                if 'recommendations' in alert:
-                    recommendations = alert['recommendations']
-                    
-                # Check in details if available
-                elif 'details' in alert and isinstance(alert['details'], dict):
-                    recommendations = alert['details'].get('recommendations')
-                
-                # Try to parse if it's a string
-                if isinstance(recommendations, str):
-                    try:
-                        recommendations = json.loads(recommendations)
-                    except:
-                        recommendations = None
-                
-                # Display immediate actions if available
-                if recommendations and isinstance(recommendations, dict) and 'immediate_actions' in recommendations:
-                    st.markdown(f"""
-                    <div class='card'>
-                        <div><span class='status-{severity}'>{severity.upper()}</span> - {pollutant_type.replace('_', ' ').title()}</div>
-                    """, unsafe_allow_html=True)
-                    
-                    # Display only the first 3 immediate actions to save space
-                    immediate_actions = recommendations['immediate_actions'][:3]
-                    for action in immediate_actions:
-                        st.markdown(f"<div class='immediate-action'>{action}</div>", unsafe_allow_html=True)
-                    
-                    # Display resource note if available
-                    if 'resource_requirements' in recommendations and 'personnel' in recommendations['resource_requirements']:
-                        personnel = recommendations['resource_requirements']['personnel']
-                        st.markdown(f"<div class='resource-note'>Resources needed: {personnel}</div>", unsafe_allow_html=True)
-                    
-                    st.markdown("</div>", unsafe_allow_html=True)
-                    
-                    # Add a link to view full details
-                    alert_id = alert.get('alert_id', '')
-                    if alert_id:
-                        st.markdown(f"<div style='text-align: right; margin-top: -8px; margin-bottom: 12px;'><a href='?page=alerts&alert={alert_id}'>View full details</a></div>", unsafe_allow_html=True)
+        # Use the hotspot data we already have
+        if hotspot_data:
+            df = pd.DataFrame(hotspot_data)
+            pollutant_counts = df['pollutant_type'].value_counts()
+            
+            # Create a pie chart
+            fig = go.Figure(data=[go.Pie(
+                labels=pollutant_counts.index,
+                values=pollutant_counts.values,
+                hole=.4,
+                textinfo='percent',
+                hoverinfo='label+value',
+                marker_colors=px.colors.qualitative.Safe
+            )])
+            
+            fig.update_layout(
+                margin=dict(t=0, b=0, l=10, r=10),
+                height=250,
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=-0.3,
+                    xanchor="center",
+                    x=0.5,
+                    font=dict(size=10)
+                )
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No critical alerts requiring immediate action")
+            st.info("No pollutant distribution data available")
         
-        # Upcoming predictions
-        st.markdown("<h2 class='sub-header'>Upcoming Critical Predictions</h2>", unsafe_allow_html=True)
+        # Severity Distribution
+        st.markdown("<h2 class='sub-header top-spacing'>Severity Distribution</h2>", unsafe_allow_html=True)
         
-        # Get predictions for next 24 hours with high environmental impact
-        predictions = timescale_client.get_predictions(hours_ahead=24, as_dataframe=False)
-        
-        # Filter for high severity predictions
-        high_impact_predictions = [p for p in predictions if p.get('severity') == 'high'][:3]
-        
-        if high_impact_predictions:
-            for prediction in high_impact_predictions:
-                hotspot_id = prediction.get('hotspot_id', '')
-                prediction_time = prediction.get('prediction_time', '')
-                severity = prediction.get('severity', 'medium')
-                pollutant = prediction.get('pollutant_type', 'unknown')
-                confidence = prediction.get('confidence', 0) * 100
-                
-                # Format prediction time
-                try:
-                    prediction_datetime = datetime.fromisoformat(prediction_time.replace('Z', '+00:00'))
-                    time_str = prediction_datetime.strftime('%Y-%m-%d %H:%M')
-                except:
-                    time_str = prediction_time
-                
-                st.markdown(f"""
-                <div class='card'>
-                    <div><span class='status-{severity}'>{severity.upper()}</span> - {time_str}</div>
-                    <div>Hotspot: {hotspot_id}</div>
-                    <div>Pollutant: {pollutant}</div>
-                    <div>Confidence: {confidence:.1f}%</div>
-                </div>
-                """, unsafe_allow_html=True)
+        if hotspot_data:
+            df = pd.DataFrame(hotspot_data)
+            severity_counts = df['severity'].value_counts().reset_index()
+            severity_counts.columns = ['severity', 'count']
+            
+            # Map colors to severity levels
+            colors = {
+                'high': '#e53935',
+                'medium': '#ff9800',
+                'low': '#4caf50'
+            }
+            
+            # Create bar chart
+            fig = px.bar(
+                severity_counts,
+                x='severity',
+                y='count',
+                color='severity',
+                color_discrete_map=colors,
+                title="Hotspots by Severity"
+            )
+            
+            fig.update_layout(
+                xaxis_title="Severity Level",
+                yaxis_title="Count",
+                showlegend=False,
+                height=250,
+                margin=dict(t=30, b=0, l=10, r=10)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No critical predictions for next 24 hours")
+            st.info("No severity distribution data available")
+    
+    # Add a refresh button at the bottom
+    if st.button("Refresh Dashboard"):
+        st.experimental_rerun()

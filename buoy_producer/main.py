@@ -1,10 +1,8 @@
-import time, json, requests, random, sys, os, yaml
+import time, json, random, sys, os, yaml, math
+from datetime import datetime
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
-from dotenv import load_dotenv
 from loguru import logger
-
-load_dotenv()
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -16,8 +14,11 @@ DLQ_TOPIC = os.getenv("DLQ_TOPIC", "buoy_data_dlq")  # Dead Letter Queue
 logger.remove()
 logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
 
+# Global state to maintain consistent data between runs
+location_states = {}
+
 def create_kafka_producer():
-    """Creates a regular JSON producer"""
+    """Creates a Kafka JSON producer with retries"""
     logger.info("Creating Kafka JSON producer")
     for _ in range(5):
         try:
@@ -30,147 +31,329 @@ def create_kafka_producer():
     logger.critical("Kafka unavailable. Exiting.")
     sys.exit(1)
 
-def on_delivery_error(err, msg):
-    """Error callback for Kafka producer"""
-    logger.error(f'Message delivery failed: {err}')
-    # Send to DLQ if possible
-    try:
-        dlq_producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8")
-        )
-        error_msg = {
-            "original_topic": msg.topic(),
-            "error": str(err),
-            "timestamp": int(time.time() * 1000),
-            "data": json.loads(msg.value().decode('utf-8')) if msg.value() else None
+def initialize_location_state(location_id, lat, lon):
+    """Initialize the baseline state for a location if not already present"""
+    if location_id in location_states:
+        return
+    
+    # Use location to seed baseline values (coastal vs ocean, temperate vs tropical)
+    rng = random.Random(hash(location_id) % 10000)
+    is_coastal = is_location_coastal(lat, lon)
+    is_tropical = is_location_tropical(lat)
+    
+    # Base environmental parameters
+    baseline = {
+        # Environmental parameters
+        "ph": rng.uniform(7.8, 8.2),  # Ocean pH is typically 7.8-8.2
+        "temperature": 25.0 if is_tropical else 15.0,  # Base temperature depends on latitude
+        "turbidity": rng.uniform(2.0, 8.0) if is_coastal else rng.uniform(0.5, 3.0),
+        "wave_height": rng.uniform(0.8, 2.0) if is_coastal else rng.uniform(1.5, 3.5),
+        "wind_speed": rng.uniform(5.0, 15.0),
+        "wind_direction": rng.uniform(0, 360),
+        "pressure": rng.uniform(1010, 1020),
+        "air_temp": 28.0 if is_tropical else 18.0,
+        "dissolved_oxygen": rng.uniform(90, 110),
+        
+        # Pollution parameters - baseline levels
+        "microplastics": rng.uniform(0.8, 4.0) if is_coastal else rng.uniform(0.2, 1.5),
+        "mercury": rng.uniform(0.001, 0.01) if is_coastal else rng.uniform(0.0005, 0.005),
+        "lead": rng.uniform(0.005, 0.02) if is_coastal else rng.uniform(0.001, 0.01),
+        "cadmium": rng.uniform(0.0005, 0.005) if is_coastal else rng.uniform(0.0001, 0.001),
+        "chromium": rng.uniform(0.002, 0.02) if is_coastal else rng.uniform(0.001, 0.005),
+        "petroleum_hydrocarbons": rng.uniform(0.05, 0.5) if is_coastal else rng.uniform(0.01, 0.1),
+        "polycyclic_aromatic": rng.uniform(0.001, 0.05) if is_coastal else rng.uniform(0.0005, 0.01),
+        "nitrates": rng.uniform(1.0, 10.0) if is_coastal else rng.uniform(0.5, 3.0),
+        "phosphates": rng.uniform(0.1, 1.0) if is_coastal else rng.uniform(0.05, 0.3),
+        "ammonia": rng.uniform(0.05, 0.5) if is_coastal else rng.uniform(0.01, 0.1),
+        "cp_pesticides_total": rng.uniform(0.001, 0.01) if is_coastal else rng.uniform(0.0001, 0.001),
+        "cp_pcbs_total": rng.uniform(0.0001, 0.001) if is_coastal else rng.uniform(0.00001, 0.0001),
+        "cp_dioxins": rng.uniform(0.00001, 0.0001) if is_coastal else rng.uniform(0.000001, 0.00001),
+        "coliform_bacteria": int(rng.uniform(10, 300)) if is_coastal else int(rng.uniform(1, 50)),
+        "chlorophyll_a": rng.uniform(2.0, 15.0) if is_coastal else rng.uniform(0.5, 5.0),
+    }
+    
+    # Store the state
+    location_states[location_id] = {
+        "baseline": baseline,
+        "current": baseline.copy(),
+        "active_events": [],
+        "last_update": time.time()
+    }
+
+def is_location_coastal(lat, lon):
+    """Simple check if location is likely coastal based on latitude/longitude"""
+    # This is a simplified approximation - for a real system you'd use actual coastline data
+    # Coastal locations are more likely to have higher pollution levels
+    coastal_zones = [
+        # Mediterranean
+        {"lat_min": 30, "lat_max": 45, "lon_min": -5, "lon_max": 40},
+        # US East Coast
+        {"lat_min": 25, "lat_max": 45, "lon_min": -85, "lon_max": -65},
+        # US West Coast
+        {"lat_min": 30, "lat_max": 50, "lon_min": -130, "lon_max": -115},
+        # Southeast Asia
+        {"lat_min": -10, "lat_max": 30, "lon_min": 95, "lon_max": 145},
+    ]
+    
+    for zone in coastal_zones:
+        if (zone["lat_min"] <= lat <= zone["lat_max"] and 
+            zone["lon_min"] <= lon <= zone["lon_max"]):
+            return True
+    
+    return False
+
+def is_location_tropical(lat):
+    """Check if location is in tropical region"""
+    return -23.5 <= lat <= 23.5
+
+def get_seasonal_factor(lat):
+    """Calculate seasonal factor based on current date and latitude"""
+    # Northern hemisphere: summer in Jun-Aug, winter in Dec-Feb
+    # Southern hemisphere: opposite
+    now = datetime.now()
+    day_of_year = now.timetuple().tm_yday
+    
+    # Calculate seasonal factor (-1 to 1): 
+    # +1 = peak summer, -1 = peak winter, 0 = spring/fall
+    if lat >= 0:  # Northern hemisphere
+        return math.sin(2 * math.pi * (day_of_year - 172) / 365)
+    else:  # Southern hemisphere
+        return -math.sin(2 * math.pi * (day_of_year - 172) / 365)
+
+def get_daily_factor():
+    """Calculate daily factor based on time of day"""
+    # +1 = noon, -1 = midnight, 0 = dawn/dusk
+    now = datetime.now()
+    hour = now.hour + now.minute / 60
+    return math.sin(2 * math.pi * (hour - 6) / 24)
+
+def update_location_state(location_id, lat, lon):
+    """Update the location state based on time patterns and events"""
+    if location_id not in location_states:
+        initialize_location_state(location_id, lat, lon)
+    
+    state = location_states[location_id]
+    baseline = state["baseline"]
+    current = state["current"]
+    last_update = state["last_update"]
+    now = time.time()
+    
+    # Time since last update in hours
+    time_delta_hours = (now - last_update) / 3600
+    
+    # Get seasonal and daily factors
+    seasonal_factor = get_seasonal_factor(lat)
+    daily_factor = get_daily_factor()
+    
+    # Apply time-based patterns
+    for param in current:
+        # Skip parameters that don't vary with time
+        if param in ["sensor_id", "latitude", "longitude"]:
+            continue
+            
+        # Get the baseline value
+        base_val = baseline[param]
+        
+        # Different parameters have different variation patterns
+        if param == "temperature":
+            # Water temperature varies with season and slightly with day
+            seasonal_effect = 5.0 * seasonal_factor  # ±5°C seasonal variation
+            daily_effect = 1.0 * daily_factor  # ±1°C daily variation
+            current[param] = base_val + seasonal_effect + daily_effect
+            
+        elif param == "air_temp":
+            # Air temperature varies more than water temperature
+            seasonal_effect = 10.0 * seasonal_factor  # ±10°C seasonal variation
+            daily_effect = 5.0 * daily_factor  # ±5°C daily variation
+            current[param] = base_val + seasonal_effect + daily_effect
+            
+        elif param == "ph":
+            # pH varies slightly with temperature (higher temp -> lower pH)
+            temp_effect = -0.1 * seasonal_factor  # Higher temp, slightly lower pH
+            current[param] = base_val + temp_effect
+            
+        elif param == "wind_speed":
+            # Wind varies with daily patterns and some randomness
+            daily_effect = 2.0 * daily_factor  # More wind during day typically
+            # Allow some random changes but maintain continuity
+            random_effect = random.uniform(-1.0, 1.0)
+            current[param] = max(0, base_val + daily_effect + random_effect)
+            
+        elif param == "wind_direction":
+            # Wind direction changes gradually
+            # Add a small random shift
+            shift = random.uniform(-10, 10)
+            current[param] = (current[param] + shift) % 360
+            
+        elif param == "wave_height":
+            # Waves correlate with wind speed
+            wind_effect = (current["wind_speed"] - baseline["wind_speed"]) * 0.1
+            current[param] = max(0.1, base_val + wind_effect)
+            
+        elif param == "dissolved_oxygen":
+            # DO decreases with temperature
+            temp_effect = -0.5 * (current["temperature"] - baseline["temperature"])
+            current[param] = max(60, base_val + temp_effect)
+            
+        elif param == "nitrates" or param == "phosphates":
+            # Nutrient levels can spike with runoff events (simulated occasionally)
+            if random.random() < 0.05:  # 5% chance of a runoff event
+                runoff_effect = random.uniform(1.0, 5.0)
+                current[param] = base_val + runoff_effect
+            else:
+                # Gradual return to baseline
+                current[param] = base_val + (current[param] - base_val) * 0.9
+    
+    # Apply correlations between parameters
+    # High nitrates/phosphates increase chlorophyll and decrease oxygen
+    if current["nitrates"] > baseline["nitrates"] * 1.5 or current["phosphates"] > baseline["phosphates"] * 1.5:
+        current["chlorophyll_a"] = min(50, current["chlorophyll_a"] * 1.1)
+        current["dissolved_oxygen"] = max(30, current["dissolved_oxygen"] * 0.95)
+    
+    # Add small random variations (sensor noise)
+    for param in current:
+        if param in ["sensor_id", "latitude", "longitude"]:
+            continue
+        
+        # Different parameters have different noise levels
+        if param in ["ph", "temperature", "turbidity"]:
+            noise = random.uniform(-0.1, 0.1)
+        elif param in ["microplastics", "mercury", "lead", "petroleum_hydrocarbons"]:
+            noise = random.uniform(-0.05, 0.05) * current[param]
+        else:
+            noise = random.uniform(-0.02, 0.02) * current[param]
+            
+        current[param] = max(0, current[param] + noise)
+    
+    # Update timestamp
+    state["last_update"] = now
+    
+    # Make a copy to return
+    result = current.copy()
+    result["sensor_id"] = location_id
+    result["latitude"] = lat
+    result["longitude"] = lon
+    
+    return result
+
+def process_pollution_events(location_id):
+    """Process any active pollution events for this location"""
+    state = location_states[location_id]
+    current = state["current"]
+    
+    # Check for active events
+    active_events = state.get("active_events", [])
+    
+    # Process existing events - decrease their duration and apply effects
+    updated_events = []
+    
+    for event in active_events:
+        # Decrease duration
+        event["duration"] -= 1
+        
+        # If still active, apply effects and keep
+        if event["duration"] > 0:
+            if event["type"] == "oil_spill":
+                # Maintain elevated hydrocarbon levels
+                current["petroleum_hydrocarbons"] = max(
+                    current["petroleum_hydrocarbons"],
+                    state["baseline"]["petroleum_hydrocarbons"] * event["intensity"] * 5
+                )
+                current["polycyclic_aromatic"] = max(
+                    current["polycyclic_aromatic"],
+                    state["baseline"]["polycyclic_aromatic"] * event["intensity"] * 4
+                )
+                # Suppress oxygen levels
+                current["dissolved_oxygen"] = min(
+                    current["dissolved_oxygen"],
+                    state["baseline"]["dissolved_oxygen"] * 0.6
+                )
+                
+            elif event["type"] == "chemical_leak":
+                # Maintain elevated heavy metal levels
+                current["mercury"] = max(
+                    current["mercury"],
+                    state["baseline"]["mercury"] * event["intensity"] * 8
+                )
+                current["lead"] = max(
+                    current["lead"],
+                    state["baseline"]["lead"] * event["intensity"] * 6
+                )
+                current["cadmium"] = max(
+                    current["cadmium"],
+                    state["baseline"]["cadmium"] * event["intensity"] * 6
+                )
+                
+            elif event["type"] == "algal_bloom":
+                # Maintain elevated algal indicators
+                current["chlorophyll_a"] = max(
+                    current["chlorophyll_a"],
+                    state["baseline"]["chlorophyll_a"] * event["intensity"] * 6
+                )
+                current["nitrates"] = max(
+                    current["nitrates"],
+                    state["baseline"]["nitrates"] * event["intensity"] * 3
+                )
+                current["phosphates"] = max(
+                    current["phosphates"],
+                    state["baseline"]["phosphates"] * event["intensity"] * 4
+                )
+                # Suppress oxygen levels
+                current["dissolved_oxygen"] = min(
+                    current["dissolved_oxygen"],
+                    state["baseline"]["dissolved_oxygen"] * 0.5
+                )
+            
+            # Add to updated list
+            updated_events.append(event)
+            logger.info(f"🔄 Active {event['type']} at {location_id} (remaining: {event['duration']} cycles)")
+    
+    # Store updated events list
+    state["active_events"] = updated_events
+    
+    # Occasionally create a new random pollution event if no active events
+    # Higher chance than before (3% instead of 1%)
+    if not updated_events and random.random() < 0.03:
+        event_type = random.choice(["oil_spill", "chemical_leak", "algal_bloom"])
+        intensity = random.uniform(0.7, 1.0)  # 0.7-1.0 scale
+        duration = random.randint(10, 20)  # lasts for 10-20 update cycles (5-10 minutes)
+        
+        # Create new event
+        new_event = {
+            "type": event_type,
+            "intensity": intensity,
+            "duration": duration,
+            "created_at": time.time()
         }
-        dlq_producer.send(DLQ_TOPIC, error_msg)
-        dlq_producer.flush()
-        logger.info(f"Message sent to DLQ topic {DLQ_TOPIC}")
-    except Exception as e:
-        logger.error(f"Failed to send to DLQ: {e}")
-
-# NOAA + USGS helpers
-def fetch_buoy(bid: str) -> dict | None:
-    url = f"https://www.ndbc.noaa.gov/data/realtime2/{bid}.txt"
-    try:
-        txt = requests.get(url, timeout=10).text.splitlines()
-        header, data = txt[0].replace("#","").split(), txt[2].split()
-        raw = dict(zip(header, data))
-    except Exception as e:
-        logger.warning(f"NOAA {bid}: {e}")
-        return None
-
-    out = {}
-    for k,v in raw.items():
-        if v!='MM':
-            try: out[k]=float(v)
-            except ValueError: out[k]=v
-    return out
-
-def fetch_usgs(sid: str) -> dict | None:
-    url = f"https://waterservices.usgs.gov/nwis/iv/?format=json&sites={sid}&parameterCd=00400,63675"
-    try:
-        ts = requests.get(url, timeout=10).json()["value"]["timeSeries"]
-    except Exception as e:
-        logger.warning(f"USGS {sid}: {e}")
-        return None
-    out={}
-    for s in ts:
-        code=s["variable"]["variableCode"][0]["value"]
-        val=float(s["values"][0]["value"][0]["value"])
-        if code=="00400": out["ph"]=val
-        elif code=="63675": out["turbidity"]=val
-    return out or None
-
-# Pollution parameter simulation
-def simulate_pollution_parameters(buoy_id: str, lat: float, lon: float) -> dict:
-    """Simulates marine pollution parameters based on location and randomness"""
-    # Seed based on buoy_id for consistency with temporal variation
-    base_seed = hash(buoy_id) % 1000 + int(time.time()) % 100
-    rng = random.Random(base_seed)
-    
-    # Base parameters with realistic variations
-    pollution_data = {
-        # Microplastics (particles per m³)
-        "microplastics": round(rng.uniform(0.1, 15.0), 2),
         
-        # Heavy metals (mg/L)
-        "mercury": round(rng.uniform(0.001, 0.05), 4),
-        "lead": round(rng.uniform(0.001, 0.1), 4),
-        "cadmium": round(rng.uniform(0.0005, 0.02), 4),
-        "chromium": round(rng.uniform(0.002, 0.15), 4),
+        # Apply immediate effects
+        if event_type == "oil_spill":
+            # Oil spill drastically increases hydrocarbons
+            current["petroleum_hydrocarbons"] *= random.uniform(4.0, 8.0)
+            current["polycyclic_aromatic"] *= random.uniform(3.0, 6.0)
+            current["dissolved_oxygen"] *= random.uniform(0.5, 0.7)
+            logger.warning(f"🛢️ NEW oil spill event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
+            
+        elif event_type == "chemical_leak":
+            # Chemical leak drastically increases heavy metals
+            current["mercury"] *= random.uniform(5.0, 10.0)
+            current["lead"] *= random.uniform(4.0, 8.0)
+            current["cadmium"] *= random.uniform(4.0, 8.0)
+            logger.warning(f"⚗️ NEW chemical leak event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
+            
+        elif event_type == "algal_bloom":
+            # Algal bloom drastically increases chlorophyll and nutrients
+            current["chlorophyll_a"] *= random.uniform(5.0, 10.0)
+            current["nitrates"] *= random.uniform(3.0, 5.0)
+            current["phosphates"] *= random.uniform(3.0, 6.0)
+            current["dissolved_oxygen"] *= random.uniform(0.4, 0.6)
+            logger.warning(f"🌱 NEW algal bloom event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
         
-        # Hydrocarbons (mg/L)
-        "petroleum_hydrocarbons": round(rng.uniform(0.01, 2.0), 3),
-        "polycyclic_aromatic": round(rng.uniform(0.001, 0.5), 4),
-        
-        # Nutrients and eutrophication
-        "nitrates": round(rng.uniform(0.1, 25.0), 2),
-        "phosphates": round(rng.uniform(0.01, 3.0), 3),
-        "ammonia": round(rng.uniform(0.01, 1.5), 3),
-        
-        # Additional chemical parameters
-        "cp_pesticides_total": round(rng.uniform(0.001, 0.1), 4),
-        "cp_pcbs_total": round(rng.uniform(0.0001, 0.01), 5),
-        "cp_dioxins": round(rng.uniform(0.00001, 0.001), 6),
-        
-        # Biological indicators
-        "coliform_bacteria": int(rng.uniform(1, 1000)),
-        "chlorophyll_a": round(rng.uniform(0.5, 50.0), 2),
-        "dissolved_oxygen": round(rng.uniform(70.0, 120.0), 1)
-    }
-    
-    # Adjustments based on location (simulation of hotspots)
-    # Coastal zones tend to have more pollution
-    if abs(lat) < 60:  # More populated zones
-        pollution_data["microplastics"] *= rng.uniform(1.2, 2.0)
-    
-    # Add realistic correlations between parameters
-    # High nitrates and phosphates correlate with high chlorophyll_a (algal growth)
-    if pollution_data["nitrates"] > 15 or pollution_data["phosphates"] > 2:
-        pollution_data["chlorophyll_a"] = min(100, pollution_data["chlorophyll_a"] * 1.5)
-        pollution_data["dissolved_oxygen"] = max(30, pollution_data["dissolved_oxygen"] * 0.85)
-    
-    # High petroleum correlates with low dissolved oxygen
-    if pollution_data["petroleum_hydrocarbons"] > 1.0:
-        pollution_data["dissolved_oxygen"] = max(30, pollution_data["dissolved_oxygen"] * 0.7)
-    
-    return pollution_data
-
-# Basic environmental data simulation
-def simulate_basic_environmental_data(buoy_id: str, lat: float, lon: float) -> dict:
-    """Simulates basic environmental data when external APIs are unavailable"""
-    base_seed = hash(buoy_id) % 1000 + int(time.time()) % 100
-    rng = random.Random(base_seed)
-    
-    data = {
-        "wind_direction": round(rng.uniform(0, 360), 1),  # Wind direction
-        "wind_speed": round(rng.uniform(2, 25), 1),   # Wind speed
-        "temperature": round(rng.uniform(8, 28), 1),   # Water temperature
-        "wave_height": round(rng.uniform(0.5, 4.0), 2), # Wave height
-        "pressure": round(rng.uniform(1010, 1025), 1), # Atmospheric pressure
-        "air_temp": round(rng.uniform(5, 35), 1),   # Air temperature
-        "ph": round(rng.uniform(7.8, 8.2), 2),  # Water pH
-        "turbidity": round(rng.uniform(1, 15), 1)  # Turbidity
-    }
-    
-    # Add realistic correlations
-    # High temperature typically lowers pH slightly
-    if data["temperature"] > 25:
-        data["ph"] = max(6.5, data["ph"] - (data["temperature"] - 25) * 0.03)
-    
-    # High turbidity reduces dissolved oxygen
-    if data["turbidity"] > 10:
-        data["dissolved_oxygen"] = round(rng.uniform(70, 85), 1)
-    else:
-        data["dissolved_oxygen"] = round(rng.uniform(85, 120), 1)
-    
-    return data
+        # Add to active events
+        state["active_events"] = [new_event]
 
 def calculate_water_quality_index(data):
-    """Calculates a realistic Water Quality Index from sensor parameters"""
+    """Calculates a Water Quality Index from sensor parameters"""
     # Define parameter weights
     weights = {
         "ph": 0.15,
@@ -317,59 +500,33 @@ def validate_sensor_data(data):
 
 # Main loop
 def main():
+    # Load location data
     locs = yaml.safe_load(open("locations.yml"))
     
     # Create Kafka producer
     prod = create_kafka_producer()
     logger.success("✅ Connected to Kafka")
     
-    logger.info("🔄 Mode: External APIs + fallback to simulated data")
+    logger.info("🔄 Mode: Realistic simulation with persistent pollution events")
 
     while True:
         for loc in locs:
-            # Try external APIs first
-            buoy = fetch_usgs(loc["id"]) if loc["type"]=="station" else fetch_buoy(loc["id"])
+            # Get location info
+            location_id = loc["id"]
+            lat = loc["lat"]
+            lon = loc["lon"]
             
-            # If external APIs fail, use simulated data
-            if not buoy:
-                logger.info(f"🎲 External API unavailable for {loc['id']}, using simulated data")
-                buoy = simulate_basic_environmental_data(loc["id"], loc["lat"], loc["lon"])
-
-            buoy["sensor_id"] = loc["id"]
-            buoy["latitude"] = loc["lat"]
-            buoy["longitude"] = loc["lon"]
-
-            # Add pollution parameter simulation
-            pollution_params = simulate_pollution_parameters(loc["id"], loc["lat"], loc["lon"])
-            buoy.update(pollution_params)
+            # Update the state and get current data
+            buoy = update_location_state(location_id, lat, lon)
             
-            # Add simulated pH if missing
-            if "ph" not in buoy or buoy["ph"] is None:
-                base_seed = hash(loc["id"]) % 1000 + int(time.time()) % 100
-                rng = random.Random(base_seed)
-                buoy["ph"] = round(rng.uniform(7.8, 8.2), 2)  # Typical seawater pH
-            
-            # Handle NOAA data mapping to standardized names
-            if "WDIR" in buoy:
-                buoy["wind_direction"] = buoy.pop("WDIR")
-            if "WSPD" in buoy:
-                buoy["wind_speed"] = buoy.pop("WSPD")
-            if "WTMP" in buoy:
-                buoy["temperature"] = buoy.pop("WTMP")
-            if "WVHT" in buoy:
-                buoy["wave_height"] = buoy.pop("WVHT")
-            if "PRES" in buoy:
-                buoy["pressure"] = buoy.pop("PRES")
-            if "ATMP" in buoy:
-                buoy["air_temp"] = buoy.pop("ATMP")
-            if "pH" in buoy:
-                buoy["ph"] = buoy.pop("pH")
-
-            # Timestamp in milliseconds
-            buoy["timestamp"] = int(time.time()*1000)
+            # Process any active pollution events
+            process_pollution_events(location_id)
             
             # Validate data to ensure realistic values
             buoy = validate_sensor_data(buoy)
+            
+            # Add timestamp
+            buoy["timestamp"] = int(time.time()*1000)
             
             # Calculate Water Quality Index
             buoy["water_quality_index"] = calculate_water_quality_index(buoy)
@@ -378,7 +535,7 @@ def main():
             try:
                 prod.send(KAFKA_TOPIC, value=buoy)
             except Exception as e:
-                logger.error(f"Error sending data for {loc['id']}: {e}")
+                logger.error(f"Error sending data for {location_id}: {e}")
                 # Send to DLQ
                 try:
                     dlq_producer = KafkaProducer(
@@ -399,16 +556,14 @@ def main():
             
             # Detailed log of sent data
             logger.info(f"→ SENT {loc['id']} ({loc['lat']}, {loc['lon']})")
-            # Show complete JSON sent (for debugging)
-            logger.debug(f"📄 Complete JSON: {json.dumps(buoy, indent=2)}")
-            logger.info(f"  📊 Environmental: pH={buoy.get('ph', 'N/A')}, Temp={buoy.get('temperature', 'N/A')}°C, Wind={buoy.get('wind_speed', 'N/A')}kt")
-            logger.info(f"  🌊 Sea: Waves={buoy.get('wave_height', 'N/A')}m, Pressure={buoy.get('pressure', 'N/A')}hPa")
-            logger.info(f"  🔬 WQI={buoy.get('water_quality_index', 'N/A')}")
-            logger.info(f"  🧪 Microplastics={buoy.get('microplastics', 'N/A')} part/m³")
-            logger.info(f"  ⚗️ Metals: Hg={buoy.get('mercury', 'N/A')}mg/L, Pb={buoy.get('lead', 'N/A')}mg/L")
-            logger.info(f"  🛢️ Hydrocarbons: TPH={buoy.get('petroleum_hydrocarbons', 'N/A')}mg/L")
-            logger.info(f"  🌱 Nutrients: NO3={buoy.get('nitrates', 'N/A')}mg/L, PO4={buoy.get('phosphates', 'N/A')}mg/L")
-            logger.info(f"  🦠 Biological: Coliform={buoy.get('coliform_bacteria', 'N/A')}, Chlorophyll={buoy.get('chlorophyll_a', 'N/A')}μg/L")
+            logger.info(f"  📊 Environmental: pH={buoy.get('ph', 'N/A'):.2f}, Temp={buoy.get('temperature', 'N/A'):.1f}°C, Wind={buoy.get('wind_speed', 'N/A'):.1f}kt")
+            logger.info(f"  🌊 Sea: Waves={buoy.get('wave_height', 'N/A'):.1f}m, Pressure={buoy.get('pressure', 'N/A'):.1f}hPa")
+            logger.info(f"  🔬 WQI={buoy.get('water_quality_index', 'N/A'):.1f}")
+            logger.info(f"  🧪 Microplastics={buoy.get('microplastics', 'N/A'):.2f} part/m³")
+            logger.info(f"  ⚗️ Metals: Hg={buoy.get('mercury', 'N/A'):.5f}mg/L, Pb={buoy.get('lead', 'N/A'):.5f}mg/L")
+            logger.info(f"  🛢️ Hydrocarbons: TPH={buoy.get('petroleum_hydrocarbons', 'N/A'):.3f}mg/L")
+            logger.info(f"  🌱 Nutrients: NO3={buoy.get('nitrates', 'N/A'):.2f}mg/L, PO4={buoy.get('phosphates', 'N/A'):.3f}mg/L")
+            logger.info(f"  🦠 Biological: Coliform={buoy.get('coliform_bacteria', 'N/A')}, Chlorophyll={buoy.get('chlorophyll_a', 'N/A'):.2f}μg/L")
             logger.info("  " + "-"*80)
 
         # Flush producer

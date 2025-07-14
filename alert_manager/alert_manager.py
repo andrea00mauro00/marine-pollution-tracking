@@ -331,9 +331,10 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
         # 1. Verifica se esiste già record in database
         with postgres_conn.cursor() as cur:
             cur.execute("SELECT alert_id FROM pollution_alerts WHERE alert_id = %s", (alert_id,))
-            if cur.fetchone():
-                logger.info(f"Alert {alert_id} già presente in database, skippiamo")
-                return
+            existing_alert = cur.fetchone()
+            if existing_alert:
+                # Non usciamo subito, potrebbe essere necessario aggiornare il record
+                logger.info(f"Alert {alert_id} già presente in database, verificheremo se aggiornare")
             
             # 2. NUOVA LOGICA: Verifica se esiste un alert spazialmente vicino entro 500 metri
             # Usa un raggio di ricerca di 0.005 gradi (circa 500 metri all'equatore)
@@ -448,17 +449,18 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                         return
             
             # 3. Verifica anche per hotspot_id (controllo originale) per retrocompatibilità
-            cur.execute("""
-                SELECT alert_id FROM pollution_alerts 
-                WHERE source_id = %s AND alert_time > NOW() - INTERVAL '30 minutes'
-                AND status = 'active'
-            """, (hotspot_id,))
-            recent_alert = cur.fetchone()
-            
-            # Skip QUALSIASI alert se c'è un alert recente per questo hotspot
-            if recent_alert and not superseded_alert:
-                logger.info(f"Alert recente già presente per hotspot {hotspot_id}, skippiamo")
-                return
+            if not existing_alert:  # Solo se non è un aggiornamento di un alert esistente
+                cur.execute("""
+                    SELECT alert_id FROM pollution_alerts 
+                    WHERE source_id = %s AND alert_time > NOW() - INTERVAL '30 minutes'
+                    AND status = 'active'
+                """, (hotspot_id,))
+                recent_alert = cur.fetchone()
+                
+                # Skip QUALSIASI alert se c'è un alert recente per questo hotspot
+                if recent_alert and not superseded_alert:
+                    logger.info(f"Alert recente già presente per hotspot {hotspot_id}, skippiamo")
+                    return
         
         # Determina regione (semplificata per questo esempio)
         region_id = data.get('environmental_reference', {}).get('region_id', 'default')
@@ -504,8 +506,7 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
             'max_risk_score': data.get('max_risk_score', 0.0),
             'environmental_reference': data.get('environmental_reference', {}),
             'parent_hotspot_id': parent_hotspot_id,
-            'derived_from': derived_from,
-            'recommendations': recommendations
+            'derived_from': derived_from
         }
         
         # Aggiungi campo supersedes se presente
@@ -550,7 +551,7 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 logger.warning(f"Errore nella verifica/creazione colonne: {e}")
                 postgres_conn.rollback()
             
-            # Ora inserisci l'alert con i campi di raccomandazione
+            # CORREZIONE: Utilizzare ON CONFLICT DO UPDATE per aggiornare record esistenti
             cur.execute("""
                 INSERT INTO pollution_alerts (
                     alert_id, source_id, source_type, alert_type, alert_time,
@@ -558,7 +559,23 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                     message, details, processed, notifications_sent, status, recommendations,
                     supersedes
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (alert_id) DO NOTHING
+                ON CONFLICT (alert_id) DO UPDATE SET
+                    alert_type = EXCLUDED.alert_type,
+                    alert_time = EXCLUDED.alert_time,
+                    severity = EXCLUDED.severity,
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    risk_score = EXCLUDED.risk_score,
+                    message = EXCLUDED.message,
+                    details = EXCLUDED.details,
+                    processed = EXCLUDED.processed,
+                    notifications_sent = CASE
+                        WHEN pollution_alerts.notifications_sent IS NULL THEN EXCLUDED.notifications_sent
+                        ELSE pollution_alerts.notifications_sent || EXCLUDED.notifications_sent
+                    END,
+                    status = EXCLUDED.status,
+                    recommendations = EXCLUDED.recommendations,
+                    supersedes = EXCLUDED.supersedes
             """, (
                 alert_id,
                 hotspot_id,
@@ -580,12 +597,71 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
             ))
             
             postgres_conn.commit()
-            logger.info(f"Alert {alert_id} salvato con raccomandazioni di intervento")
+            logger.info(f"Alert {alert_id} salvato/aggiornato con raccomandazioni di intervento")
+        
+        # NUOVA FUNZIONALITÀ: Salva le raccomandazioni anche in Redis per accesso rapido
+        try:
+            if redis_conn and recommendations:
+                # Salva le raccomandazioni in Redis
+                recommendations_key = f"recommendations:{alert_id}"
+                redis_conn.set(recommendations_key, json.dumps(recommendations))
+                redis_conn.expire(recommendations_key, 86400)  # TTL di 24 ore
+                
+                # Aggiorna l'hash dell'alert in Redis
+                alert_key = f"alert:{alert_id}"
+                redis_conn.hset(alert_key, "alert_id", alert_id)
+                redis_conn.hset(alert_key, "hotspot_id", hotspot_id)
+                redis_conn.hset(alert_key, "severity", severity)
+                redis_conn.hset(alert_key, "pollutant_type", pollutant_type)
+                redis_conn.hset(alert_key, "status", "active")
+                redis_conn.hset(alert_key, "message", message)
+                redis_conn.hset(alert_key, "latitude", str(latitude))
+                redis_conn.hset(alert_key, "longitude", str(longitude))
+                redis_conn.hset(alert_key, "timestamp", str(int(alert_time.timestamp() * 1000)))
+                redis_conn.hset(alert_key, "has_recommendations", "true")
+                
+                # Aggiungi alle strutture dati di dashboard
+                redis_conn.zadd("dashboard:alerts:active", {alert_id: int(alert_time.timestamp())})
+                redis_conn.sadd(f"dashboard:alerts:by_severity:{severity}", alert_id)
+                
+                # Imposta TTL
+                redis_conn.expire(alert_key, 3600 * 24)  # 24 ore TTL
+                redis_conn.expire(f"dashboard:alerts:by_severity:{severity}", 3600 * 6)  # 6 ore TTL
+                
+                # Aggiorna il dashboard:summary
+                update_alert_counters(redis_conn)
+                
+                logger.info(f"Raccomandazioni per alert {alert_id} salvate in Redis")
+        except Exception as e:
+            logger.warning(f"Errore nel salvataggio delle raccomandazioni in Redis: {e}")
     
     except Exception as e:
-        postgres_conn.rollback()
+        try:
+            postgres_conn.rollback()
+        except:
+            pass
         logger.error(f"Errore processamento alert: {e}")
         logger.exception(e)  # Log completo dello stack trace
+
+# Funzione helper per aggiornare i contatori degli alert in Redis
+def update_alert_counters(redis_conn):
+    try:
+        # Conteggio diretto degli alert per severità
+        high_alerts = redis_conn.scard("dashboard:alerts:by_severity:high") or 0
+        medium_alerts = redis_conn.scard("dashboard:alerts:by_severity:medium") or 0
+        low_alerts = redis_conn.scard("dashboard:alerts:by_severity:low") or 0
+        total_alerts = redis_conn.zcard("dashboard:alerts:active") or 0
+        
+        # Aggiornamento summary con dati accurati
+        severity_distribution = json.dumps({"high": high_alerts, "medium": medium_alerts, "low": low_alerts})
+        redis_conn.hset("dashboard:summary", "alerts_count", str(total_alerts))
+        redis_conn.hset("dashboard:summary", "severity_distribution", severity_distribution)
+        redis_conn.hset("dashboard:summary", "updated_at", str(int(time.time() * 1000)))
+        
+        # Imposta TTL per il summary
+        redis_conn.expire("dashboard:summary", 300)  # 5 minuti TTL
+    except Exception as e:
+        logger.warning(f"Errore nell'aggiornamento dei contatori alert: {e}")
 
 def generate_alert_message(data, alert_type):
     """Genera messaggio di alert"""
