@@ -173,7 +173,7 @@ def show_predictions_page(clients):
                         
                         with col1:
                             st.markdown(f"**Pollutant Type:** {hotspot['pollutant_type']}")
-                            st.markdown(f"**Severity:** <span class='status-{hotspot['severity']}'>{hotspot['severity'].upper()}</span>", unsafe_allow_html=True)
+                            st.markdown(f"**Current Severity:** <span class='status-{hotspot['severity']}'>{hotspot['severity'].upper()}</span>", unsafe_allow_html=True)
                         
                         with col2:
                             st.markdown(f"**Current Risk Score:** {hotspot['avg_risk_score']}")
@@ -182,6 +182,32 @@ def show_predictions_page(clients):
                         with col3:
                             st.markdown(f"**Status:** <span class='status-{hotspot['status']}'>{hotspot['status'].upper()}</span>", unsafe_allow_html=True)
                             st.markdown(f"**Last Updated:** {hotspot['last_updated_at']}")
+                    
+                    # Add a section for prediction severity distribution
+                    st.markdown("<h3>Prediction Severity Distribution</h3>", unsafe_allow_html=True)
+                    
+                    # Get severity counts from predictions
+                    severity_counts = hotspot_preds_df['severity'].value_counts().reset_index()
+                    severity_counts.columns = ['Severity', 'Count']
+                    
+                    # Create columns for the severity info
+                    sev_cols = st.columns(3)
+                    
+                    # Show severity distribution with colored indicators
+                    for i, (_, row) in enumerate(severity_counts.iterrows()):
+                        severity = row['Severity']
+                        count = row['Count']
+                        color_map = {"high": "#F44336", "medium": "#FF9800", "low": "#4CAF50"}
+                        color = color_map.get(severity, "#9E9E9E")
+                        
+                        with sev_cols[i % 3]:
+                            st.markdown(
+                                f"<div style='padding: 10px; border-radius: 5px; background-color: {color}25; border-left: 5px solid {color};'>"
+                                f"<h4 style='margin:0; color: {color};'>{severity.upper()}</h4>"
+                                f"<p style='margin:0;'>{count} predictions</p>"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
                     
                     # Create visualization tabs
                     viz_tab1, viz_tab2, viz_tab3 = st.tabs(["Spatial Movement", "Risk Evolution", "Concentration Analysis"])
@@ -235,10 +261,10 @@ def show_predictions_page(clients):
                             movement_df,
                             lat="latitude",
                             lon="longitude",
-                            color="hours_ahead",
+                            color="severity",  # Changed from "hours_ahead" to "severity"
                             size="radius_km",
                             hover_name="hours_ahead",
-                            color_continuous_scale=px.colors.sequential.Viridis,
+                            color_discrete_map={"high": "#F44336", "medium": "#FF9800", "low": "#4CAF50"},  # Use severity colors
                             size_max=15,
                             zoom=10,
                             height=500
@@ -272,6 +298,25 @@ def show_predictions_page(clients):
                         
                         # Sort by hours ahead
                         hotspot_preds_df = hotspot_preds_df.sort_values('hours_ahead')
+                        
+                        # Add severity indicator
+                        if 'severity' in hotspot_preds_df.columns:
+                            # Create a numeric mapping for severity to plot
+                            severity_numeric = hotspot_preds_df['severity'].map({'high': 3, 'medium': 2, 'low': 1})
+                            
+                            fig.add_trace(go.Scatter(
+                                x=hotspot_preds_df['hours_ahead'],
+                                y=severity_numeric,
+                                mode='markers+lines',
+                                name='Severity Level',
+                                line=dict(color='#9C27B0', dash='dot'),
+                                marker=dict(
+                                    size=10,
+                                    color=hotspot_preds_df['severity'].map({"high": "#F44336", "medium": "#FF9800", "low": "#4CAF50"}),
+                                    symbol='circle'
+                                ),
+                                yaxis='y2'
+                            ))
                         
                         # Add environmental score line
                         if 'environmental_score' in hotspot_preds_df.columns:
@@ -308,6 +353,16 @@ def show_predictions_page(clients):
                             title="Risk Metrics Over Time",
                             xaxis_title="Hours Ahead",
                             yaxis_title="Score (0-1)",
+                            yaxis2=dict(
+                                title="Severity Level",
+                                titlefont=dict(color="#9C27B0"),
+                                tickfont=dict(color="#9C27B0"),
+                                overlaying="y",
+                                side="right",
+                                range=[0.5, 3.5],
+                                tickvals=[1, 2, 3],
+                                ticktext=['Low', 'Medium', 'High']
+                            ),
                             legend=dict(
                                 orientation="h",
                                 yanchor="bottom",
@@ -318,6 +373,11 @@ def show_predictions_page(clients):
                         )
                         
                         st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Add legend explanation for severity
+                        st.markdown("""
+                        **Note:** The dotted purple line shows the predicted severity level over time (High, Medium, Low).
+                        """)
                         
                         # Add radius growth chart
                         if 'radius_km' in hotspot_preds_df.columns:

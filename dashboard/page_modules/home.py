@@ -271,6 +271,8 @@ def show_home_page(clients):
     high_alerts = severity_counts["high"]
     medium_alerts = severity_counts["medium"]
     low_alerts = severity_counts["low"]
+    if alerts_count == 0:
+        alerts_count = high_alerts + medium_alerts + low_alerts
     
     # Calculate time since last update
     last_updated = summary.get("updated_at", int(time.time() * 1000))

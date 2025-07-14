@@ -2,18 +2,21 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import folium
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
 from datetime import datetime, timedelta
 import logging
 import random
 import math
 import numpy as np
 
-# Configura logging
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("hotspots_page")
 
 def show_hotspots_page(clients):
-    """Render the pollution hotspots monitoring page"""
+    """Render the pollution hotspots monitoring page using folium for maps"""
     st.markdown("<h1 class='main-header'>Pollution Hotspots Monitoring</h1>", unsafe_allow_html=True)
     
     # Get clients with validation
@@ -109,87 +112,192 @@ def show_hotspots_page(clients):
             with col4:
                 st.metric("Low Severity", severity_counts['low'])
             
-            # Hotspots map
-            st.markdown("<h2 class='sub-header'>Pollution Hotspots Map</h2>", unsafe_allow_html=True)
+            # Create main layout columns for map and charts
+            map_col, charts_col = st.columns([3, 2])
             
-            if hotspots_data:
-                # Create map using direct Plotly GO for maximum control
-                fig = go.Figure()
+            with map_col:
+                # Hotspots map using Folium
+                st.markdown("<h2 class='sub-header'>Pollution Hotspots Map</h2>", unsafe_allow_html=True)
                 
-                # Add hotspots layer - show as circles with radius proportional to real radius
-                for hotspot in hotspots_data:
-                    # Convert radius from km to degrees (approximate)
-                    radius_deg = hotspot['radius_km'] / 111  # ~111 km per degree at equator
+                if hotspots_data:
+                    # Center map on Chesapeake Bay by default
+                    center_lat, center_lon = 37.8, -76.0
                     
-                    # Get color based on severity
-                    color = '#F44336' if hotspot.get('severity') == 'high' else \
-                            '#FF9800' if hotspot.get('severity') == 'medium' else \
-                            '#4CAF50' if hotspot.get('severity') == 'low' else '#9E9E9E'
+                    # Create a folium map centered on Chesapeake Bay
+                    m = folium.Map(location=[center_lat, center_lon], zoom_start=7)
                     
-                    # Add circle to represent hotspot area
-                    fig.add_trace(go.Scattermapbox(
-                        lat=[hotspot['center_latitude']],
-                        lon=[hotspot['center_longitude']],
-                        mode='markers',
-                        marker=dict(
-                            size=25,
+                    # Add marker cluster for better organization
+                    marker_cluster = MarkerCluster().add_to(m)
+                    
+                    # Add hotspots to the map
+                    for hotspot in hotspots_data:
+                        # Get color based on severity
+                        severity = hotspot.get('severity', 'low')
+                        color = {'high': 'red', 'medium': 'orange', 'low': 'green'}.get(severity, 'blue')
+                        
+                        # Create popup content
+                        popup_text = f"""
+                            <b>ID:</b> {hotspot['hotspot_id']}<br>
+                            <b>Pollutant:</b> {hotspot.get('pollutant_type', 'N/A')}<br>
+                            <b>Severity:</b> {hotspot.get('severity', 'N/A')}<br>
+                            <b>Risk Score:</b> {hotspot.get('avg_risk_score', 'N/A')}<br>
+                            <b>Radius:</b> {hotspot.get('radius_km', 'N/A')} km
+                        """
+                        
+                        # Create marker icon with appropriate color and icon
+                        icon = folium.Icon(
                             color=color,
-                            opacity=0.7
-                        ),
-                        text=[
-                            f"ID: {hotspot['hotspot_id']}<br>" +
-                            f"Pollutant: {hotspot.get('pollutant_type', 'N/A')}<br>" +
-                            f"Severity: {hotspot.get('severity', 'N/A')}<br>" +
-                            f"Risk Score: {hotspot.get('avg_risk_score', 'N/A')}<br>" +
-                            f"Radius: {hotspot.get('radius_km', 'N/A')} km"
-                        ],
-                        hoverinfo='text',
-                        name=f"Hotspot {hotspot['hotspot_id']}"
-                    ))
+                            icon="info-sign"
+                        )
+                        
+                        # Add marker for center point with icon
+                        folium.Marker(
+                            location=[hotspot['center_latitude'], hotspot['center_longitude']],
+                            popup=folium.Popup(popup_text, max_width=300),
+                            icon=icon,
+                            tooltip=f"{severity.upper()} - {hotspot.get('pollutant_type', 'unknown')}"
+                        ).add_to(marker_cluster)
+                        
+                        # Add circle to represent the actual area
+                        folium.Circle(
+                            location=[hotspot['center_latitude'], hotspot['center_longitude']],
+                            radius=hotspot['radius_km'] * 1000,  # Convert km to meters
+                            color=color,
+                            fill=True,
+                            fill_color=color,
+                            fill_opacity=0.2,
+                            weight=2,
+                        ).add_to(m)
                     
-                    # Add a transparent circle to show the actual area
-                    theta = np.linspace(0, 2*np.pi, 100)
-                    circle_lats = [hotspot['center_latitude'] + radius_deg * np.cos(t) for t in theta]
-                    circle_lons = [hotspot['center_longitude'] + radius_deg * np.sin(t) for t in theta]
+                    # Display the map in Streamlit
+                    st_folium(m, width=700, height=500)
+                else:
+                    st.info("No hotspot data available for mapping")
+            
+            with charts_col:
+                # Distribution by pollutant type (pie chart)
+                st.markdown("<h3>Distribution by Pollutant Type</h3>", unsafe_allow_html=True)
+                
+                pollutant_counts = {}
+                for hotspot in hotspots_data:
+                    pollutant_type = hotspot.get("pollutant_type", "unknown")
+                    pollutant_counts[pollutant_type] = pollutant_counts.get(pollutant_type, 0) + 1
+                
+                # Create dataframe for chart
+                if pollutant_counts:
+                    pollutant_df = pd.DataFrame({
+                        "Pollutant Type": list(pollutant_counts.keys()),
+                        "Count": list(pollutant_counts.values())
+                    })
                     
-                    fig.add_trace(go.Scattermapbox(
-                        lat=circle_lats,
-                        lon=circle_lons,
-                        mode='lines',
-                        line=dict(width=2, color=color),
-                        opacity=0.5,
-                        hoverinfo='skip',
-                        showlegend=False
-                    ))
-                
-                # Calculate center for map view
-                try:
-                    center_lat = sum(h['center_latitude'] for h in hotspots_data) / len(hotspots_data)
-                    center_lon = sum(h['center_longitude'] for h in hotspots_data) / len(hotspots_data)
-                except:
-                    center_lat, center_lon = 38.5, -76.4  # Chesapeake Bay fallback
-                
-                # Set map layout
-                fig.update_layout(
-                    mapbox=dict(
-                        style="open-street-map",
-                        center=dict(lat=center_lat, lon=center_lon),
-                        zoom=5
-                    ),
-                    margin=dict(l=0, r=0, t=0, b=0),
-                    height=500,
-                    legend=dict(
-                        orientation="h",
-                        yanchor="bottom",
-                        y=1.02,
-                        xanchor="right",
-                        x=1
+                    fig = px.pie(
+                        pollutant_df,
+                        values="Count",
+                        names="Pollutant Type",
+                        color_discrete_sequence=px.colors.qualitative.Safe
                     )
-                )
+                    
+                    # Update layout for better appearance
+                    fig.update_layout(
+                        margin=dict(t=0, b=0, l=0, r=0),
+                        legend=dict(
+                            orientation="h",
+                            yanchor="bottom",
+                            y=-0.2,
+                            xanchor="center",
+                            x=0.5
+                        )
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No pollutant data available for visualization")
                 
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No hotspot data available for mapping")
+                # Distribution by severity (bar chart)
+                st.markdown("<h3>Distribution by Severity</h3>", unsafe_allow_html=True)
+                
+                if severity_counts:
+                    severity_df = pd.DataFrame({
+                        "Severity": list(severity_counts.keys()),
+                        "Count": list(severity_counts.values())
+                    })
+                    
+                    # Define colors for severity
+                    severity_colors = {
+                        "high": "#F44336",
+                        "medium": "#FF9800",
+                        "low": "#4CAF50",
+                        "none": "#9E9E9E"
+                    }
+                    
+                    fig = px.bar(
+                        severity_df,
+                        x="Severity",
+                        y="Count",
+                        color="Severity",
+                        color_discrete_map=severity_colors
+                    )
+                    
+                    # Update layout
+                    fig.update_layout(
+                        margin=dict(t=0, b=0, l=0, r=0),
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No severity data available for visualization")
+                
+                # Average Risk Score by Pollutant Type (horizontal bar chart)
+                st.markdown("<h3>Avg Risk Score by Pollutant Type</h3>", unsafe_allow_html=True)
+                
+                risk_by_pollutant = {}
+                count_by_pollutant = {}
+                
+                for hotspot in hotspots_data:
+                    pollutant_type = hotspot.get("pollutant_type", "unknown")
+                    risk_score = hotspot.get("avg_risk_score")
+                    
+                    if risk_score is not None:
+                        if pollutant_type not in risk_by_pollutant:
+                            risk_by_pollutant[pollutant_type] = 0
+                            count_by_pollutant[pollutant_type] = 0
+                        
+                        risk_by_pollutant[pollutant_type] += float(risk_score)
+                        count_by_pollutant[pollutant_type] += 1
+                
+                # Calculate averages
+                avg_risk_by_pollutant = {
+                    p: risk_by_pollutant[p] / count_by_pollutant[p]
+                    for p in risk_by_pollutant
+                    if count_by_pollutant[p] > 0
+                }
+                
+                if avg_risk_by_pollutant:
+                    risk_df = pd.DataFrame({
+                        "Pollutant Type": list(avg_risk_by_pollutant.keys()),
+                        "Average Risk Score": list(avg_risk_by_pollutant.values())
+                    })
+                    
+                    # Sort by risk score
+                    risk_df = risk_df.sort_values("Average Risk Score", ascending=True)
+                    
+                    fig = px.bar(
+                        risk_df,
+                        y="Pollutant Type",
+                        x="Average Risk Score",
+                        orientation='h',
+                        color="Average Risk Score",
+                        color_continuous_scale=px.colors.sequential.Reds
+                    )
+                    
+                    # Update layout
+                    fig.update_layout(
+                        margin=dict(t=0, b=0, l=0, r=0),
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No risk score data available for visualization")
             
             # Recent hotspot evolution
             st.markdown("<h2 class='sub-header'>Hotspot Evolution (Last 7 Days)</h2>", unsafe_allow_html=True)
@@ -200,17 +308,28 @@ def show_hotspots_page(clients):
                 try:
                     # Query to get hotspot evolution over time
                     query = """
-                        SELECT 
+                        WITH latest_versions AS (
+                        SELECT DISTINCT ON (hotspot_id, time_bucket('1 day', detected_at))
+                            hotspot_id,
                             time_bucket('1 day', detected_at) as day,
-                            COUNT(*) as total_hotspots,
-                            SUM(CASE WHEN severity = 'high' THEN 1 ELSE 0 END) as high_severity,
-                            SUM(CASE WHEN severity = 'medium' THEN 1 ELSE 0 END) as medium_severity,
-                            SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) as low_severity,
-                            AVG(radius_km) as avg_radius
+                            severity,
+                            radius_km,
+                            risk_score
                         FROM hotspot_versions
                         WHERE detected_at > NOW() - INTERVAL '7 days'
-                        GROUP BY day
-                        ORDER BY day
+                        ORDER BY hotspot_id, time_bucket('1 day', detected_at), detected_at DESC
+                    )
+                    SELECT 
+                        day,
+                        COUNT(*) as total_hotspots,
+                        SUM(CASE WHEN severity = 'high' THEN 1 ELSE 0 END) as high_severity,
+                        SUM(CASE WHEN severity = 'medium' THEN 1 ELSE 0 END) as medium_severity,
+                        SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) as low_severity,
+                        AVG(radius_km) as avg_radius,
+                        AVG(risk_score) as avg_risk_score
+                    FROM latest_versions
+                    GROUP BY day
+                    ORDER BY day
                     """
                     
                     raw_trends = timescale_client.execute_query(query)
@@ -221,7 +340,7 @@ def show_hotspots_page(clients):
                     st.warning(f"Could not retrieve hotspot evolution data: {str(e)}")
             
             if hotspot_trends is not None and not hotspot_trends.empty and 'day' in hotspot_trends.columns:
-                # Create two columns for charts
+                # Create columns for charts
                 trend_col1, trend_col2 = st.columns(2)
                 
                 with trend_col1:
@@ -273,28 +392,51 @@ def show_hotspots_page(clients):
                     st.plotly_chart(fig, use_container_width=True)
                 
                 with trend_col2:
-                    # Average radius trend
-                    st.markdown("#### Average Hotspot Radius")
-                    if 'avg_radius' in hotspot_trends.columns:
+                    # Average risk score trend
+                    st.markdown("#### Average Risk Score Trend")
+                    if 'avg_risk_score' in hotspot_trends.columns:
                         fig = go.Figure()
                         
                         fig.add_trace(go.Scatter(
                             x=hotspot_trends['day'],
-                            y=hotspot_trends['avg_radius'],
+                            y=hotspot_trends['avg_risk_score'],
                             mode='lines+markers',
-                            name='Avg Radius (km)',
-                            line=dict(color='#673AB7')
+                            name='Avg Risk Score',
+                            line=dict(color='#E91E63')
                         ))
                         
                         # Update layout
                         fig.update_layout(
                             xaxis=dict(title="Date"),
-                            yaxis=dict(title="Average Radius (km)")
+                            yaxis=dict(title="Average Risk Score")
                         )
                         
                         st.plotly_chart(fig, use_container_width=True)
                     else:
-                        st.info("No radius data available")
+                        st.info("No risk score trend data available")
+                
+                # Create a third chart for radius evolution
+                st.markdown("#### Average Hotspot Radius Evolution")
+                if 'avg_radius' in hotspot_trends.columns:
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=hotspot_trends['day'],
+                        y=hotspot_trends['avg_radius'],
+                        mode='lines+markers',
+                        name='Avg Radius (km)',
+                        line=dict(color='#673AB7')
+                    ))
+                    
+                    # Update layout
+                    fig.update_layout(
+                        xaxis=dict(title="Date"),
+                        yaxis=dict(title="Average Radius (km)")
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No radius data available")
             else:
                 st.info("No hotspot evolution data available for the last 7 days")
             
@@ -418,70 +560,48 @@ def show_hotspots_page(clients):
                             except:
                                 st.markdown(f"**Detected At:** {hotspot_data['detected_at']}")
                     
-                    # Map of this specific hotspot
+                    # Map of this specific hotspot using folium
                     st.markdown("<h3>Hotspot Location</h3>", unsafe_allow_html=True)
                     
                     if all(k in hotspot_data for k in ['center_latitude', 'center_longitude', 'radius_km']):
-                        # Create a detailed map of this specific hotspot
-                        fig = go.Figure()
-                        
                         # Get color based on severity
-                        color = '#F44336' if hotspot_data.get('severity') == 'high' else \
-                                '#FF9800' if hotspot_data.get('severity') == 'medium' else \
-                                '#4CAF50' if hotspot_data.get('severity') == 'low' else '#9E9E9E'
+                        severity = hotspot_data.get('severity', 'low')
+                        color = {'high': 'red', 'medium': 'orange', 'low': 'green'}.get(severity, 'blue')
                         
-                        # Add marker for center
-                        fig.add_trace(go.Scattermapbox(
-                            lat=[hotspot_data['center_latitude']],
-                            lon=[hotspot_data['center_longitude']],
-                            mode='markers',
-                            marker=dict(
-                                size=20,
-                                color=color,
-                                opacity=0.8
-                            ),
-                            text=[f"Hotspot Center<br>Radius: {hotspot_data['radius_km']} km"],
-                            hoverinfo='text',
-                            name='Hotspot Center'
-                        ))
-                        
-                        # Add circle to show the area
-                        # Convert radius from km to degrees (approximate)
-                        radius_deg = hotspot_data['radius_km'] / 111  # ~111 km per degree at equator
-                        
-                        theta = np.linspace(0, 2*np.pi, 100)
-                        circle_lats = [hotspot_data['center_latitude'] + radius_deg * np.cos(t) for t in theta]
-                        circle_lons = [hotspot_data['center_longitude'] + radius_deg * np.sin(t) for t in theta]
-                        
-                        fig.add_trace(go.Scattermapbox(
-                            lat=circle_lats,
-                            lon=circle_lons,
-                            mode='lines',
-                            line=dict(width=3, color=color),
-                            opacity=0.7,
-                            name='Affected Area'
-                        ))
-                        
-                        # Set map layout focused on this hotspot
-                        fig.update_layout(
-                            mapbox=dict(
-                                style="open-street-map",
-                                center=dict(lat=hotspot_data['center_latitude'], 
-                                            lon=hotspot_data['center_longitude']),
-                                zoom=9
-                            ),
-                            margin=dict(l=0, r=0, t=0, b=0),
-                            height=400,
-                            legend=dict(
-                                orientation="h",
-                                yanchor="bottom",
-                                y=1.02,
-                                xanchor="right",
-                                x=1
-                            )
+                        # Create a detailed map of this specific hotspot
+                        m = folium.Map(
+                            location=[hotspot_data['center_latitude'], hotspot_data['center_longitude']], 
+                            zoom_start=9
                         )
                         
-                        st.plotly_chart(fig, use_container_width=True)
+                        # Create icon based on severity
+                        icon = folium.Icon(
+                            color=color,
+                            icon="info-sign"
+                        )
+                        
+                        # Add marker for center point with icon
+                        folium.Marker(
+                            location=[hotspot_data['center_latitude'], hotspot_data['center_longitude']],
+                            popup="Hotspot Center<br>Radius: {} km".format(hotspot_data['radius_km']),
+                            icon=icon,
+                            tooltip=f"{severity.upper()} - {hotspot_data.get('pollutant_type', 'unknown')}"
+                        ).add_to(m)
+                        
+                        # Add circle for the affected area
+                        folium.Circle(
+                            location=[hotspot_data['center_latitude'], hotspot_data['center_longitude']],
+                            radius=hotspot_data['radius_km'] * 1000,  # Convert km to meters
+                            color=color,
+                            fill=True,
+                            fill_color=color,
+                            fill_opacity=0.3,
+                            weight=3,
+                            popup="Affected Area"
+                        ).add_to(m)
+                        
+                        # Display the map in Streamlit
+                        st_folium(m, width=700, height=400)
                     
                     # Get historical data for this hotspot from TimescaleDB
                     historical_data = None
@@ -607,79 +727,64 @@ def show_hotspots_page(clients):
                         with history_tabs[2]:
                             # Spatial movement
                             if all(col in historical_data.columns for col in ['center_latitude', 'center_longitude']):
-                                # Create a map showing the movement path
-                                fig = go.Figure()
-                                
-                                # Add line connecting all positions
-                                fig.add_trace(go.Scattermapbox(
-                                    lat=historical_data['center_latitude'],
-                                    lon=historical_data['center_longitude'],
-                                    mode='lines+markers',
-                                    marker=dict(
-                                        size=10,
-                                        color='#2196F3',
-                                        opacity=0.7
-                                    ),
-                                    line=dict(
-                                        width=2,
-                                        color='#2196F3'
-                                    ),
-                                    text=[f"Time: {d}<br>Radius: {r} km" 
-                                          for d, r in zip(historical_data['detected_at'], 
-                                                         historical_data['radius_km'])],
-                                    hoverinfo='text',
-                                    name='Movement Path'
-                                ))
-                                
-                                # Add first and last position markers
-                                fig.add_trace(go.Scattermapbox(
-                                    lat=[historical_data['center_latitude'].iloc[0]],
-                                    lon=[historical_data['center_longitude'].iloc[0]],
-                                    mode='markers',
-                                    marker=dict(
-                                        size=15,
-                                        color='green',
-                                        symbol='triangle-up'
-                                    ),
-                                    text=["First Detection"],
-                                    hoverinfo='text',
-                                    name='First Detection'
-                                ))
-                                
-                                fig.add_trace(go.Scattermapbox(
-                                    lat=[historical_data['center_latitude'].iloc[-1]],
-                                    lon=[historical_data['center_longitude'].iloc[-1]],
-                                    mode='markers',
-                                    marker=dict(
-                                        size=15,
-                                        color='red',
-                                        symbol='circle'
-                                    ),
-                                    text=["Current Position"],
-                                    hoverinfo='text',
-                                    name='Current Position'
-                                ))
-                                
-                                # Set map layout
-                                fig.update_layout(
-                                    mapbox=dict(
-                                        style="open-street-map",
-                                        center=dict(lat=historical_data['center_latitude'].mean(), 
-                                                    lon=historical_data['center_longitude'].mean()),
-                                        zoom=8
-                                    ),
-                                    margin=dict(l=0, r=0, t=0, b=0),
-                                    height=400,
-                                    legend=dict(
-                                        orientation="h",
-                                        yanchor="bottom",
-                                        y=1.02,
-                                        xanchor="right",
-                                        x=1
-                                    )
+                                # Create a map showing the movement path using folium
+                                m = folium.Map(
+                                    location=[
+                                        historical_data['center_latitude'].mean(),
+                                        historical_data['center_longitude'].mean()
+                                    ],
+                                    zoom_start=8
                                 )
                                 
-                                st.plotly_chart(fig, use_container_width=True)
+                                # Create a feature group for the path
+                                path_group = folium.FeatureGroup(name="Movement Path")
+                                
+                                # Add line connecting all positions
+                                points = [
+                                    [lat, lon] for lat, lon in 
+                                    zip(historical_data['center_latitude'], historical_data['center_longitude'])
+                                ]
+                                
+                                folium.PolyLine(
+                                    points,
+                                    color='#2196F3',
+                                    weight=3,
+                                    opacity=0.7,
+                                ).add_to(path_group)
+                                
+                                # Add first position marker with icon
+                                folium.Marker(
+                                    location=[historical_data['center_latitude'].iloc[0], 
+                                              historical_data['center_longitude'].iloc[0]],
+                                    popup="First Detection",
+                                    icon=folium.Icon(color='green', icon='play', prefix='fa')
+                                ).add_to(path_group)
+                                
+                                # Add last position marker with icon
+                                folium.Marker(
+                                    location=[historical_data['center_latitude'].iloc[-1], 
+                                              historical_data['center_longitude'].iloc[-1]],
+                                    popup="Current Position",
+                                    icon=folium.Icon(color='red', icon='map-marker', prefix='fa')
+                                ).add_to(path_group)
+                                
+                                # Add intermediate points as small markers with timestamps
+                                for i in range(1, len(historical_data) - 1):
+                                    folium.CircleMarker(
+                                        location=[historical_data['center_latitude'].iloc[i], 
+                                                  historical_data['center_longitude'].iloc[i]],
+                                        radius=5,
+                                        color='#2196F3',
+                                        fill=True,
+                                        fill_color='#2196F3',
+                                        fill_opacity=0.7,
+                                        popup=f"Time: {historical_data['detected_at'].iloc[i]}<br>Radius: {historical_data['radius_km'].iloc[i]} km"
+                                    ).add_to(path_group)
+                                
+                                path_group.add_to(m)
+                                
+                                # Display the map in Streamlit
+                                st_folium(m, width=700, height=400)
                                 
                                 # Calculate some movement statistics
                                 if len(historical_data) > 1:

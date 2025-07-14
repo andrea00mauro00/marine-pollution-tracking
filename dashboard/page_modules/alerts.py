@@ -19,6 +19,211 @@ import plotly.graph_objects as go
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def generate_fallback_recommendations(alert):
+    """Genera raccomandazioni di fallback basate sul tipo di inquinante e la severità"""
+    pollutant_type = alert.get("pollutant_type", "unknown")
+    severity = alert.get("severity", "low")
+    risk_score = float(alert.get("risk_score", 0.5))
+    
+    recommendations = {
+        "immediate_actions": [],
+        "resource_requirements": {},
+        "stakeholders_to_notify": [],
+        "regulatory_implications": [],
+        "environmental_impact_assessment": {},
+        "cleanup_methods": []
+    }
+    
+    # Raccomandazioni basate sul tipo di inquinante
+    if pollutant_type == "oil_spill":
+        recommendations["immediate_actions"] = [
+            "Deploy containment booms to prevent spreading",
+            "Activate oil spill response team",
+            "Notify coastal communities within 5km radius",
+            "Implement shoreline protection measures if near coast"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "15-20 trained responders",
+            "equipment": "Class B oil containment kit, 3 skimmers, absorbent materials",
+            "vessels": "2 response boats, 1 support vessel",
+            "supplies": "500m oil boom, dispersant if approved by authorities"
+        }
+        recommendations["cleanup_methods"] = ["mechanical_recovery", "dispersants_if_approved", "in_situ_burning", "shoreline_cleanup"]
+        
+    elif pollutant_type == "chemical_discharge":
+        recommendations["immediate_actions"] = [
+            "Identify chemical composition if unknown",
+            "Establish safety perimeter based on chemical type",
+            "Deploy specialized containment equipment",
+            "Prevent water intake in affected area"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "10-15 hazmat-trained responders",
+            "equipment": "Chemical neutralizing agents, specialized containment",
+            "vessels": "1 response vessel with hazmat capability",
+            "supplies": "pH buffers, neutralizing agents, chemical absorbents"
+        }
+        recommendations["cleanup_methods"] = ["neutralization", "extraction", "activated_carbon", "aeration"]
+
+    elif pollutant_type == "algal_bloom":
+        recommendations["immediate_actions"] = [
+            "Test for toxin-producing species",
+            "Implement public health advisories if needed",
+            "Monitor dissolved oxygen levels",
+            "Restrict recreational activities in affected area"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "5-10 water quality specialists",
+            "equipment": "Water testing kits, aeration systems",
+            "vessels": "2 monitoring vessels",
+            "supplies": "Algaecide (if permitted), aeration equipment"
+        }
+        recommendations["cleanup_methods"] = ["aeration", "nutrient_management", "algaecide_if_approved", "ultrasonic_treatment"]
+
+    elif pollutant_type == "sewage":
+        recommendations["immediate_actions"] = [
+            "Issue public health warning for affected area",
+            "Test for pathogenic bacteria",
+            "Identify source of discharge",
+            "Notify drinking water authorities"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "8-12 water quality and public health specialists",
+            "equipment": "Disinfection equipment, bacterial testing kits",
+            "vessels": "1 sampling vessel",
+            "supplies": "Chlorine or UV disinfection equipment"
+        }
+        recommendations["cleanup_methods"] = ["disinfection", "biological_treatment", "aeration", "filtration"]
+
+    elif pollutant_type == "agricultural_runoff":
+        recommendations["immediate_actions"] = [
+            "Monitor for fertilizer and pesticide concentrations",
+            "Check for fish kill risk",
+            "Assess nutrient loading",
+            "Identify source farms"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "5-8 environmental specialists",
+            "equipment": "Nutrient testing kits, water samplers",
+            "vessels": "1 monitoring vessel",
+            "supplies": "Buffer zone materials, erosion control"
+        }
+        recommendations["cleanup_methods"] = ["wetland_filtration", "buffer_zones", "phytoremediation", "soil_erosion_control"]
+    
+    else:  # unknown or other
+        recommendations["immediate_actions"] = [
+            "Conduct comprehensive water quality testing",
+            "Deploy monitoring buoys around affected area",
+            "Collect water and sediment samples",
+            "Document visual observations with photos/video"
+        ]
+        recommendations["resource_requirements"] = {
+            "personnel": "5-10 environmental response specialists",
+            "equipment": "Multi-parameter testing kits, sampling equipment",
+            "vessels": "1-2 monitoring vessels",
+            "supplies": "Sample containers, documentation equipment"
+        }
+        recommendations["cleanup_methods"] = ["monitoring", "containment", "assessment", "targeted_intervention"]
+    
+    # Adatta raccomandazioni basate sulla severità
+    if severity == "high":
+        recommendations["stakeholders_to_notify"] = [
+            "Environmental Protection Agency",
+            "Coast Guard",
+            "Local Government Emergency Response",
+            "Fisheries and Wildlife Department",
+            "Public Health Authority",
+            "Water Management Authority"
+        ]
+        recommendations["regulatory_implications"] = [
+            "Mandatory reporting to environmental authorities within 24 hours",
+            "Potential penalties under Clean Water Act",
+            "Documentation requirements for affected area and response actions",
+            "Possible long-term monitoring requirements"
+        ]
+    elif severity == "medium":
+        recommendations["stakeholders_to_notify"] = [
+            "Local Environmental Agency",
+            "Water Management Authority",
+            "Local Government"
+        ]
+        recommendations["regulatory_implications"] = [
+            "Documentation of incident and response actions",
+            "Potential monitoring requirements",
+            "Notification to local authorities"
+        ]
+    else:  # low
+        recommendations["stakeholders_to_notify"] = [
+            "Local Environmental Monitoring Office"
+        ]
+        recommendations["regulatory_implications"] = [
+            "Standard documentation for minor incidents",
+            "Inclusion in routine monitoring reports"
+        ]
+    
+    # Valutazione dell'impatto
+    affected_area = risk_score * 10
+    recommendations["environmental_impact_assessment"] = {
+        "estimated_area_affected": f"{affected_area:.1f} km²",
+        "expected_duration": "3-5 days" if severity == "low" else "1-2 weeks" if severity == "medium" else "2-4 weeks",
+        "sensitive_habitats_affected": ["coral_reefs", "mangroves", "seagrass_beds"] if severity == "high" else 
+                                      ["shoreline", "nearshore_waters"] if severity == "medium" else [],
+        "potential_wildlife_impact": "High - immediate intervention required" if severity == "high" else
+                                    "Moderate - monitoring required" if severity == "medium" else
+                                    "Low - standard protocols sufficient",
+        "water_quality_recovery": "1-2 months" if severity == "high" else
+                                 "2-3 weeks" if severity == "medium" else
+                                 "3-7 days"
+    }
+    
+    return recommendations
+
+def get_recommendations(alert, clients):
+    """Funzione helper per recuperare le raccomandazioni di un alert"""
+    recommendations = None
+    alert_id = alert.get("alert_id")
+    
+    if not alert_id:
+        return None
+    
+    # 1. Preferisci recuperare le raccomandazioni direttamente da PostgreSQL
+    if "postgres" in clients:
+        try:
+            postgres_recommendations = clients["postgres"].get_alert_recommendations(alert_id)
+            if postgres_recommendations:
+                return postgres_recommendations
+        except Exception as e:
+            logger.warning(f"Error retrieving recommendations from PostgreSQL: {e}")
+    
+    # 2. Controlla nel campo recommendations dell'alert
+    if alert.get("recommendations"):
+        recommendations = alert.get("recommendations")
+        if isinstance(recommendations, str):
+            try:
+                recommendations = json.loads(recommendations)
+                return recommendations
+            except json.JSONDecodeError:
+                pass
+    
+    # 3. Controlla nel campo details.recommendations
+    if alert.get("details") and isinstance(alert.get("details"), dict):
+        details = alert.get("details")
+        if details.get("recommendations"):
+            return details.get("recommendations")
+    
+    # 4. Fallback a Redis
+    if "redis" in clients:
+        try:
+            redis_recommendations = clients["redis"].get_recommendations(alert_id)
+            if redis_recommendations:
+                return redis_recommendations
+        except Exception as e:
+            logger.warning(f"Error retrieving recommendations from Redis: {e}")
+    
+    # 5. Se non abbiamo trovato raccomandazioni, genera fallback basate sul tipo di inquinante
+    logger.info(f"Generating fallback recommendations for alert {alert_id} of type {alert.get('pollutant_type', 'unknown')}")
+    return generate_fallback_recommendations(alert)
+
 def show_alerts_page(clients):
     """Visualizza la pagina degli alert con raccomandazioni dettagliate"""
     
@@ -29,7 +234,7 @@ def show_alerts_page(clients):
     # Inizializza alerts prima di usarlo
     alerts = []
     
-    # Recupera gli alert - Usa direttamente PostgreSQL
+    # Recupera gli alert SOLO da PostgreSQL che è la fonte autorevole gestita dall'Alert Manager
     try:
         # Recupera tutti gli alert attivi
         alerts = clients["postgres"].get_alerts(days=90, status_filter="active")
@@ -39,7 +244,7 @@ def show_alerts_page(clients):
         unique_ids = set()
         unique_alerts = []
         for alert in alerts:
-            alert_id = alert.get("alert_id", "")
+            alert_id = alert.get("alert_id")
             if alert_id and alert_id not in unique_ids:
                 unique_ids.add(alert_id)
                 unique_alerts.append(alert)
@@ -400,40 +605,8 @@ def show_alerts_page(clients):
                     except (ValueError, TypeError):
                         st.markdown("**Risk Score:** Not available")
                     
-                    # SEZIONE RACCOMANDAZIONI: Prima controlla se sono già presenti nell'alert
-                    recommendations = None
-                    
-                    # 1. Controlla direttamente nelle raccomandazioni dell'alert
-                    if alert.get("recommendations"):
-                        recommendations = alert.get("recommendations")
-                        if isinstance(recommendations, str):
-                            try:
-                                recommendations = json.loads(recommendations)
-                            except json.JSONDecodeError:
-                                recommendations = None
-                    
-                    # 2. Controlla nel campo details.recommendations
-                    elif alert.get("details") and isinstance(alert.get("details"), dict):
-                        details = alert.get("details")
-                        if details.get("recommendations"):
-                            recommendations = details.get("recommendations")
-                    
-                    # 3. Se ancora non ci sono raccomandazioni, prova a recuperarle direttamente
-                    if not recommendations:
-                        try:
-                            # Prova a ottenere le raccomandazioni da Redis
-                            if "redis" in clients:
-                                redis_recommendations = clients["redis"].get_recommendations(alert_id)
-                                if redis_recommendations:
-                                    recommendations = redis_recommendations
-                            
-                            # Se ancora non ci sono, prova a ottenerle da PostgreSQL
-                            if not recommendations and "postgres" in clients:
-                                postgres_recommendations = clients["postgres"].get_alert_recommendations(alert_id)
-                                if postgres_recommendations:
-                                    recommendations = postgres_recommendations
-                        except Exception as e:
-                            logger.warning(f"Error retrieving recommendations for alert {alert_id}: {e}")
+                    # SEZIONE RACCOMANDAZIONI: Usa la funzione helper
+                    recommendations = get_recommendations(alert, clients)
                     
                     # Visualizza raccomandazioni se disponibili
                     if recommendations:
@@ -492,10 +665,19 @@ def show_alerts_page(clients):
                     selected_alert = alert
                     break
             
-            # Se non trovato, prova a ottenerlo direttamente
+            # Se non trovato, prova a ottenerlo direttamente da PostgreSQL
             if not selected_alert:
                 logger.info(f"Alert {alert_id} not found in current list, trying direct fetch")
                 selected_alert = clients["postgres"].get_alert_details(alert_id)
+                
+                # Fallback a Redis solo se necessario
+                if not selected_alert and "redis" in clients:
+                    try:
+                        redis_alert = clients["redis"].get_alert(alert_id)
+                        if redis_alert:
+                            selected_alert = redis_alert
+                    except Exception as e:
+                        logger.warning(f"Error retrieving alert from Redis: {e}")
             
             if selected_alert:
                 # Layout dettagli in 2 colonne
@@ -583,39 +765,7 @@ def show_alerts_page(clients):
                         st.warning("Invalid location data for this alert.")
                 
                 # Raccomandazioni (se disponibili)
-                recommendations = None
-                
-                # 1. Controlla direttamente nelle raccomandazioni dell'alert
-                if selected_alert.get("recommendations"):
-                    recommendations = selected_alert.get("recommendations")
-                    if isinstance(recommendations, str):
-                        try:
-                            recommendations = json.loads(recommendations)
-                        except json.JSONDecodeError:
-                            recommendations = None
-                
-                # 2. Controlla nel campo details.recommendations
-                elif selected_alert.get("details") and isinstance(selected_alert.get("details"), dict):
-                    details = selected_alert.get("details")
-                    if details.get("recommendations"):
-                        recommendations = details.get("recommendations")
-                
-                # 3. Se ancora non ci sono raccomandazioni, prova a recuperarle direttamente
-                if not recommendations:
-                    try:
-                        # Prova a ottenere le raccomandazioni da Redis
-                        if "redis" in clients:
-                            redis_recommendations = clients["redis"].get_recommendations(alert_id)
-                            if redis_recommendations:
-                                recommendations = redis_recommendations
-                        
-                        # Se ancora non ci sono, prova a ottenerle da PostgreSQL
-                        if not recommendations and "postgres" in clients:
-                            postgres_recommendations = clients["postgres"].get_alert_recommendations(alert_id)
-                            if postgres_recommendations:
-                                recommendations = postgres_recommendations
-                    except Exception as e:
-                        logger.warning(f"Error retrieving recommendations for alert {alert_id}: {e}")
+                recommendations = get_recommendations(selected_alert, clients)
                 
                 if recommendations and isinstance(recommendations, dict):
                     st.markdown("<h3>Intervention Recommendations</h3>", unsafe_allow_html=True)
@@ -727,8 +877,8 @@ def show_alerts_page(clients):
             else:
                 st.error(f"Alert with ID {alert_id} not found")
                 
-                # Per aiutare a debuggare, aggiungiamo un suggerimento sulla possibile causa
-                st.info("This alert may no longer be active or might have been superseded by a more recent alert.")
+                # Messaggio migliorato per il debug
+                st.info("This alert may no longer be active or might have been superseded by a more recent alert. It may also have been removed by the Alert Manager's deduplication process.")
         except Exception as e:
             st.error(f"Error retrieving alert details: {e}")
             logger.error(f"Exception in alert details: {e}")

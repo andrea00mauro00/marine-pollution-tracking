@@ -610,6 +610,7 @@ def main():
     postgres_conn = connect_postgres()
     
     # Consumer Kafka
+    # Consumer Kafka con configurazioni ottimizzate
     consumer = KafkaConsumer(
         BUOY_TOPIC,
         SATELLITE_TOPIC,
@@ -623,7 +624,12 @@ def main():
         group_id='storage-consumer-group',
         auto_offset_reset='latest',
         value_deserializer=deserialize_message,
-        enable_auto_commit=False
+        enable_auto_commit=False,
+        # Configurazioni per risolvere il timeout
+        max_poll_interval_ms=300000,  # Aumenta a 5 minuti (default 300000ms = 5min)
+        max_poll_records=100,         # Limita il numero di record per batch
+        session_timeout_ms=60000,     # Timeout della sessione a 60 secondi
+        heartbeat_interval_ms=20000   # Intervallo heartbeat a 20 secondi
     )
     
     logger.info("Storage Consumer avviato - in attesa di messaggi...")
