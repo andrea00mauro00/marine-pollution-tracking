@@ -1,0 +1,7 @@
+streamlit
+requests
+pandas
+psycopg2-binary
+plotly
+python-dotenv
+requests>=2.28.0

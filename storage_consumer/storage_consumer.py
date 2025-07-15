@@ -15,6 +15,7 @@ import time
 import sys
 import uuid
 from datetime import datetime
+from prometheus_client import start_http_server, Counter, Histogram
 from kafka import KafkaConsumer
 import boto3
 from botocore.exceptions import ClientError
@@ -25,10 +26,46 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pythonjsonlogger import jsonlogger
 
-# Configurazione logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Prometheus Metrics
+METRICS_PORT = 8006
+RECORDS_STORED_TOTAL = Counter(
+    'storage_records_stored_total',
+    'Total number of records stored',
+    ['table', 'status']
+)
+DATABASE_OPERATION_DURATION_SECONDS = Histogram(
+    'storage_database_operation_duration_seconds',
+    'Latency of database operations'
+)
+STORAGE_ERRORS_TOTAL = Counter(
+    'storage_errors_total',
+    'Total number of storage errors',
+    ['type']
+)
+
+# Structured JSON Logger setup
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s %(component)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
+)
+logHandler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'storage-consumer'
+    return record
+logging.setLogRecordFactory(record_factory)
 
 # Configurazione
 KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -229,9 +266,12 @@ def process_raw_buoy_data(s3_client, data):
         )
         logger.info(f"Dati buoy salvati in Bronze: bronze/{key}")
         
+        RECORDS_STORED_TOTAL.labels(table='minio_bronze', status='success').inc()
         return True
     except Exception as e:
         logger.error(f"Errore nel processare i dati buoy grezzi: {e}")
+        RECORDS_STORED_TOTAL.labels(table='minio_bronze', status='failed').inc()
+        STORAGE_ERRORS_TOTAL.labels(type='minio').inc()
         return False
 
 def process_raw_satellite_data(s3_client, data):
@@ -267,9 +307,12 @@ def process_raw_satellite_data(s3_client, data):
         )
         logger.info(f"Metadati satellite salvati in Bronze: bronze/{metadata_key}")
         
+        RECORDS_STORED_TOTAL.labels(table='minio_bronze', status='success').inc()
         return True
     except Exception as e:
         logger.error(f"Errore nel processare i metadati satellite grezzi: {e}")
+        RECORDS_STORED_TOTAL.labels(table='minio_bronze', status='failed').inc()
+        STORAGE_ERRORS_TOTAL.labels(type='minio').inc()
         return False
 
 def process_processed_imagery(s3_client, data):
@@ -305,11 +348,15 @@ def process_processed_imagery(s3_client, data):
         )
         logger.info(f"Dati immagine processata salvati in Silver: silver/{processed_key}")
         
+        RECORDS_STORED_TOTAL.labels(table='minio_silver', status='success').inc()
         return True
     except Exception as e:
         logger.error(f"Errore nel processare i dati immagine processata: {e}")
+        RECORDS_STORED_TOTAL.labels(table='minio_silver', status='failed').inc()
+        STORAGE_ERRORS_TOTAL.labels(type='minio').inc()
         return False
 
+@DATABASE_OPERATION_DURATION_SECONDS.time()
 def process_analyzed_sensor_data(s3_client, conn_timescale, data):
     """Processa dati sensore analizzati e li archivia nel livello Silver e TimescaleDB"""
     try:
@@ -371,11 +418,14 @@ def process_analyzed_sensor_data(s3_client, conn_timescale, data):
             conn_timescale.commit()
             logger.info(f"Salvati dati in TimescaleDB: sensor_measurements per sensore {location.get('sensor_id')}")
         
+        RECORDS_STORED_TOTAL.labels(table='minio_silver', status='success').inc()
+        RECORDS_STORED_TOTAL.labels(table='timescaledb_sensor_data', status='success').inc()
         return True
     except Exception as e:
         logger.error(f"Errore nel processare i dati sensore analizzati: {e}")
-        if conn_timescale:
-            conn_timescale.rollback()
+        RECORDS_STORED_TOTAL.labels(table='minio_silver', status='failed').inc()
+        RECORDS_STORED_TOTAL.labels(table='timescaledb_sensor_data', status='failed').inc()
+        STORAGE_ERRORS_TOTAL.labels(type='database').inc()
         return False
 
 def process_analyzed_data(s3_client, conn_timescale, data):
@@ -397,6 +447,7 @@ def process_analyzed_data(s3_client, conn_timescale, data):
         logger.error(f"Errore nel processare i dati analizzati: {e}")
         return False
 
+@DATABASE_OPERATION_DURATION_SECONDS.time()
 def process_hotspot_data(s3_client, conn_timescale, data):
     """Processa dati hotspot e li archivia nel livello Gold e TimescaleDB"""
     try:
@@ -477,6 +528,16 @@ def determine_region(latitude, longitude):
 def process_prediction_data(s3_client, data):
     """Processa dati predizione e li archivia nel livello Gold"""
     try:
+        # ... (logica esistente)
+        RECORDS_STORED_TOTAL.labels(table='minio_gold', status='success').inc()
+        return True
+    except Exception as e:
+        logger.error(f"Errore nel processare i dati predizione: {e}")
+        RECORDS_STORED_TOTAL.labels(table='minio_gold', status='failed').inc()
+        STORAGE_ERRORS_TOTAL.labels(type='minio').inc()
+        return False
+    """Processa dati predizione e li archivia nel livello Gold"""
+    try:
         # Standardizza i dati
         data = standardize_data(data, "prediction")
         
@@ -506,6 +567,16 @@ def process_prediction_data(s3_client, data):
         return False
 
 def process_alert_data(s3_client, data):
+    """Processa dati allarme e li archivia nel livello Gold"""
+    try:
+        # ... (logica esistente)
+        RECORDS_STORED_TOTAL.labels(table='minio_gold', status='success').inc()
+        return True
+    except Exception as e:
+        logger.error(f"Errore nel processare i dati alert: {e}")
+        RECORDS_STORED_TOTAL.labels(table='minio_gold', status='failed').inc()
+        STORAGE_ERRORS_TOTAL.labels(type='minio').inc()
+        return False
     """Processa dati allarme e li archivia nel livello Gold"""
     try:
         # Standardizza i dati
@@ -538,6 +609,13 @@ def process_alert_data(s3_client, data):
 
 def main():
     """Funzione principale"""
+    # Avvia il server per le metriche Prometheus
+    try:
+        start_http_server(METRICS_PORT)
+        logger.info(f"Serving Prometheus metrics on port {METRICS_PORT}")
+    except Exception as e:
+        logger.error(f"Could not start Prometheus metrics server: {e}")
+
     logger.info("Starting Storage Consumer")
     
     # Connetti a TimescaleDB

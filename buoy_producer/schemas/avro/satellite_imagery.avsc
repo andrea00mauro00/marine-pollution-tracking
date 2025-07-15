@@ -1,0 +1,96 @@
+{
+  "type": "record",
+  "name": "SatelliteImagery",
+  "namespace": "com.marine.pollution",
+  "doc": "Schema for satellite imagery metadata",
+  "fields": [
+    {
+      "name": "image_pointer",
+      "type": "string",
+      "doc": "Path to the image file in MinIO or other storage"
+    },
+    {
+      "name": "metadata",
+      "type": [
+        "null",
+        {
+          "type": "record",
+          "name": "ImageMetadata",
+          "fields": [
+            {"name": "macroarea_id", "type": ["null", "string"], "default": null, "doc": "Identifier for the macro area (e.g., 'BUOY')"},
+            {"name": "microarea_id", "type": ["null", "string"], "default": null, "doc": "Identifier for the micro area (e.g., buoy ID)"},
+            {"name": "bbox", "type": {"type": "array", "items": "double"}, "doc": "Bounding box coordinates [lon1, lat1, lon2, lat2]"},
+            {"name": "timestamp", "type": ["null", "string"], "default": null, "doc": "Timestamp of image acquisition"},
+            {
+              "name": "satellite_data",
+              "type": [
+                "null",
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "record",
+                    "name": "SatellitePoint",
+                    "fields": [
+                      {"name": "latitude", "type": "double"},
+                      {"name": "longitude", "type": "double"},
+                      {
+                        "name": "bands",
+                        "type": [
+                          "null",
+                          {
+                            "type": "map",
+                            "values": "double"
+                          }
+                        ],
+                        "default": null
+                      }
+                    ]
+                  }
+                }
+              ],
+              "default": null
+            },
+            {"name": "cloud_coverage", "type": ["null", "double"], "default": null, "doc": "Cloud coverage percentage"},
+            {
+              "name": "cloud_metadata",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "CloudMetadata",
+                  "fields": [
+                    {"name": "cloud_assessment_algorithm", "type": ["null", "string"], "default": null},
+                    {"name": "cloud_shadows_detected", "type": ["null", "boolean"], "default": null},
+                    {"name": "quality_assessment", "type": ["null", "string"], "default": null}
+                  ]
+                }
+              ],
+              "default": null
+            },
+            {
+              "name": "spectral_metadata",
+              "type": [
+                "null",
+                {
+                  "type": "record",
+                  "name": "SpectralMetadata",
+                  "fields": [
+                    {"name": "available_bands", "type": {"type": "array", "items": "string"}},
+                    {"name": "band_info", "type": {"type": "map", "values": "string"}},
+                    {"name": "ndwi_available", "type": "boolean"},
+                    {"name": "ndvi_available", "type": "boolean"},
+                    {"name": "band_resolution", "type": {"type": "map", "values": "int"}}
+                  ]
+                }
+              ],
+              "default": null
+            }
+          ]
+        },
+        "string"
+      ],
+      "default": null,
+      "doc": "Complete metadata for the image, either as a nested record or serialized JSON string"
+    }
+  ]
+}

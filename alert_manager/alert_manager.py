@@ -17,19 +17,35 @@ import time
 import uuid
 import re
 import traceback
+import sys
+from pythonjsonlogger import jsonlogger
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import psycopg2
 import redis
 from kafka import KafkaConsumer
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(asctime)s - %(message)s',
-    datefmt='%H:%M:%S'
+# Structured JSON Logger setup
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
 )
+logHandler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'alert-manager'
+    return record
+logging.setLogRecordFactory(record_factory)
 
 # Configuration from environment variables
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092").split(",")

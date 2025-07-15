@@ -1,9 +1,10 @@
-kafka-python
+apache-flink==1.17.0
+boto3
+pandas
+numpy
 redis
-psycopg2-binary
+kafka-python
+loguru
 python-dotenv
 python-json-logger==2.0.7
-loguru
-requests
-kafka-python
 prometheus-client

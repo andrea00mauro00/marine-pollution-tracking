@@ -12,15 +12,34 @@ import logging
 import json
 import time
 import sys
+from pythonjsonlogger import jsonlogger
 from datetime import datetime, timedelta
 import boto3
 import psycopg2
 from kafka import KafkaConsumer
 import redis
 
-# Configurazione logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Structured JSON Logger setup
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
+)
+logHandler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'dashboard-consumer'
+    return record
+logging.setLogRecordFactory(record_factory)
 
 # Configurazione
 KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")

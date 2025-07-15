@@ -1,0 +1,731 @@
+version: '3.8'
+
+services:
+  # OBSERVABILITY STACK (ELK) - Avvio per primo
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.9.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - marine_net
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.9.0
+    container_name: logstash
+    ports:
+      - "5044:5044"
+      - "12201:12201/udp"
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - marine_net
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9600 || exit 1"]
+      interval: 60s
+      timeout: 30s
+      retries: 10
+      start_period: 120s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.9.0
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - marine_net
+    restart: always
+
+  # MONITORING STACK - Solo Prometheus
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    depends_on:
+      logstash:
+        condition: service_healthy
+    networks:
+      - marine_net
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/api/v1/status/config || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # INFRASTRUCTURE & MESSAGING
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    restart: always
+    networks:
+      - marine_net
+    depends_on:
+      logstash:
+        condition: service_healthy
+    logging: &elk-logging
+      driver: "gelf"
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "redis"
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    restart: always
+    networks:
+      - marine_net
+    depends_on:
+      logstash:
+        condition: service_healthy
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "zookeeper"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    depends_on:
+      zookeeper:
+        condition: service_started
+      logstash:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    restart: always
+    networks:
+      - marine_net
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "kafka"
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: schema-registry
+    depends_on:
+      kafka:
+        condition: service_started
+      logstash:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    networks:
+      - marine_net
+    restart: always
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "schema-registry"
+
+  schema-registry-ui:
+    platform: linux/amd64
+    image: landoop/schema-registry-ui:latest
+    container_name: schema-registry-ui
+    depends_on:
+      schema-registry:
+        condition: service_started
+      logstash:
+        condition: service_healthy
+    ports:
+      - "8088:8000"
+    environment:
+      SCHEMAREGISTRY_URL: http://schema-registry:8081
+      PROXY: "true"
+    networks:
+      - marine_net
+    restart: always
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "schema-registry-ui"
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    depends_on:
+      logstash:
+        condition: service_healthy
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+    networks:
+      - marine_net
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "minio"
+
+  # DATABASE LAYER
+  postgres:
+    image: postgres:14-alpine
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=marine_pollution
+    depends_on:
+      logstash:
+        condition: service_healthy
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - marine_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "postgres"
+
+  timescaledb:
+    image: timescale/timescaledb-ha:pg14-latest
+    container_name: timescaledb
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=marine_pollution
+    depends_on:
+      logstash:
+        condition: service_healthy
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    networks:
+      - marine_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "timescaledb"
+
+  # SETUP & INITIALIZATION
+  create_buckets:
+    build:
+      context: ./setup_minio
+    container_name: create_buckets
+    depends_on:
+      minio:
+        condition: service_started
+      logstash:
+        condition: service_healthy
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    networks:
+      - marine_net
+    restart: "no"
+    command: ["sh", "-c", "sleep 30 && python create_minio_buckets.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "create_buckets"
+
+  create_dlq_topics:
+    image: python:3.9
+    container_name: create_dlq_topics
+    depends_on:
+      kafka:
+        condition: service_started
+      logstash:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts
+    working_dir: /scripts
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    command: ["sh", "-c", "sleep 30 && pip install kafka-python && python create_dlq_topics.py"]
+    restart: "no"
+    networks:
+      - marine_net
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "create_dlq_topics"
+
+  setup_database:
+    build:
+      context: ./setup_database
+    container_name: setup_database
+    depends_on:
+      postgres:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      logstash:
+        condition: service_healthy
+    environment:
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    networks:
+      - marine_net
+    restart: "no"
+    command: ["sh", "-c", "sleep 20 && python init_db.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "setup_database"
+
+  # PRODUCER LAYER
+  buoy_producer:
+    build:
+      context: ./buoy_producer
+    container_name: buoy_producer
+    depends_on:
+      kafka:
+        condition: service_started
+      schema-registry:
+        condition: service_started
+      create_dlq_topics:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=buoy_data
+      - GENERATE_INTERVAL_SECONDS=30
+      - SCHEMA_REGISTRY_URL=http://schema-registry:8081
+      - DLQ_TOPIC=buoy_data_dlq
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./schemas:/app/schemas
+    restart: always
+    networks:
+      - marine_net
+    command: ["sh", "-c", "sleep 45 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "buoy_producer"
+
+  satellite_producer:
+    build:
+      context: ./satellite_producer
+    container_name: satellite_producer
+    depends_on:
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_started
+      create_buckets:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=satellite_imagery
+      - FETCH_INTERVAL_SECONDS=900
+      - SH_CLIENT_ID=sh-eb560cfe-5964-4ac6-a0b0-d87c8e03af4b
+      - SH_CLIENT_SECRET=qZywwuvH6Bqq0TmbDuoNkW9SxgTVO4HA
+      - SH_TOKEN_URL=https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token
+      - SH_BASE_URL=https://sh.dataspace.copernicus.eu
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_BUCKET=bronze
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - ./schemas:/app/schemas
+    restart: always
+    networks:
+      - marine_net
+    command: ["sh", "-c", "sleep 50 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "satellite_producer"
+
+  # PROCESSING LAYER (FLINK JOBS)
+  image_standardizer:
+    build:
+      context: ./image_standardizer
+    container_name: image_standardizer
+    ports:
+      - "8082:8081"
+    depends_on:
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_started
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - SATELLITE_TOPIC=satellite_imagery
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery
+    volumes:
+      - ./common:/opt/flink/usrlib/common
+    networks:
+      - marine_net
+    restart: on-failure
+    command: ["sh", "-c", "sleep 60 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "image_standardizer"
+
+  sensor_analyzer:
+    build:
+      context: ./sensor_analyzer
+    container_name: sensor_analyzer
+    ports:
+      - "8085:8081"
+    depends_on:
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_started
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - BUOY_TOPIC=buoy_data
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - MINIO_ENDPOINT=minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - ./common:/opt/flink/usrlib/common
+    networks:
+      - marine_net
+    restart: on-failure
+    command: ["sh", "-c", "sleep 60 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "sensor_analyzer"
+
+  pollution_detector:
+    build:
+      context: ./pollution_detector
+    container_name: pollution_detector
+    ports:
+      - "8083:8081"
+    depends_on:
+      kafka:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      setup_database:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery
+      - ANALYZED_DATA_TOPIC=analyzed_data
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - ALERTS_TOPIC=sensor_alerts
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    networks:
+      - marine_net
+    restart: on-failure
+    command: ["sh", "-c", "sleep 70 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "pollution_detector"
+
+  ml_prediction_job:
+    build:
+      context: ./ml_prediction
+    container_name: ml_prediction_job
+    ports:
+      - "8084:8081"
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+      setup_database:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - PREDICTIONS_TOPIC=pollution_predictions
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    networks:
+      - marine_net
+    restart: on-failure
+    command: ["sh", "-c", "sleep 60 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "ml_prediction_job"
+
+  # CONSUMER LAYER
+  storage_consumer:
+    build:
+      context: ./storage_consumer
+    container_name: storage_consumer
+    depends_on:
+      kafka:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      create_buckets:
+        condition: service_completed_successfully
+      setup_database:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - BUOY_TOPIC=buoy_data
+      - SATELLITE_TOPIC=satellite_imagery
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - ANALYZED_TOPIC=analyzed_data
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - PREDICTIONS_TOPIC=pollution_predictions
+      - ALERTS_TOPIC=sensor_alerts
+    networks:
+      - marine_net
+    restart: on-failure
+    command: ["sh", "-c", "sleep 80 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "storage_consumer"
+
+  dlq_consumer:
+    build:
+      context: ./dlq_consumer
+    container_name: dlq_consumer
+    depends_on:
+      kafka:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      create_dlq_topics:
+        condition: service_completed_successfully
+      setup_database:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    networks:
+      - marine_net
+    restart: on-failure
+    command: ["sh", "-c", "sleep 60 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "dlq_consumer"
+
+  alert_manager:
+    build:
+      context: ./alert_manager
+    container_name: alert_manager
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+      setup_database:
+        condition: service_completed_successfully
+      logstash:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - ALERTS_TOPIC=sensor_alerts
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - PREDICTIONS_TOPIC=pollution_predictions
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SMTP_SERVER=smtp.example.com
+      - SMTP_PORT=587
+      - SMTP_USER=user@example.com
+      - SMTP_PASSWORD=password
+      - EMAIL_SENDER=noreply@example.com
+      - REGIONAL_CONFIG={"upper_bay":{"email_recipients":["upperchesapeake@example.com"]},"lower_bay":{"email_recipients":["lowerchesapeake@example.com"]}}
+    networks:
+      - marine_net
+    restart: on-failure
+    command: ["sh", "-c", "sleep 70 && python main.py"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "alert_manager"
+
+  # VISUALIZATION LAYER - Solo Streamlit (no Grafana)
+  dashboard_streamlit:
+    build:
+      context: ./dashboard_streamlit
+    container_name: dashboard_streamlit
+    ports:
+      - "8501:8501"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      setup_database:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_healthy
+      logstash:
+        condition: service_healthy
+    environment:
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - PROMETHEUS_URL=http://prometheus:9090
+    networks:
+      - marine_net
+    restart: always
+    command: ["sh", "-c", "sleep 60 && streamlit run app.py --server.port=8501 --server.address=0.0.0.0"]
+    logging:
+      <<: *elk-logging
+      options:
+        gelf-address: "udp://localhost:12201"
+        tag: "dashboard_streamlit"
+
+networks:
+  marine_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  timescaledb_data:
+  minio_data:
+  es_data:
+  prometheus_data:

@@ -1,0 +1,11 @@
+apache-flink==1.17.0
+numpy
+scipy
+scikit-learn==1.2.2
+kafka-python
+loguru
+python-dotenv
+python-json-logger==2.0.7
+boto3
+pandas
+prometheus-client

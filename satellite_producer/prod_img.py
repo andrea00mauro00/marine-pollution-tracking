@@ -5,8 +5,9 @@ import time
 import json
 import pathlib
 import traceback
+import logging
+from pythonjsonlogger import jsonlogger
 from datetime import date, timedelta, datetime
-from loguru import logger
 from sentinelhub import SHConfig, SentinelHubCatalog
 import boto3
 from botocore.exceptions import ClientError
@@ -44,6 +45,26 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
+# ---- Logger Setup ----------------------------------------------------------
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
+)
+logHandler.setFormatter(formatter)
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'satellite-producer'
+    return record
+logging.setLogRecordFactory(record_factory)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_sh_config() -> SHConfig:
@@ -79,7 +100,7 @@ def get_minio_client():
         client.head_bucket(Bucket=MINIO_BUCKET)
     except ClientError:
         client.create_bucket(Bucket=MINIO_BUCKET)
-        logger.success(f"Created MinIO bucket '{MINIO_BUCKET}'")
+        logger.info(f"Created MinIO bucket '{MINIO_BUCKET}'")
     return client
 
 def pick_best_scene(cfg: SHConfig, bbox):
@@ -168,17 +189,15 @@ def on_delivery_error(err, msg):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    logger.add(lambda m: print(m, end=""), level="INFO")
-    
     # Try to use Schema Registry producer
     schema_path = "schemas/avro/satellite_imagery.avsc"
     try:
         producer = create_schema_registry_producer(schema_path)
-        logger.success("✅ Connected to Kafka with Schema Registry")
+        logger.info("✅ Connected to Kafka with Schema Registry")
     except Exception as e:
         logger.error(f"Schema Registry error: {e}")
         producer = create_fallback_producer()
-        logger.success("✅ Connected to Kafka using fallback producer")
+        logger.info("✅ Connected to Kafka using fallback producer")
     
     sh_cfg = build_sh_config()
     minio_cli = get_minio_client()

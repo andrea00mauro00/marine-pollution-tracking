@@ -16,6 +16,8 @@ import time
 import uuid
 import math
 import traceback
+import sys
+from pythonjsonlogger import jsonlogger
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict, deque
@@ -32,13 +34,27 @@ from pyflink.common.typeinfo import Types
 # Import HotspotManager
 from services.hotspot_manager import HotspotManager
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(asctime)s - %(message)s',
-    datefmt='%H:%M:%S'
+# Structured JSON Logger setup
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s %(component)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
 )
+logHandler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'pollution-detector'
+    return record
+logging.setLogRecordFactory(record_factory)
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")

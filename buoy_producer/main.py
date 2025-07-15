@@ -1,13 +1,14 @@
-import time, json, requests, random, sys, os, yaml
+import time, json, requests, random, sys, os, yaml, logging
+from pythonjsonlogger import jsonlogger
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
 from confluent_kafka import SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
 from dotenv import load_dotenv
-from loguru import logger
+from prometheus_client import start_http_server, Counter
 
-load_dotenv()
+# load_dotenv() # No longer needed, env vars are passed by Docker
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -16,9 +17,30 @@ POLL_INTERVAL_SEC = int(os.getenv("GENERATE_INTERVAL_SECONDS", 30))
 DLQ_TOPIC = os.getenv("DLQ_TOPIC", "buoy_data_dlq")  # Dead Letter Queue
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 
-# Logger setup
-logger.remove()
-logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
+# Prometheus Metrics
+MESSAGES_PRODUCED = Counter('buoy_messages_produced_total', 'Total messages produced by the buoy producer.')
+PRODUCER_ERRORS = Counter('buoy_producer_errors_total', 'Total errors encountered by the buoy producer.')
+
+
+# Structured JSON Logger setup
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
+)
+logHandler.setFormatter(formatter)
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'buoy-producer'
+    return record
+logging.setLogRecordFactory(record_factory)
 
 def schema_registry_producer():
     """Creates a Kafka producer with Schema Registry integration"""
@@ -41,8 +63,8 @@ def schema_registry_producer():
         # Configure Kafka producer with Avro serializer
         producer_conf = {
             'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
-            'value.serializer': avro_serializer,
-            'error.cb': on_delivery_error
+            'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+            'value.serializer': avro_serializer
         }
         
         return SerializingProducer(producer_conf)
@@ -64,26 +86,31 @@ def fallback_producer():
     logger.critical("Kafka unavailable. Exiting.")
     sys.exit(1)
 
-def on_delivery_error(err, msg):
-    """Error callback for Kafka producer"""
-    logger.error(f'Message delivery failed: {err}')
-    # Send to DLQ if possible
-    try:
-        dlq_producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8")
-        )
-        error_msg = {
-            "original_topic": msg.topic(),
-            "error": str(err),
-            "timestamp": int(time.time() * 1000),
-            "data": json.loads(msg.value().decode('utf-8')) if msg.value() else None
-        }
-        dlq_producer.send(DLQ_TOPIC, error_msg)
-        dlq_producer.flush()
-        logger.info(f"Message sent to DLQ topic {DLQ_TOPIC}")
-    except Exception as e:
-        logger.error(f"Failed to send to DLQ: {e}")
+def on_delivery_callback(err, msg):
+    """Callback for Kafka producer delivery reports."""
+    if err is not None:
+        logger.error(f'Message delivery failed: {err}')
+        PRODUCER_ERRORS.inc()
+        # Send to DLQ if possible
+        try:
+            dlq_producer = KafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8")
+            )
+            error_msg = {
+                "original_topic": msg.topic(),
+                "error": str(err),
+                "timestamp": int(time.time() * 1000),
+                "data": json.loads(msg.value().decode('utf-8')) if msg.value() else None
+            }
+            dlq_producer.send(DLQ_TOPIC, error_msg)
+            dlq_producer.flush()
+            logger.info(f"Message sent to DLQ topic {DLQ_TOPIC}")
+        except Exception as e:
+            logger.error(f"Failed to send to DLQ: {e}")
+    else:
+        MESSAGES_PRODUCED.inc()
+        logger.info(f"✅ Message delivered to {msg.topic()} [{msg.partition()}] at offset {msg.offset()}")
 
 # NOAA + USGS helpers
 def fetch_buoy(bid: str) -> dict | None:
@@ -351,16 +378,18 @@ def validate_sensor_data(data):
 
 # Main loop
 def main():
+    start_http_server(8001)
+    logger.info("📈 Prometheus metrics server started on port 8001")
     locs = yaml.safe_load(open("locations.yml"))
     
     # Try to use Schema Registry producer first
     try:
         prod = schema_registry_producer()
-        logger.success("✅ Connected to Kafka with Schema Registry")
+        logger.info("✅ Connected to Kafka with Schema Registry")
     except Exception as e:
         logger.error(f"Schema Registry error: {e}")
         prod = fallback_producer()
-        logger.success("✅ Connected to Kafka using fallback producer")
+        logger.info("✅ Connected to Kafka using fallback producer")
     
     logger.info("🔄 Mode: External APIs + fallback to simulated data")
 
@@ -420,7 +449,7 @@ def main():
                     prod.produce(
                         topic=KAFKA_TOPIC,
                         value=buoy,
-                        on_delivery=lambda err, msg: logger.error(f"Message delivery failed: {err}") if err else None
+                        on_delivery=on_delivery_callback
                     )
                     # Manual flush after each message to handle errors properly
                     prod.flush()

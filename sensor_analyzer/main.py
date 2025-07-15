@@ -30,18 +30,33 @@ from pyflink.common import Types
 # Import ML infrastructure
 import sys
 import os
+from pythonjsonlogger import jsonlogger
 
 # Add the common directory to the Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from common.ml_infrastructure import ModelManager, ErrorHandler
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(asctime)s - %(message)s',
-    datefmt='%H:%M:%S'
+# Structured JSON Logger setup
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s %(component)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
 )
+logHandler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'sensor-analyzer'
+    return record
+logging.setLogRecordFactory(record_factory)
 
 # Configuration variables
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")

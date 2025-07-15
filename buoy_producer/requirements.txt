@@ -5,3 +5,5 @@ loguru==0.7.2
 PyYAML==6.0
 confluent-kafka==2.2.0
 fastavro==1.7.3
+prometheus-client
+python-json-logger==2.0.7

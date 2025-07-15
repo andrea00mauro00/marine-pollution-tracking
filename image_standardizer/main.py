@@ -18,6 +18,7 @@ import time
 import sys
 import uuid
 import traceback
+from pythonjsonlogger import jsonlogger
 from datetime import datetime
 import tempfile
 from io import BytesIO
@@ -32,13 +33,27 @@ from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream.functions import ProcessFunction
 from pyflink.common import Types
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(asctime)s - %(message)s',
-    datefmt='%H:%M:%S'
+# Structured JSON Logger setup
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s %(component)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
 )
+logHandler.setFormatter(formatter)
+
 logger = logging.getLogger(__name__)
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'image-standardizer'
+    return record
+logging.setLogRecordFactory(record_factory)
 
 # Configuration variables - corrected variable names
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")

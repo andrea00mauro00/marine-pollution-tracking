@@ -21,6 +21,7 @@ RUN pip3 install \
     apache-flink==1.17.0 \
     boto3 pandas \
     redis kafka-python loguru python-dotenv \
+    python-json-logger==2.0.7 \
     pillow numpy \
     pyarrow
 
