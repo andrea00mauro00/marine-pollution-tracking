@@ -32,21 +32,7 @@ RUN mkdir -p /app/satellite_producer/utils && \
     touch /app/satellite_producer/__init__.py && \
     touch /app/satellite_producer/utils/__init__.py
 
-# Copia i file esistenti in Utils nella directory satellite_producer/utils
-RUN cp /app/Utils/__init__.py /app/satellite_producer/utils/ && \
-    cp /app/Utils/buoy_utils.py /app/satellite_producer/utils/ && \
-    cp /app/Utils/db_utils.py /app/satellite_producer/utils/ && \
-    cp /app/Utils/geo_img_utils.py /app/satellite_producer/utils/ && \
-    cp /app/Utils/imgfetch_utils.py /app/satellite_producer/utils/ && \
-    cp /app/Utils/imgfilter_utils.py /app/satellite_producer/utils/ && \
-    cp /app/Utils/stream_img_utils.py /app/satellite_producer/utils/
-
-# Copia ricorsivamente anche la sottodirectory config se esiste
-RUN if [ -d "/app/Utils/config" ]; then \
-        mkdir -p /app/satellite_producer/utils/config && \
-        cp -r /app/Utils/config/* /app/satellite_producer/utils/config/; \
-    fi
-
+COPY Utils/ /app/satellite_producer/utils/
 
 # Imposta variabili d'ambiente
 ENV KAFKA_BOOTSTRAP_SERVERS=kafka:9092

@@ -5,7 +5,7 @@ Marine Pollution Monitoring System - Pollution Detector
 This job:
 1. Consumes analyzed sensor data and processed imagery from Kafka
 2. Performs spatial clustering to identify pollution hotspots
-3. Evaluates confidence levels for detected events
+3. Evaluates confidence levels for detected events using ML models
 4. Publishes detected pollution events for prediction and alerting
 """
 
@@ -16,11 +16,17 @@ import time
 import uuid
 import math
 import traceback
-import sys
-from pythonjsonlogger import jsonlogger
+import pickle
+import numpy as np
+import hashlib  # Aggiunto per ID deterministici
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict, deque
+
+# Aggiungi queste righe all'inizio del file
+import sys
+sys.path.append('/opt/flink/usrlib')
+
 
 # PyFlink imports
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
@@ -31,30 +37,17 @@ from pyflink.common import WatermarkStrategy, Time, TypeInformation
 from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
 from pyflink.common.typeinfo import Types
 
-# Import HotspotManager
+# Import HotspotManager e chiavi Redis standardizzate
 from services.hotspot_manager import HotspotManager
+from common.redis_keys import *  # Importa chiavi standardizzate
 
-# Structured JSON Logger setup
-logHandler = logging.StreamHandler(sys.stdout)
-formatter = jsonlogger.JsonFormatter(
-    '%(asctime)s %(name)s %(levelname)s %(message)s %(component)s',
-    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] %(asctime)s - %(message)s',
+    datefmt='%H:%M:%S'
 )
-logHandler.setFormatter(formatter)
-
 logger = logging.getLogger(__name__)
-if logger.hasHandlers():
-    logger.handlers.clear()
-logger.addHandler(logHandler)
-logger.setLevel(logging.INFO)
-
-# Add component to all log messages
-old_factory = logging.getLogRecordFactory()
-def record_factory(*args, **kwargs):
-    record = old_factory(*args, **kwargs)
-    record.component = 'pollution-detector'
-    return record
-logging.setLogRecordFactory(record_factory)
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -64,6 +57,11 @@ HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
 ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
 ANALYZED_DATA_TOPIC = os.environ.get("ANALYZED_DATA_TOPIC", "analyzed_data")
 
+# MinIO configuration
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
+
 # Spatial clustering parameters
 DISTANCE_THRESHOLD_KM = 5.0  # Cluster points within 5km
 TIME_WINDOW_HOURS = 24.0     # Consider points within 24 hours
@@ -71,12 +69,12 @@ MIN_POINTS = 2               # Minimum points to form a cluster
 GRID_SIZE_DEG = 0.05         # Grid size for spatial indexing
 
 # Confidence estimation parameters
-CONFIDENCE_THRESHOLD = 0.7  # RESTORED: Minimum confidence for validated hotspots
+CONFIDENCE_THRESHOLD = 0.05  # ABBASSATO: Minimum confidence for validated hotspots
 
 # Risk thresholds
-HIGH_RISK_THRESHOLD = 0.7    # RESTORED: Threshold for high severity
-MEDIUM_RISK_THRESHOLD = 0.4  # RESTORED: Threshold for medium severity
-DETECTION_THRESHOLD = 0.4    # RESTORED: Minimum risk to consider
+HIGH_RISK_THRESHOLD = 0.6    # ABBASSATO: Threshold for high severity (was 0.7)
+MEDIUM_RISK_THRESHOLD = 0.3  # ABBASSATO: Threshold for medium severity (was 0.4)
+DETECTION_THRESHOLD = 0.3    # ABBASSATO: Minimum risk to consider (was 0.4)
 
 # Timer parameters
 CLUSTERING_INTERVAL_MS = 60000  # Run clustering every 1 minute
@@ -94,6 +92,60 @@ ENVIRONMENTAL_REGIONS = {
     }
 }
 
+# Memoria e limiti di esecuzione
+MAX_POINTS_IN_MEMORY = 1000      # Hard limit punti
+SOFT_CLEANUP_THRESHOLD = 800     # Soglia per cleanup proattivo
+MIN_POINTS_TO_KEEP = 100         # Minimum per clustering efficace
+
+# Retry configuration
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 2  # secondi
+
+class RedisCircuitBreaker:
+    """
+    Circuit breaker pattern per interazioni con Redis
+    Previene il fallimento a cascata quando Redis non è disponibile
+    """
+    def __init__(self, failure_threshold=3, reset_timeout=60):
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF-OPEN
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        
+    def execute(self, func, *args, **kwargs):
+        """Esegue una funzione con circuit breaker pattern"""
+        if self.state == "OPEN":
+            # Check if timeout has elapsed to transition to HALF-OPEN
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                self.state = "HALF-OPEN"
+                logger.info(f"[CIRCUIT] Transitioning to HALF-OPEN state")
+            else:
+                logger.warning(f"[CIRCUIT] Circuit OPEN, skipping operation")
+                return None
+                
+        try:
+            result = func(*args, **kwargs)
+            
+            # If successful in HALF-OPEN, transition to CLOSED
+            if self.state == "HALF-OPEN":
+                self.state = "CLOSED"
+                self.failure_count = 0
+                logger.info(f"[CIRCUIT] Success, transitioning to CLOSED")
+                
+            return result
+            
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            
+            if self.failure_count >= self.failure_threshold:
+                self.state = "OPEN"
+                logger.warning(f"[CIRCUIT] Circuit OPEN after {self.failure_count} failures")
+                
+            logger.error(f"[CIRCUIT] Operation failed: {e}")
+            return None
+
 class PollutionEventDetector(MapFunction):
     """
     Detects pollution events from sensor and imagery data
@@ -108,117 +160,44 @@ class PollutionEventDetector(MapFunction):
             data = json.loads(value)
             source_type = data.get("source_type", "unknown")
             
-            # Extract location
-            location = None
-            if source_type == "buoy":
-                location = data.get("location")
-            elif source_type == "satellite":
-                # Check different location fields for satellite data
-                if "center_location" in data:
-                    location = data.get("center_location")
-                elif "location" in data:
-                    location = data.get("location")
-                elif "metadata" in data and isinstance(data["metadata"], dict):
-                    metadata = data["metadata"]
-                    if "latitude" in metadata and "longitude" in metadata:
-                        location = {
-                            "latitude": metadata["latitude"], 
-                            "longitude": metadata["longitude"]
-                        }
-                    elif "lat" in metadata and "lon" in metadata:
-                        location = {
-                            "latitude": metadata["lat"], 
-                            "longitude": metadata["lon"]
-                        }
-                elif "pollution_detection" in data and "spectral_analysis" in data:
-                    if "processed_bands" in data["spectral_analysis"]:
-                        bands = data["spectral_analysis"]["processed_bands"]
-                        if bands and "lat" in bands[0] and "lon" in bands[0]:
-                            location = {
-                                "latitude": bands[0]["lat"],
-                                "longitude": bands[0]["lon"]
-                            }
+            logger.info(f"[DEBUG] Processing data from source: {source_type}")
             
-            # Extract pollution analysis
-            pollution_analysis = None
-            if source_type == "buoy":
-                pollution_analysis = data.get("pollution_analysis")
-            elif source_type == "satellite":
-                # Try multiple possible field names
-                if "detected_pollution" in data:
-                    pollution_analysis = data.get("detected_pollution")
-                elif "pollution_detection" in data:
-                    pollution_analysis = data.get("pollution_detection")
+            # Extract location - NORMALIZZATO per compatibilità con Image Standardizer
+            location = self._extract_location(data)
+            if not location:
+                logger.warning(f"[DEBUG] Missing location info for {source_type}")
+                return value
             
+            # Estrai pollution analysis - NORMALIZZATO per compatibilità con Image Standardizer
+            pollution_analysis = self._extract_pollution_analysis(data, source_type)
             if not pollution_analysis:
+                logger.info(f"[DEBUG] No pollution analysis found for {source_type}")
                 return value
             
             # Standardize pollution analysis format
-            risk_score = 0.0
-            pollutant_type = "unknown"
-            severity = "low"
+            risk_score, pollutant_type, severity = self._normalize_pollution_data(pollution_analysis, source_type)
             
-            if source_type == "buoy":
-                # Format for buoy data
-                pollutant_type = pollution_analysis.get("pollutant_type", "unknown")
-                risk_score = pollution_analysis.get("risk_score", 0.0)
-                severity = pollution_analysis.get("level", "low")
-            elif source_type == "satellite":
-                # Handle satellite data
-                if isinstance(pollution_analysis, dict):
-                    # Try multiple field names for risk score
-                    if "risk_score" in pollution_analysis:
-                        risk_score = pollution_analysis["risk_score"]
-                    elif "confidence" in pollution_analysis:
-                        risk_score = pollution_analysis["confidence"]
-                    
-                    # Try multiple field names for pollutant type
-                    if "pollutant_type" in pollution_analysis:
-                        pollutant_type = pollution_analysis["pollutant_type"]
-                    elif "type" in pollution_analysis:
-                        pollutant_type = pollution_analysis["type"]
-                    
-                    # For satellite data, calculate severity based on risk score
-                    severity = "high" if risk_score > HIGH_RISK_THRESHOLD else "medium" if risk_score > MEDIUM_RISK_THRESHOLD else "low"
-            
-            # Skip if location info is insufficient
-            if not location:
-                logger.warning(f"Missing location info for {source_type}")
-                return value
-            
-            # Normalize location format
-            latitude = None
-            longitude = None
-            if "latitude" in location:
-                latitude = location.get("latitude")
-                longitude = location.get("longitude")
-            elif "center_latitude" in location:
-                latitude = location.get("center_latitude")
-                longitude = location.get("center_longitude")
-            elif "center_lat" in location:
-                latitude = location.get("center_lat")
-                longitude = location.get("center_lon")
-            elif "lat" in location:
-                latitude = location.get("lat")
-                longitude = location.get("lon")
-            
-            if latitude is None or longitude is None:
-                logger.warning(f"Invalid location coordinates for {source_type}: {location}")
-                return value
+            logger.info(f"[DEBUG] Risk score for {source_type}: {risk_score}, threshold: {self.risk_threshold}")
             
             # If risk score exceeds threshold, create event data
             if risk_score >= self.risk_threshold:
-                event_id = str(uuid.uuid4())
+                # Genera un ID deterministico basato su caratteristiche dell'evento
+                # Rende più facile tracciare lo stesso evento tra diversi componenti
+                lat_rounded = round(location["latitude"], 3)
+                lon_rounded = round(location["longitude"], 3)
+                time_bucket = (int(time.time() * 1000) // (30 * 60 * 1000)) * (30 * 60 * 1000)
+                id_base = f"{lat_rounded}_{lon_rounded}_{pollutant_type}_{time_bucket}"
+                event_id = f"event-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
                 
                 # Find environmental region
-                region_id = self._get_environmental_region(latitude, longitude)
+                region_id = self._get_environmental_region(location["latitude"], location["longitude"])
                 
                 event_data = {
                     "event_id": event_id,
                     "timestamp": data.get("timestamp", int(time.time() * 1000)),
                     "location": {
-                        "latitude": latitude,
-                        "longitude": longitude
+                        "latitude": location["latitude"],
+                        "longitude": location["longitude"]
                     },
                     "pollutant_type": pollutant_type,
                     "severity": severity,
@@ -235,11 +214,14 @@ class PollutionEventDetector(MapFunction):
                 
                 # Add event info to original data
                 data["pollution_event_detection"] = event_data
-                logger.info(f"[EVENT DETECTED] {source_type} pollution event at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
+                logger.info(f"[EVENT DETECTED] {source_type} pollution event at ({location['latitude']}, {location['longitude']}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
                 
-                # Ensure severity is properly set based on risk score
+                # Force severity to high for testing if risk_score is sufficient
                 if risk_score >= HIGH_RISK_THRESHOLD and severity != "high":
+                    logger.info(f"[DEBUG] Forcing severity to HIGH for testing (risk_score: {risk_score})")
                     data["pollution_event_detection"]["severity"] = "high"
+            else:
+                logger.info(f"[DEBUG] Risk score {risk_score} below threshold {self.risk_threshold}, skipping")
             
             return json.dumps(data)
             
@@ -247,6 +229,95 @@ class PollutionEventDetector(MapFunction):
             logger.error(f"[ERROR] Error in pollution event detection: {e}")
             traceback.print_exc()
             return value
+    
+    def _extract_location(self, data):
+        """Estrae e normalizza le informazioni di location da diverse strutture possibili"""
+        # Prima controlla il campo location standard dell'Image Standardizer
+        if "location" in data:
+            location = data["location"]
+            result = {}
+            
+            # Gestisci sia latitude/longitude che center_latitude/center_longitude
+            if "latitude" in location and "longitude" in location:
+                result["latitude"] = location["latitude"]
+                result["longitude"] = location["longitude"]
+                return result
+            elif "center_latitude" in location and "center_longitude" in location:
+                result["latitude"] = location["center_latitude"]
+                result["longitude"] = location["center_longitude"]
+                return result
+        
+        # Controlla in pollution_detection per i dati satellitari
+        if "pollution_detection" in data and isinstance(data["pollution_detection"], dict):
+            if "location" in data["pollution_detection"]:
+                loc = data["pollution_detection"]["location"]
+                if "latitude" in loc and "longitude" in loc:
+                    return {"latitude": loc["latitude"], "longitude": loc["longitude"]}
+        
+        # Controlla nei metadati
+        if "metadata" in data and isinstance(data["metadata"], dict):
+            metadata = data["metadata"]
+            if "latitude" in metadata and "longitude" in metadata:
+                return {"latitude": metadata["latitude"], "longitude": metadata["longitude"]}
+            elif "lat" in metadata and "lon" in metadata:
+                return {"latitude": metadata["lat"], "longitude": metadata["lon"]}
+        
+        # Controlla l'analisi spettrale
+        if "spectral_analysis" in data and "processed_bands" in data["spectral_analysis"]:
+            bands = data["spectral_analysis"]["processed_bands"]
+            if bands and isinstance(bands, list) and len(bands) > 0:
+                if "lat" in bands[0] and "lon" in bands[0]:
+                    return {"latitude": bands[0]["lat"], "longitude": bands[0]["lon"]}
+        
+        return None
+    
+    def _extract_pollution_analysis(self, data, source_type):
+        """Estrae l'analisi dell'inquinamento dalla struttura dati"""
+        # Per dati satellitari, usa pollution_detection (formato Image Standardizer)
+        if source_type == "satellite" and "pollution_detection" in data:
+            return data["pollution_detection"]
+        
+        # Per dati da boe, usa il campo standard pollution_analysis
+        if source_type == "buoy" and "pollution_analysis" in data:
+            return data["pollution_analysis"]
+        
+        # Fallback: cerca anche detected_pollution per compatibilità
+        if "detected_pollution" in data:
+            return data["detected_pollution"]
+        
+        return None
+    
+    def _normalize_pollution_data(self, pollution_analysis, source_type):
+        """Normalizza i dati di inquinamento in un formato standard"""
+        risk_score = 0.0
+        pollutant_type = "unknown"
+        severity = "low"
+        
+        if source_type == "buoy":
+            # Format for buoy data
+            pollutant_type = pollution_analysis.get("pollutant_type", "unknown")
+            risk_score = pollution_analysis.get("risk_score", 0.0)
+            severity = pollution_analysis.get("level", "low")
+        elif source_type == "satellite":
+            # Per satellite, gestisci sia format type/confidence (Image Standardizer)
+            # che pollutant_type/risk_score (format legacy)
+            
+            # Risk score - prova entrambi i campi
+            if "confidence" in pollution_analysis:
+                risk_score = pollution_analysis["confidence"]
+            elif "risk_score" in pollution_analysis:
+                risk_score = pollution_analysis["risk_score"]
+            
+            # Pollutant type - prova entrambi i campi
+            if "type" in pollution_analysis:
+                pollutant_type = pollution_analysis["type"]
+            elif "pollutant_type" in pollution_analysis:
+                pollutant_type = pollution_analysis["pollutant_type"]
+            
+            # Calcola severity basata su risk score
+            severity = "high" if risk_score > HIGH_RISK_THRESHOLD else "medium" if risk_score > MEDIUM_RISK_THRESHOLD else "low"
+        
+        return risk_score, pollutant_type, severity
     
     def _get_environmental_region(self, latitude, longitude):
         """Determine which environmental region contains the coordinates"""
@@ -261,64 +332,42 @@ class PollutionEventDetector(MapFunction):
 
 class AlertExtractor(MapFunction):
     """
-    Extracts alert events based on severity
+    Extracts alert events based on severity - modified to only handle hotspots
     """
     def __init__(self):
         self.redis_client = None
+        self.circuit_breaker = RedisCircuitBreaker()
         
     def open(self, runtime_context):
+        self._init_redis_with_retry()
+    
+    def _init_redis_with_retry(self):
+        """Initialize Redis connection with retry logic"""
         import redis
-        # Initialize Redis client
-        redis_host = os.environ.get("REDIS_HOST", "redis")
-        redis_port = int(os.environ.get("REDIS_PORT", "6379"))
-        self.redis_client = redis.Redis(host=redis_host, port=redis_port)
-        logger.info("AlertExtractor connected to Redis")
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Initialize Redis client
+                redis_host = os.environ.get("REDIS_HOST", "redis")
+                redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+                self.redis_client = redis.Redis(host=redis_host, port=redis_port)
+                # Test connection
+                self.redis_client.ping()
+                logger.info("AlertExtractor connected to Redis")
+                return
+            except Exception as e:
+                wait_time = BACKOFF_FACTOR ** attempt
+                logger.warning(f"Redis connection attempt {attempt+1}/{MAX_RETRIES} failed: {e}. Retrying in {wait_time}s")
+                time.sleep(wait_time)
+        
+        logger.error("Failed to connect to Redis after multiple attempts")
     
     def map(self, value):
         try:
             data = json.loads(value)
             
-            # Check if this is an event with pollution_event_detection
-            event_detection = data.get("pollution_event_detection")
-            if event_detection:
-                severity = event_detection.get("severity")
-                risk_score = event_detection.get("risk_score", 0.0)
-                source_type = event_detection.get("detection_source", "unknown")
-                pollutant_type = event_detection.get("pollutant_type", "unknown")
-                
-                # Extract location for logging
-                location = event_detection.get("location", {})
-                latitude = location.get("latitude", "unknown")
-                longitude = location.get("longitude", "unknown")
-                
-                # Log only significant events
-                if severity in ["medium", "high"]:
-                    logger.info(f"[ALERT CHECK] Checking event: severity={severity}, risk={risk_score}, source={source_type}")
-                
-                # Check severity - if medium or high, this is an alert
-                if severity in ["medium", "high"]:
-                    # Check for cooldown if Redis is available
-                    if self.redis_client:
-                        event_id = event_detection.get("event_id", "unknown")
-                        cooldown_key = f"alert:cooldown:event:{event_id}"
-                        
-                        # Skip if in cooldown
-                        if self.redis_client.exists(cooldown_key):
-                            logger.info(f"[ALERT FILTERED] Event {event_id} is in cooldown period, skipping")
-                            return None
-                        
-                        # Set cooldown (30 min for medium, 15 min for high)
-                        cooldown_seconds = 1800 if severity == "medium" else 900
-                        self.redis_client.setex(cooldown_key, cooldown_seconds, "1")
-                    
-                    logger.info(f"[ALERT GENERATED] {source_type} alert at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
-                    return value
-                else:
-                    logger.info(f"[ALERT FILTERED] Event severity '{severity}' not high enough for alert")
-                    return None
-            
-            # Check if this is a hotspot
-            elif "hotspot_id" in data:
+            # Check only for hotspots
+            if "hotspot_id" in data:
                 hotspot_id = data.get("hotspot_id")
                 severity = data.get("severity")
                 avg_risk = data.get("avg_risk_score", 0.0)
@@ -327,36 +376,46 @@ class AlertExtractor(MapFunction):
                 is_significant = data.get("is_significant_change", False)
                 severity_changed = data.get("severity_changed", False)
                 
+                # Estrai campi di relazione
+                parent_hotspot_id = data.get("parent_hotspot_id")
+                derived_from = data.get("derived_from")
+                
                 # Extract location for logging
                 location = data.get("location", {})
-                latitude = location.get("center_latitude", location.get("center_lat", "unknown"))
-                longitude = location.get("center_longitude", location.get("center_lon", "unknown"))
+                latitude = location.get("center_latitude", location.get("latitude", "unknown"))
+                longitude = location.get("center_longitude", location.get("longitude", "unknown"))
                 
                 logger.info(f"[ALERT CHECK] Checking hotspot: severity={severity}, avg_risk={avg_risk}, is_update={is_update}")
                 
-                # Filter updates that aren't significant
-                if is_update and not (is_significant or severity_changed):
-                    logger.info(f"[ALERT FILTERED] Hotspot update {hotspot_id} isn't significant, skipping")
-                    return None
-                
-                # Check cooldown if Redis is available
-                if self.redis_client and is_update:
-                    cooldown_key = f"alert:cooldown:hotspot:{hotspot_id}"
+                # Check cooldown using circuit breaker
+                in_cooldown = False
+                if self.redis_client:
+                    def check_cooldown():
+                        cooldown_key = alert_cooldown_key(hotspot_id)
+                        return self.redis_client.exists(cooldown_key)
                     
-                    # Skip if in cooldown (only for updates, not new hotspots)
-                    if self.redis_client.exists(cooldown_key):
+                    in_cooldown = self.circuit_breaker.execute(check_cooldown)
+                    
+                    # If circuit breaker is open or cooldown exists, skip
+                    if in_cooldown:
                         logger.info(f"[ALERT FILTERED] Hotspot {hotspot_id} is in cooldown period, skipping")
                         return None
                     
-                    # Set cooldown based on severity
-                    if severity == "high":
-                        cooldown_seconds = 900  # 15 minutes
-                    elif severity == "medium":
-                        cooldown_seconds = 1800  # 30 minutes
-                    else:
-                        cooldown_seconds = 3600  # 60 minutes
+                    # Set cooldown period safely
+                    def set_cooldown():
+                        cooldown_key = alert_cooldown_key(hotspot_id)
+                        # Set cooldown based on severity
+                        if severity == "high":
+                            cooldown_seconds = 900  # 15 minutes
+                        elif severity == "medium":
+                            cooldown_seconds = 1800  # 30 minutes
+                        else:
+                            cooldown_seconds = 3600  # 60 minutes
+                        
+                        self.redis_client.setex(cooldown_key, cooldown_seconds, "1")
                     
-                    self.redis_client.setex(cooldown_key, cooldown_seconds, "1")
+                    # Use circuit breaker to set cooldown
+                    self.circuit_breaker.execute(set_cooldown)
                 
                 # Check severity - if medium or high, this is an alert
                 if severity in ["medium", "high"]:
@@ -373,7 +432,7 @@ class AlertExtractor(MapFunction):
                     logger.info(f"[ALERT FILTERED] Hotspot severity '{severity}' not high enough for alert")
                     return None
             
-            # Not an event or hotspot
+            # Not a hotspot
             return None
             
         except Exception as e:
@@ -391,6 +450,12 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         self.timer_state = None
         self.first_event_processed = None
         self.hotspot_manager = None
+        self.confidence_model = None
+        
+        # Limiti di memoria
+        self.MAX_POINTS_IN_MEMORY = MAX_POINTS_IN_MEMORY
+        self.SOFT_CLEANUP_THRESHOLD = SOFT_CLEANUP_THRESHOLD
+        self.MIN_POINTS_TO_KEEP = MIN_POINTS_TO_KEEP
         
     def open(self, runtime_context):
         # State to store pollution points
@@ -416,7 +481,55 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Initialize HotspotManager
         self.hotspot_manager = HotspotManager()
         
-        logger.info("SpatialClusteringProcessor initialized with HotspotManager")
+        # Load ML model from MinIO with retry
+        self._load_confidence_model_with_retry()
+        
+        logger.info("[DEBUG] SpatialClusteringProcessor initialized with HotspotManager and ML Model")
+    
+    def _load_confidence_model_with_retry(self):
+        """Load the confidence estimation model with retry logic"""
+        for attempt in range(MAX_RETRIES):
+            try:
+                self._load_confidence_model()
+                if self.confidence_model:
+                    logger.info(f"Successfully loaded confidence model on attempt {attempt+1}")
+                    return
+            except Exception as e:
+                wait_time = BACKOFF_FACTOR ** attempt
+                logger.warning(f"Model loading attempt {attempt+1}/{MAX_RETRIES} failed: {e}. Retrying in {wait_time}s")
+                time.sleep(wait_time)
+        
+        logger.error("Failed to load confidence model after multiple attempts, using heuristic method")
+        self.confidence_model = None
+    
+    def _load_confidence_model(self):
+        """Load the confidence estimation model from MinIO"""
+        try:
+            import boto3
+            
+            s3_client = boto3.client(
+                's3',
+                endpoint_url=f'http://{MINIO_ENDPOINT}',
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY
+            )
+            
+            # Load confidence estimation model
+            model_key = "pollution_detection/confidence_estimator_v1.pkl"
+            
+            try:
+                logger.info(f"Loading confidence estimation model from models/{model_key}")
+                response = s3_client.get_object(Bucket="models", Key=model_key)
+                model_bytes = response['Body'].read()
+                self.confidence_model = pickle.loads(model_bytes)
+                logger.info("Confidence estimation model loaded successfully")
+            except Exception as e:
+                logger.error(f"Error loading confidence estimation model: {e}")
+                logger.info("Will use heuristic confidence estimation instead")
+                self.confidence_model = None
+        except Exception as e:
+            logger.error(f"Error in model loading: {e}")
+            self.confidence_model = None
     
     def process_element(self, value, ctx):
         try:
@@ -437,8 +550,11 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             source_type = event_detection["detection_source"]
             severity = event_detection["severity"]
             
+            logger.info(f"[DEBUG] Processing event: {event_id} from {source_type} with risk {risk_score}, severity: {severity}")
+            
             # Skip if already processed
             if self.processed_events.contains(event_id):
+                logger.info(f"[DEBUG] Event {event_id} already processed, skipping")
                 return
             
             # Mark as processed
@@ -460,44 +576,173 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             # Store point in state
             point_key = f"{event_id}"
             self.points_state.put(point_key, json.dumps(point_data))
+            logger.info(f"[DEBUG] Stored point: {point_key}")
             
-            # Check if this is the first event - if so, schedule initial timer
-            if self.first_event_processed.value() is None:
-                # Schedule an initial clustering after a short delay
-                current_time = ctx.timestamp() or int(time.time() * 1000)
-                next_trigger = current_time + 10000  # 10 seconds from now
-                ctx.timer_service().register_processing_time_timer(next_trigger)
-                self.timer_state.update(next_trigger)
-                logger.info(f"Scheduled initial clustering at {next_trigger}")
-                
-                # Mark first event as processed
-                self.first_event_processed.update(True)
-            else:
-                # Set timer for clustering (if not already set or too far in future)
-                current_time = ctx.timestamp() or int(time.time() * 1000)
-                existing_timer = self.timer_state.value()
-                
-                # Schedule a timer if none exists or if existing timer is too far in the future
-                if existing_timer is None or (existing_timer - current_time) > CLUSTERING_INTERVAL_MS:
-                    trigger_time = current_time + CLUSTERING_INTERVAL_MS
-                    ctx.timer_service().register_processing_time_timer(trigger_time)
-                    self.timer_state.update(trigger_time)
-                    logger.info(f"Scheduled clustering at {trigger_time} (in {CLUSTERING_INTERVAL_MS/1000} seconds)")
+            # NUOVO: Controlla limiti di memoria dopo ogni inserimento
+            self._enforce_memory_limits()
             
-            # Count total points in state for monitoring
+            # MIGLIORATO: Timer deterministico basato su time windows
+            self._schedule_deterministic_timer(ctx)
+            
+            # Debug: Count total points in state
             point_count = sum(1 for _ in self.points_state.keys())
-            if point_count % 10 == 0:  # Log every 10 points to avoid spam
-                logger.info(f"Total points in state: {point_count}")
+            logger.info(f"[DEBUG] Total points in state: {point_count}")
         
         except Exception as e:
             logger.error(f"[ERROR] Error in spatial clustering processor: {e}")
             traceback.print_exc()
     
+    def _schedule_deterministic_timer(self, ctx):
+        """Schedule deterministic timer based on time windows"""
+        try:
+            # Check if first event
+            if self.first_event_processed.value() is None:
+                # Mark first event as processed
+                self.first_event_processed.update(True)
+                
+                # Schedule an initial clustering after a short delay
+                current_time = ctx.timestamp() or int(time.time() * 1000)
+                next_trigger = current_time + 10000  # 10 seconds from now
+                ctx.timer_service().register_processing_time_timer(next_trigger)
+                self.timer_state.update(next_trigger)
+                logger.info(f"[TIMER] Scheduled initial clustering at {next_trigger}")
+                return
+            
+            # Get current time
+            current_time = ctx.timestamp() or int(time.time() * 1000)
+            
+            # Calculate deterministic window boundary
+            window_start = (current_time // CLUSTERING_INTERVAL_MS) * CLUSTERING_INTERVAL_MS
+            next_window = window_start + CLUSTERING_INTERVAL_MS
+            
+            # Get existing timer
+            existing_timer = self.timer_state.value()
+            
+            # Only schedule if different from existing
+            if existing_timer != next_window:
+                # Cancel existing timer if present
+                if existing_timer is not None:
+                    ctx.timer_service().delete_processing_time_timer(existing_timer)
+                
+                # Register new timer
+                ctx.timer_service().register_processing_time_timer(next_window)
+                self.timer_state.update(next_window)
+                logger.info(f"[TIMER] Scheduled deterministic clustering at {next_window}")
+        except Exception as e:
+            logger.error(f"[TIMER ERROR] Error scheduling timer: {e}")
+            self._schedule_recovery_timer(ctx)
+    
+    def _schedule_recovery_timer(self, ctx):
+        """Fallback timer in case of errors"""
+        try:
+            current_time = int(time.time() * 1000)
+            recovery_time = current_time + CLUSTERING_INTERVAL_MS
+            ctx.timer_service().register_processing_time_timer(recovery_time)
+            self.timer_state.update(recovery_time)
+            logger.info(f"[RECOVERY] Scheduled recovery timer at {recovery_time}")
+        except Exception as e:
+            logger.error(f"[RECOVERY FAILED] Unable to schedule recovery timer: {e}")
+    
+    def _enforce_memory_limits(self):
+        """Enforce memory limits to prevent OOM errors"""
+        try:
+            # Count points
+            points_count = sum(1 for _ in self.points_state.keys())
+            
+            # Apply hard limit
+            if points_count >= self.MAX_POINTS_IN_MEMORY:
+                logger.warning(f"[MEMORY] Hard limit reached: {points_count} points")
+                self._aggressive_cleanup()
+            # Apply soft limit
+            elif points_count >= self.SOFT_CLEANUP_THRESHOLD:
+                logger.info(f"[MEMORY] Soft limit reached: {points_count} points")
+                self._smart_cleanup()
+        except Exception as e:
+            logger.error(f"[MEMORY] Error enforcing memory limits: {e}")
+    
+    def _aggressive_cleanup(self):
+        """Aggressive cleanup to enforce hard memory limit"""
+        try:
+            # Collect points with timestamps
+            point_timestamps = []
+            for point_key in list(self.points_state.keys()):
+                point_json = self.points_state.get(point_key)
+                if point_json:
+                    point = json.loads(point_json)
+                    point_timestamps.append((point["timestamp"], point_key))
+            
+            # Sort by timestamp (oldest first)
+            point_timestamps.sort()
+            
+            # Calculate points to remove
+            target_count = self.SOFT_CLEANUP_THRESHOLD
+            points_to_remove = max(0, len(point_timestamps) - target_count)
+            
+            # Ensure we don't remove too many points
+            points_to_remove = min(points_to_remove, len(point_timestamps) - self.MIN_POINTS_TO_KEEP)
+            
+            # Remove oldest points
+            removed_count = 0
+            for timestamp, point_key in point_timestamps[:points_to_remove]:
+                self.points_state.remove(point_key)
+                removed_count += 1
+            
+            logger.info(f"[CLEANUP] Aggressive cleanup removed {removed_count} oldest points")
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error in aggressive cleanup: {e}")
+    
+    def _smart_cleanup(self):
+        """Smart cleanup based on point quality"""
+        try:
+            # Collect points with priority scores
+            point_priorities = []
+            current_time = int(time.time() * 1000)
+            
+            for point_key in list(self.points_state.keys()):
+                point_json = self.points_state.get(point_key)
+                if point_json:
+                    point = json.loads(point_json)
+                    
+                    # Calculate priority score (higher = more important)
+                    age_hours = (current_time - point["timestamp"]) / (1000 * 60 * 60)
+                    recency_score = max(0, 24 - age_hours) / 24  # 0-1, more recent is better
+                    risk_score = point["risk_score"]  # 0-1, higher is better
+                    
+                    # Bonus for source diversity
+                    source_bonus = 0.1 if point["source_type"] == "satellite" else 0.0
+                    
+                    # Calculate final priority
+                    priority = (recency_score * 0.4) + (risk_score * 0.5) + source_bonus
+                    point_priorities.append((priority, point_key))
+            
+            # Sort by priority (lowest first = to be removed)
+            point_priorities.sort()
+            
+            # Calculate points to remove (20% of low priority)
+            points_to_remove = max(0, min(len(point_priorities) // 5, 
+                                       len(point_priorities) - self.MIN_POINTS_TO_KEEP))
+            
+            # Remove lowest priority points
+            removed_count = 0
+            for priority, point_key in point_priorities[:points_to_remove]:
+                self.points_state.remove(point_key)
+                removed_count += 1
+            
+            logger.info(f"[CLEANUP] Smart cleanup removed {removed_count} low-priority points")
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error in smart cleanup: {e}")
+    
     def on_timer(self, timestamp, ctx):
         try:
+            # Verify this is the expected timer
+            expected_timer = self.timer_state.value()
+            if expected_timer != timestamp:
+                logger.warning(f"[TIMER] Unexpected timer {timestamp}, expected {expected_timer}")
+                return
+            
             # Reset timer state
             self.timer_state.clear()
-            logger.info(f"[DEBUG] Timer triggered at {timestamp}")
+            logger.info(f"[TIMER] Timer triggered at {timestamp}")
             
             # Collect all points
             points = []
@@ -524,11 +769,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                     logger.info(f"[HOTSPOT GENERATED] Single-point test hotspot: {managed_hotspot['hotspot_id']} (confidence: {managed_hotspot['confidence_score']})")
                     yield json.dumps(managed_hotspot)
                 
-                # Schedule next timer
-                next_trigger = int(time.time() * 1000) + CLUSTERING_INTERVAL_MS
-                ctx.timer_service().register_processing_time_timer(next_trigger)
-                self.timer_state.update(next_trigger)
-                logger.info(f"[DEBUG] Scheduled next clustering at {next_trigger}")
+                # Schedule next deterministic timer
+                self._schedule_next_deterministic_timer(ctx, timestamp)
                 return
             
             # Perform DBSCAN clustering
@@ -551,8 +793,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                 # Calculate cluster characteristics
                 hotspot = self._analyze_cluster(cluster_id, cluster_points)
                 
-                # Estimate confidence
-                confidence = self._estimate_confidence(cluster_points)
+                # Estimate confidence using ML model or fallback to heuristic
+                confidence = self._estimate_confidence_ml(cluster_points)
                 hotspot["confidence_score"] = confidence
                 
                 logger.info(f"[DEBUG] Cluster {cluster_id}: {len(cluster_points)} points, confidence {confidence:.2f}")
@@ -570,31 +812,39 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             
             logger.info(f"[DEBUG] Published {hotspots_published} hotspots")
             
-            # Clean up old points
+            # Clean up old points - improved cleanup
             self._clean_old_points()
             
-            # Schedule next timer
-            next_trigger = int(time.time() * 1000) + CLUSTERING_INTERVAL_MS
-            ctx.timer_service().register_processing_time_timer(next_trigger)
-            self.timer_state.update(next_trigger)
-            logger.info(f"[DEBUG] Scheduled next clustering at {next_trigger}")
+            # Schedule next deterministic timer
+            self._schedule_next_deterministic_timer(ctx, timestamp)
         
         except Exception as e:
             logger.error(f"[ERROR] Error in clustering timer: {e}")
             traceback.print_exc()
             
             # Ensure next timer is scheduled even on error
-            try:
-                next_trigger = int(time.time() * 1000) + CLUSTERING_INTERVAL_MS
-                ctx.timer_service().register_processing_time_timer(next_trigger)
-                self.timer_state.update(next_trigger)
-                logger.info(f"[DEBUG] Scheduled next clustering after error at {next_trigger}")
-            except Exception as timer_error:
-                logger.error(f"[ERROR] Failed to schedule next timer: {timer_error}")
+            self._schedule_recovery_timer(ctx)
+    
+    def _schedule_next_deterministic_timer(self, ctx, current_timestamp):
+        """Schedule next deterministic timer"""
+        try:
+            # Calculate next window boundary
+            next_trigger = ((current_timestamp // CLUSTERING_INTERVAL_MS) + 1) * CLUSTERING_INTERVAL_MS
+            ctx.timer_service().register_processing_time_timer(next_trigger)
+            self.timer_state.update(next_trigger)
+            logger.info(f"[TIMER] Scheduled next clustering at {next_trigger}")
+        except Exception as e:
+            logger.error(f"[TIMER ERROR] Error scheduling next timer: {e}")
+            self._schedule_recovery_timer(ctx)
     
     def _create_single_point_hotspot(self, point):
         """Create a test hotspot from a single point"""
-        hotspot_id = f"test-hotspot-{uuid.uuid4()}"
+        # Genera ID deterministico per il singolo punto
+        lat_rounded = round(point["latitude"], 3)
+        lon_rounded = round(point["longitude"], 3)
+        time_bucket = (int(time.time() * 1000) // (30 * 60 * 1000)) * (30 * 60 * 1000)
+        id_base = f"{lat_rounded}_{lon_rounded}_{point['pollutant_type']}_{time_bucket}"
+        hotspot_id = f"hotspot-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
         
         hotspot = {
             "hotspot_id": hotspot_id,
@@ -615,7 +865,9 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             "points": [point],
             "environmental_reference": point.get("environmental_reference", {}),
             "confidence_score": 0.5,  # Medium confidence for testing
-            "test_generated": True  # Flag indicating this is a test hotspot
+            "test_generated": True,  # Flag indicating this is a test hotspot
+            "parent_hotspot_id": None,  # Campi di relazione
+            "derived_from": None       # Campi di relazione
         }
         
         return hotspot
@@ -689,6 +941,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         
         return clusters
     
+    # Analyze cluster method con ID deterministico
     def _analyze_cluster(self, cluster_id, points):
         """Calculate cluster characteristics"""
         # Extract coordinates
@@ -734,9 +987,20 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Determine severity
         severity = "high" if avg_risk > HIGH_RISK_THRESHOLD else "medium" if avg_risk > MEDIUM_RISK_THRESHOLD else "low"
         
+        # Genera ID deterministico
+        # Arrotonda coordinate e timestamp per stabilità
+        lat_rounded = round(center_latitude, 2)
+        lon_rounded = round(center_longitude, 2)
+        current_time = int(time.time() * 1000)
+        time_bucket = (current_time // (30 * 60 * 1000)) * (30 * 60 * 1000)
+        
+        # Crea ID base usando le caratteristiche fisiche
+        id_base = f"{lat_rounded}_{lon_rounded}_{dominant_pollutant}_{time_bucket}"
+        deterministic_id = f"hotspot-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
+        
         # Create hotspot data
         hotspot = {
-            "hotspot_id": f"hotspot-{uuid.uuid4()}",
+            "hotspot_id": deterministic_id,  # ID deterministico
             "cluster_id": cluster_id,
             "detected_at": int(time.time() * 1000),
             "location": {
@@ -752,30 +1016,69 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             "source_diversity": len(source_counts),
             "time_span_hours": time_span_hours,
             "points": points,
-            "environmental_reference": environmental_reference
+            "environmental_reference": environmental_reference,
+            "parent_hotspot_id": None,  # Inizialmente nullo, sarà impostato da HotspotManager
+            "derived_from": None        # Inizialmente nullo, sarà impostato da HotspotManager
         }
         
         return hotspot
     
-    def _estimate_confidence(self, points):
-        """Estimate confidence level of a cluster using heuristic model"""
-        # Simple heuristic-based confidence estimation
-        # In a real implementation, this would use the trained Random Forest model
-        
-        # Calculate features
-        num_points = len(points)
-        risks = [p["risk_score"] for p in points]
-        avg_risk = sum(risks) / len(risks)
-        max_risk = max(risks)
-        
-        # Count unique sources
-        sources = set(p["source_type"] for p in points)
-        source_diversity = len(sources)
-        
-        # Time span
-        timestamps = [p["timestamp"] for p in points]
-        time_span_hours = (max(timestamps) - min(timestamps)) / (1000 * 60 * 60)
-        
+    def _estimate_confidence_ml(self, points):
+        """
+        Estimate confidence level of a cluster using the ML model.
+        Falls back to heuristic method if model is not available.
+        """
+        try:
+            # Calculate features
+            num_points = len(points)
+            risks = [p["risk_score"] for p in points]
+            avg_risk = sum(risks) / len(risks)
+            max_risk = max(risks)
+            
+            # Count unique sources
+            sources = set(p["source_type"] for p in points)
+            source_diversity = len(sources) / 2.0  # Normalize to 0-1 range (assuming max 2 sources)
+            
+            # Time span
+            timestamps = [p["timestamp"] for p in points]
+            time_span_hours = (max(timestamps) - min(timestamps)) / (1000 * 60 * 60)
+            
+            # Check if ML model is available
+            if self.confidence_model is not None:
+                # Prepare features for the model
+                features = np.array([[
+                    num_points,
+                    avg_risk,
+                    max_risk,
+                    source_diversity,
+                    time_span_hours
+                ]])
+                
+                # Make prediction
+                confidence = self.confidence_model.predict(features)[0]
+                logger.info(f"[ML] Confidence estimated using ML model: {confidence:.2f}")
+                
+                # Ensure confidence is between 0 and 1
+                confidence = max(0, min(1, confidence))
+                
+                return confidence
+            else:
+                # Fall back to heuristic method
+                logger.info(f"[ML] Using heuristic confidence estimation (model not available)")
+                return self._estimate_confidence_heuristic(num_points, avg_risk, source_diversity, time_span_hours)
+                
+        except Exception as e:
+            logger.error(f"Error in ML confidence estimation: {e}")
+            logger.error(traceback.format_exc())
+            
+            # Fall back to heuristic method
+            return self._estimate_confidence_heuristic(len(points), 
+                                                      sum([p["risk_score"] for p in points]) / len(points),
+                                                      len(set(p["source_type"] for p in points)) / 2.0,
+                                                      (max([p["timestamp"] for p in points]) - min([p["timestamp"] for p in points])) / (1000 * 60 * 60))
+    
+    def _estimate_confidence_heuristic(self, num_points, avg_risk, source_diversity, time_span_hours):
+        """Heuristic-based confidence estimation as fallback"""
         # Base confidence starts at 0.3
         confidence = 0.3
         
@@ -799,24 +1102,27 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
     
     def _clean_old_points(self):
         """Remove old points from state"""
-        current_time = int(time.time() * 1000)
-        keys_to_remove = []
-        
-        for point_key in list(self.points_state.keys()):
-            point_json = self.points_state.get(point_key)
-            if point_json:
-                point = json.loads(point_json)
-                timestamp = point["timestamp"]
-                
-                # Remove points older than TIME_WINDOW_HOURS
-                if (current_time - timestamp) > (TIME_WINDOW_HOURS * 60 * 60 * 1000):
-                    keys_to_remove.append(point_key)
-        
-        for key in keys_to_remove:
-            self.points_state.remove(key)
-        
-        if keys_to_remove:
-            logger.info(f"[DEBUG] Cleaned {len(keys_to_remove)} old points")
+        try:
+            current_time = int(time.time() * 1000)
+            keys_to_remove = []
+            
+            for point_key in list(self.points_state.keys()):
+                point_json = self.points_state.get(point_key)
+                if point_json:
+                    point = json.loads(point_json)
+                    timestamp = point["timestamp"]
+                    
+                    # Remove points older than TIME_WINDOW_HOURS
+                    if (current_time - timestamp) > (TIME_WINDOW_HOURS * 60 * 60 * 1000):
+                        keys_to_remove.append(point_key)
+            
+            for key in keys_to_remove:
+                self.points_state.remove(key)
+            
+            if keys_to_remove:
+                logger.info(f"[DEBUG] Cleaned {len(keys_to_remove)} old points")
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error in old points cleanup: {e}")
     
     def _haversine_distance(self, lat1, lon1, lat2, lon2):
         """Calculate distance between two points in kilometers"""
@@ -831,6 +1137,36 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         r = 6371  # Radius of earth in kilometers
         
         return c * r
+
+# Funzione per la chiave spaziale
+def create_spatial_key(data):
+    try:
+        event = json.loads(data).get("pollution_event_detection")
+        if not event or "location" not in event:
+            return "default_key"
+            
+        lat = event["location"]["latitude"]
+        lon = event["location"]["longitude"]
+        
+        # Determina la cella principale
+        grid_lat = int(lat / 0.5)
+        grid_lon = int(lon / 0.5)
+        
+        # Calcola distanza dai bordi in gradi
+        lat_remainder = lat % 0.5
+        lon_remainder = lon % 0.5
+        
+        # Se il punto è vicino al confine (entro 5km ~ 0.05 gradi), 
+        # usa una chiave speciale che sarà sempre inviata allo stesso task
+        border_distance = 0.05
+        if (lat_remainder < border_distance or lat_remainder > (0.5 - border_distance) or
+            lon_remainder < border_distance or lon_remainder > (0.5 - border_distance)):
+            return "boundary_region"
+            
+        return f"grid_{grid_lat}_{grid_lon}"
+    except Exception as e:
+        logger.error(f"[SPATIAL KEY] Error creating spatial key: {e}")
+        return "default_key"
 
 def wait_for_services():
     """Wait for Kafka to be available"""
@@ -853,7 +1189,30 @@ def wait_for_services():
     if not kafka_ready:
         logger.error("Kafka not available after multiple attempts")
     
-    return kafka_ready
+    # Check MinIO
+    minio_ready = False
+    for i in range(10):
+        try:
+            import boto3
+            s3 = boto3.client(
+                's3',
+                endpoint_url=f"http://{MINIO_ENDPOINT}",
+                aws_access_key_id=MINIO_ACCESS_KEY,
+                aws_secret_access_key=MINIO_SECRET_KEY
+            )
+            buckets = s3.list_buckets()
+            bucket_names = [b['Name'] for b in buckets.get('Buckets', [])]
+            minio_ready = True
+            logger.info(f"MinIO is ready, available buckets: {bucket_names}")
+            break
+        except Exception:
+            logger.info(f"Waiting for MinIO... ({i+1}/10)")
+            time.sleep(5)
+    
+    if not minio_ready:
+        logger.error("MinIO not available after multiple attempts")
+    
+    return kafka_ready and minio_ready
 
 def main():
     """Main entry point for the Pollution Detector job"""
@@ -930,18 +1289,9 @@ def main():
     # 4. Send all events to analyzed_data topic
     all_events.add_sink(analyzed_producer).name("Publish_All_Analyzed_Data")
     
-    # 5. Extract alerts from events using proper deserialization
-    event_alerts = all_events \
-        .map(AlertExtractor(), output_type=Types.STRING()) \
-        .filter(lambda x: x is not None) \
-        .name("Extract_Event_Alerts")
-    
-    # 6. Send alerts to alert topic
-    event_alerts.add_sink(alert_producer).name("Publish_Event_Alerts")
-    
-    # 7. Perform spatial clustering
+    # 7. Perform spatial clustering - MODIFICATO: usa create_spatial_key
     hotspots = all_events \
-        .key_by(lambda x: "global_key") \
+        .key_by(create_spatial_key) \
         .process(SpatialClusteringProcessor(), output_type=Types.STRING()) \
         .name("Spatial_Clustering")
     

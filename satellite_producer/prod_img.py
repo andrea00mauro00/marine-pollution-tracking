@@ -5,16 +5,13 @@ import time
 import json
 import pathlib
 import traceback
-import logging
-from pythonjsonlogger import jsonlogger
 from datetime import date, timedelta, datetime
+from loguru import logger
 from sentinelhub import SHConfig, SentinelHubCatalog
 import boto3
 from botocore.exceptions import ClientError
-from confluent_kafka import SerializingProducer
-from confluent_kafka.schema_registry import SchemaRegistryClient
-from confluent_kafka.schema_registry.avro import AvroSerializer
 from kafka import KafkaProducer
+from kafka.errors import KafkaError
 
 # ─────────────────── PATH HACK (import Utils.* outside container) ──────────
 UTILS_DIR = pathlib.Path(__file__).resolve().parent / "utils"
@@ -27,12 +24,11 @@ from Utils.imgfetch_utils import (
     true_color_image_request_processing,
     process_image,
 )
-from Utils.buoy_utils import fetch_buoy_positions, bbox_around
+from satellite_producer.utils.buoy_utils import fetch_buoy_positions, bbox_around
 
 # ---- env-var ---------------------------------------------------------------
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "satellite_imagery")
 KAFKA_BROKERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092").split(",")
-SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 DLQ_TOPIC = os.getenv("DLQ_TOPIC", "satellite_imagery_dlq")
 
 POLL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", "900"))
@@ -44,26 +40,6 @@ MINIO_BUCKET = os.getenv("MINIO_BUCKET", "bronze")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
-
-# ---- Logger Setup ----------------------------------------------------------
-logHandler = logging.StreamHandler(sys.stdout)
-formatter = jsonlogger.JsonFormatter(
-    '%(asctime)s %(name)s %(levelname)s %(message)s',
-    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
-)
-logHandler.setFormatter(formatter)
-
-logger = logging.getLogger(__name__)
-logger.addHandler(logHandler)
-logger.setLevel(logging.INFO)
-
-# Add component to all log messages
-old_factory = logging.getLogRecordFactory()
-def record_factory(*args, **kwargs):
-    record = old_factory(*args, **kwargs)
-    record.component = 'satellite-producer'
-    return record
-logging.setLogRecordFactory(record_factory)
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -100,7 +76,7 @@ def get_minio_client():
         client.head_bucket(Bucket=MINIO_BUCKET)
     except ClientError:
         client.create_bucket(Bucket=MINIO_BUCKET)
-        logger.info(f"Created MinIO bucket '{MINIO_BUCKET}'")
+        logger.success(f"Created MinIO bucket '{MINIO_BUCKET}'")
     return client
 
 def pick_best_scene(cfg: SHConfig, bbox):
@@ -116,48 +92,20 @@ def pick_best_scene(cfg: SHConfig, bbox):
     )
     return next(search, None)
 
-def create_schema_registry_producer(schema_path):
-    """Creates a Kafka producer with Schema Registry integration"""
-    try:
-        # Create Schema Registry client
-        schema_registry_conf = {'url': SCHEMA_REGISTRY_URL}
-        schema_registry_client = SchemaRegistryClient(schema_registry_conf)
-        
-        # Get the Avro schema
+def create_kafka_producer():
+    """Creates a regular Kafka producer"""
+    logger.info("Creating Kafka JSON producer")
+    for _ in range(5):
         try:
-            with open(schema_path, 'r') as f:
-                schema_str = f.read()
-        except FileNotFoundError:
-            logger.error(f"Schema file {schema_path} not found, cannot proceed with Schema Registry")
-            raise FileNotFoundError(f"Required schema file {schema_path} not found")
-        
-        # Create Avro serializer
-        avro_serializer = AvroSerializer(
-            schema_registry_client, 
-            schema_str, 
-            lambda x, ctx: x  # Value to dict conversion function
-        )
-        
-        # Configure Kafka producer with Avro serializer
-        producer_conf = {
-            'bootstrap.servers': ','.join(KAFKA_BROKERS),
-            'value.serializer': avro_serializer,
-            'error.cb': on_delivery_error
-        }
-        
-        return SerializingProducer(producer_conf)
-    except Exception as e:
-        logger.error(f"Failed to create Schema Registry producer: {e}")
-        logger.error(traceback.format_exc())
-        return create_fallback_producer()
-
-def create_fallback_producer():
-    """Creates a regular Kafka producer for fallback"""
-    logger.warning("Using fallback JSON producer without Schema Registry")
-    return KafkaProducer(
-        bootstrap_servers=KAFKA_BROKERS,
-        value_serializer=lambda v: v.encode('utf-8')
-    )
+            return KafkaProducer(
+                bootstrap_servers=KAFKA_BROKERS,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            )
+        except Exception as e:
+            logger.warning(f"Kafka not reachable, retrying in 5s: {e}")
+            time.sleep(5)
+    logger.critical("Failed to connect to Kafka after 5 attempts. Exiting.")
+    sys.exit(1)
 
 def on_delivery_error(err, msg):
     """Error callback for Kafka producer"""
@@ -189,15 +137,11 @@ def on_delivery_error(err, msg):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    # Try to use Schema Registry producer
-    schema_path = "schemas/avro/satellite_imagery.avsc"
-    try:
-        producer = create_schema_registry_producer(schema_path)
-        logger.info("✅ Connected to Kafka with Schema Registry")
-    except Exception as e:
-        logger.error(f"Schema Registry error: {e}")
-        producer = create_fallback_producer()
-        logger.info("✅ Connected to Kafka using fallback producer")
+    logger.add(lambda m: print(m, end=""), level="INFO")
+    
+    # Create Kafka producer
+    producer = create_kafka_producer()
+    logger.success("✅ Connected to Kafka")
     
     sh_cfg = build_sh_config()
     minio_cli = get_minio_client()
@@ -254,35 +198,17 @@ def main() -> None:
 
                     # --- send to Kafka --------------------------------------------------------
                     try:
-                        # Handle different producer types
-                        if isinstance(producer, SerializingProducer):
-                            # Prepare payload for Avro schema
-                            if isinstance(payload, str):
-                                # Parse JSON string to dict
-                                payload_dict = json.loads(payload)
-                            else:
-                                payload_dict = payload
-                            
-                            # Create Avro-compliant payload
-                            avro_payload = {
-                                "image_pointer": payload_dict.get("image_pointer", ""),
-                                "metadata": payload_dict  # Use the entire dict as metadata
-                            }
-                                
-                            # Use SerializingProducer's produce method
-                            producer.produce(
-                                topic=KAFKA_TOPIC,
-                                value=avro_payload,
-                                on_delivery=lambda err, msg: logger.error(f"Message delivery failed: {err}") if err else None
-                            )
-                            # Manual flush for proper error handling
-                            producer.flush()
+                        # Prepare the message payload
+                        if isinstance(payload, str):
+                            kafka_payload = json.loads(payload)
                         else:
-                            # Standard KafkaProducer
-                            producer.send(KAFKA_TOPIC, value=payload) \
-                                    .add_callback(on_send_success) \
-                                    .add_errback(on_send_error)
-                            producer.flush()
+                            kafka_payload = payload
+                            
+                        # Send to Kafka
+                        producer.send(KAFKA_TOPIC, value=kafka_payload) \
+                                .add_callback(on_send_success) \
+                                .add_errback(on_send_error)
+                        producer.flush()
                         
                         logger.info(f"🛰️ Buoy {buoy_id} → image + metadata JSON sent")
                     except Exception as e:

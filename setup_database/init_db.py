@@ -149,6 +149,9 @@ def init_postgres():
             password=POSTGRES_PASSWORD
         ) as conn:
             with conn.cursor() as cur:
+                # Imposta timeout predefinito
+                cur.execute("SET statement_timeout = '30000';")  # 30 secondi
+                
                 # Esegui tutti gli script SQL nella directory init_scripts/postgres
                 script_dir = Path("init_scripts/postgres")
                 for sql_file in sorted(script_dir.glob("*.sql")):
@@ -156,6 +159,33 @@ def init_postgres():
                     with open(sql_file, "r") as f:
                         sql_script = f.read()
                         cur.execute(sql_script)
+                
+                # Aggiorna lo schema della tabella pollution_alerts se necessario
+                try:
+                    logger.info("Verifica e aggiunta colonne necessarie alla tabella pollution_alerts")
+                    cur.execute("""
+                        ALTER TABLE IF EXISTS pollution_alerts 
+                        ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
+                        ADD COLUMN IF NOT EXISTS superseded_by TEXT DEFAULT NULL,
+                        ADD COLUMN IF NOT EXISTS supersedes TEXT DEFAULT NULL,
+                        ADD COLUMN IF NOT EXISTS recommendations JSONB DEFAULT NULL
+                    """)
+                    
+                    # Crea indici per le nuove colonne
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_status ON pollution_alerts(status);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_superseded_by ON pollution_alerts(superseded_by);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_supersedes ON pollution_alerts(supersedes);")
+                    
+                    # Aggiunta indici spaziali
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_lat ON pollution_alerts(latitude);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_lon ON pollution_alerts(longitude);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_latlon ON pollution_alerts(latitude, longitude);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_type_status ON pollution_alerts(pollutant_type, status);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_time_status ON pollution_alerts(alert_time, status);")
+                    
+                    logger.info("✅ Schema pollution_alerts aggiornato con successo")
+                except Exception as e:
+                    logger.warning(f"Errore nell'aggiornamento dello schema pollution_alerts: {e}")
                 
                 conn.commit()
                 logger.info("✅ Schema PostgreSQL inizializzato con successo")
@@ -170,33 +200,87 @@ def init_redis():
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
         
-        # Pulisci tutte le chiavi esistenti legate agli hotspot
-        existing_keys = r.keys("hotspot:*") + r.keys("spatial:*") + r.keys("config:hotspot:*")
+        # Pulisci tutte le chiavi esistenti
+        existing_keys = r.keys("hotspot:*") + r.keys("spatial:*") + r.keys("config:*") + \
+                        r.keys("counters:*") + r.keys("dashboard:*") + r.keys("alert:*") + \
+                        r.keys("locks:*") + r.keys("recommendations:*")  # Aggiunto recommendations:*
         if existing_keys:
             r.delete(*existing_keys)
             logger.info(f"Rimosse {len(existing_keys)} chiavi Redis esistenti")
         
         # Configurazione sistema
-        r.set("config:hotspot:spatial_bin_size", "0.05")     # Dimensione griglia spaziale in gradi (~5km)
-        r.set("config:hotspot:ttl_hours", "72")              # Tempo di vita massimo hotspot attivi
-        r.set("config:alert:cooldown_minutes:low", "60")     # Cooldown per alert a bassa priorità
-        r.set("config:alert:cooldown_minutes:medium", "30")  # Cooldown per alert a media priorità
-        r.set("config:alert:cooldown_minutes:high", "15")    # Cooldown per alert ad alta priorità
-        r.set("config:prediction:min_interval_minutes", "30") # Intervallo minimo tra previsioni
+        r.set("config:hotspot:spatial_bin_size", "0.05")       # Dimensione griglia spaziale in gradi (~5km)
+        r.set("config:hotspot:ttl_hours", "72")                # Tempo di vita massimo hotspot attivi
+        r.set("config:alert:cooldown_minutes:low", "60")       # Cooldown per alert a bassa priorità
+        r.set("config:alert:cooldown_minutes:medium", "30")    # Cooldown per alert a media priorità
+        r.set("config:alert:cooldown_minutes:high", "15")      # Cooldown per alert ad alta priorità
+        r.set("config:prediction:min_interval_minutes", "30")  # Intervallo minimo tra previsioni
+        
+        # Configurazioni per cache e dashboard
+        r.set("config:cache:dashboard_refresh_seconds", "60")  # Intervallo aggiornamento dashboard
+        r.set("config:cache:alerts_ttl", "3600")               # TTL per cache alert (1 ora)
+        r.set("config:cache:sensor_data_ttl", "1800")          # TTL per dati sensori (30 minuti)
+        r.set("config:cache:predictions_ttl", "7200")          # TTL per previsioni (2 ore)
+        r.set("config:dashboard:max_items", "50")              # Numero massimo elementi in liste dashboard
+        
+        # Configurazioni per lock distribuiti
+        r.set("config:locks:hotspot_ttl", "10")                # TTL per lock hotspot (10 secondi)
+        r.set("config:locks:retry_count", "3")                 # Numero tentativi per acquisire lock
+        r.set("config:locks:retry_delay", "100")               # Delay tra tentativi (ms)
+        
+        # Configurazioni per raccomandazioni
+        r.set("config:recommendations:ttl", "86400")           # TTL per raccomandazioni (24 ore)
         
         # Inizializza contatori
-        r.set("counters:hotspots:total", "0")
-        r.set("counters:alerts:total", "0")
-        r.set("counters:predictions:total", "0")
+        r.set("counters:hotspots:total", "0")                  # Totale hotspot rilevati
+        r.set("counters:alerts:total", "0")                    # Totale alert generati
+        r.set("counters:predictions:total", "0")               # Totale prediction sets generati
+        r.set("counters:alerts:active", "0")                   # Alert attivi
+        r.set("counters:alerts:by_severity:high", "0")         # Alert per severità
+        r.set("counters:alerts:by_severity:medium", "0")
+        r.set("counters:alerts:by_severity:low", "0")
+        r.set("counters:alerts:superseded", "0")               # Alert sostituiti
+        r.set("counters:hotspots:active", "0")                 # Hotspot attivi
+        r.set("counters:hotspots:inactive", "0")               # Hotspot inattivi
         
-        # Crea strutture di base per tracciamento spaziale
+        # Crea strutture di base per tracciamento
         r.sadd("hotspot:indices", "spatial")
+        r.sadd("dashboard:indices", "hotspots", "alerts", "predictions")
         
-        # Impostazione TTL per cache hotspot
-        r.set("config:cache:hotspot_metadata_ttl", "86400")  # 24 ore
+        # Crea strutture di base per alert
+        r.sadd("dashboard:alerts:types", "active", "superseded")
         
-        # Verifica configurazione
-        logger.info(f"✅ Configurazioni impostate: {r.keys('config:*')}")
+        # Impostazione TTL
+        r.set("config:cache:hotspot_metadata_ttl", "86400")    # 24 ore
+        
+        # Script Lua per lock distribuiti
+        acquire_lock_script = """
+        local lock_key = KEYS[1]
+        local lock_value = ARGV[1]
+        local ttl = tonumber(ARGV[2])
+        
+        if redis.call('setnx', lock_key, lock_value) == 1 then
+            redis.call('expire', lock_key, ttl)
+            return 1
+        else
+            return 0
+        end
+        """
+        
+        release_lock_script = """
+        local lock_key = KEYS[1]
+        local lock_value = ARGV[1]
+        
+        if redis.call('get', lock_key) == lock_value then
+            return redis.call('del', lock_key)
+        else
+            return 0
+        end
+        """
+        
+        # Registra script in Redis
+        r.set("scripts:acquire_lock", acquire_lock_script)
+        r.set("scripts:release_lock", release_lock_script)
         
         logger.info("✅ Strutture Redis inizializzate con successo")
         

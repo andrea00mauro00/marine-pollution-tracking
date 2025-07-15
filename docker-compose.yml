@@ -1,390 +1,506 @@
-version: '3.8'
-
-networks:
-  marine-network:
-    driver: bridge
-
-volumes:
-  kafka-data:
-  zookeeper-data:
-  postgres-data:
-  timescale-data:
-  minio-data:
-  redis-data:
-  elasticsearch-data:
-  prometheus-data:
-  grafana-data:
-
 services:
-  # ==================== CORE INFRASTRUCTURE ====================
+  # DATABASE E MESSAGGISTICA
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    restart: always
+    networks:
+      - marine_net
+    
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
+    ports:
+      - "2181:2181"
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    volumes:
-      - zookeeper-data:/var/lib/zookeeper/data
+    restart: always
     networks:
-      - marine-network
-    ports:
-      - "2181:2181"
+      - marine_net
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
     depends_on:
       - zookeeper
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
-    volumes:
-      - kafka-data:/var/lib/kafka/data
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    restart: always
     networks:
-      - marine-network
-    ports:
-      - "9092:9092"
-      - "29092:29092"
+      - marine_net
 
+  # Schema Registry
   schema-registry:
     image: confluentinc/cp-schema-registry:7.5.0
     container_name: schema-registry
     depends_on:
       - kafka
+      - zookeeper
+    ports:
+      - "8081:8081"
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
     networks:
-      - marine-network
-    ports:
-      - "8081:8081"
-
+      - marine_net
+    restart: always
+  
+  # Schema Registry UI
   schema-registry-ui:
+    platform: linux/amd64
     image: landoop/schema-registry-ui:latest
     container_name: schema-registry-ui
     depends_on:
       - schema-registry
-    environment:
-      SCHEMAREGISTRY_URL: http://schema-registry:8081
-    networks:
-      - marine-network
     ports:
       - "8000:8000"
-
-  # ==================== DATABASES ====================
-  postgres:
-    image: postgres:14-alpine
-    container_name: postgres
     environment:
-      POSTGRES_DB: marine_db
-      POSTGRES_USER: marine_user
-      POSTGRES_PASSWORD: marine_password
-      POSTGRES_MULTIPLE_DATABASES: "marine_db,pollution_db"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./setup_database/init_scripts/postgres:/docker-entrypoint-initdb.d
+      SCHEMAREGISTRY_URL: http://schema-registry:8081
+      PROXY: "true"
     networks:
-      - marine-network
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U marine_user -d marine_db"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  timescaledb:
-    image: timescale/timescaledb-ha:pg14-latest
-    container_name: timescaledb
-    environment:
-      POSTGRES_DB: marine_timeseries
-      POSTGRES_USER: marine_user
-      POSTGRES_PASSWORD: marine_password
-    volumes:
-      - timescale-data:/var/lib/postgresql/data
-      - ./setup_database/init_scripts/timescale:/docker-entrypoint-initdb.d
-    networks:
-      - marine-network
-    ports:
-      - "5433:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U marine_user -d marine_timeseries"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    volumes:
-      - redis-data:/data
-    networks:
-      - marine-network
-    ports:
-      - "6379:6379"
+      - marine_net
+    restart: always
 
   minio:
     image: minio/minio:latest
     container_name: minio
-    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Web UI
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
     volumes:
-      - minio-data:/data
+      - minio_data:/data
+    restart: unless-stopped
     networks:
-      - marine-network
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      - marine_net
 
-  # ==================== PRODUCERS ====================
+  create_buckets:
+    build:
+      context: ./setup_minio
+      dockerfile: Dockerfile
+    container_name: create_buckets
+    depends_on:
+      - minio
+    environment:
+      - MINIO_ENDPOINT=minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - ./setup_minio:/setup
+    networks:
+      - marine_net
+    restart: "no"
+
+  # Create DLQ topics
+  create_dlq_topics:
+    image: python:3.9
+    container_name: create_dlq_topics
+    depends_on:
+      - kafka
+    volumes:
+      - ./scripts:/scripts
+    working_dir: /scripts
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    command: ["sh", "-c", "pip install kafka-python && python create_dlq_topics.py"]
+    restart: "no"
+    networks:
+      - marine_net
+
+  # Database initialization - NUOVO
+  setup_database:
+    build:
+      context: ./setup_database
+      dockerfile: Dockerfile
+    container_name: setup_database
+    depends_on:
+      - postgres
+      - timescaledb
+      - redis
+    environment:
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_PORT=5432
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./setup_database:/setup
+    networks:
+      - marine_net
+    restart: "no"
+
+  # PRODUCER LAYER
   buoy_producer:
-    build: ./buoy_producer
+    build:
+      context: ./buoy_producer
     container_name: buoy_producer
     depends_on:
       - kafka
       - schema-registry
+      - create_dlq_topics
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=buoy_data
+      - GENERATE_INTERVAL_SECONDS=30
+      - SCHEMA_REGISTRY_URL=http://schema-registry:8081
+      - DLQ_TOPIC=buoy_data_dlq
+    volumes:
+      - ./schemas:/app/schemas  # Mount schemas directory
+    restart: always
     networks:
-      - marine-network
-    restart: unless-stopped
+      - marine_net
 
   satellite_producer:
-    build: ./satellite_producer
+    build:
+      context: ./satellite_producer 
     container_name: satellite_producer
     depends_on:
       - kafka
-      - schema-registry
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SCHEMA_REGISTRY_URL: http://schema-registry:8081
-    networks:
-      - marine-network
-    restart: unless-stopped
-
-  # ==================== PROCESSING SERVICES ====================
-  image_standardizer:
-    build: ./image_standardizer
-    container_name: image_standardizer
-    depends_on:
-      - kafka
-      - redis
       - minio
+      - create_buckets
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      REDIS_HOST: redis
-      MINIO_ENDPOINT: minio:9000
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=satellite_imagery
+      - FETCH_INTERVAL_SECONDS=900
+      - SH_CLIENT_ID=sh-48bf00cf-f69f-4700-ba00-c54fd436fafa
+      - SH_CLIENT_SECRET=DGTXvpdZD3B2MpCsdSz7qqZuvRtHMZ0X
+      - SH_TOKEN_URL=https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token
+      - SH_BASE_URL=https://sh.dataspace.copernicus.eu
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_BUCKET=bronze
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - ./schemas:/app/schemas
+    restart: always
     networks:
-      - marine-network
+      - marine_net
+
+  # PROCESSING LAYER (NUOVI JOB FLINK)
+  image_standardizer:
+    build:
+      context: ./image_standardizer  # Ex data_processor
+    container_name: image_standardizer
     ports:
       - "8082:8081"
+    depends_on:
+      - kafka
+      - minio
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - SATELLITE_TOPIC=satellite_imagery
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery  # Nuovo topic
+    volumes:
+      - ./common:/opt/flink/usrlib/common
+    networks:
+      - marine_net
+    restart: on-failure
 
   sensor_analyzer:
-    build: ./sensor_analyzer
+    build:
+      context: ./sensor_analyzer
     container_name: sensor_analyzer
-    depends_on:
-      - kafka
-      - redis
-      - timescaledb
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      REDIS_HOST: redis
-      TIMESCALE_HOST: timescaledb
-    networks:
-      - marine-network
     ports:
       - "8085:8081"
+    depends_on:
+      - kafka
+      - minio
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - BUOY_TOPIC=buoy_data
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - MINIO_ENDPOINT=minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+    volumes:
+      - ./common:/opt/flink/usrlib/common
+    networks:
+      - marine_net
+    restart: on-failure
 
   pollution_detector:
-    build: ./pollution_detector
+    build:
+      context: ./pollution_detector  # Ex pollution_analyzer
     container_name: pollution_detector
+    ports:
+      - "8083:8081"
+    depends_on:
+      - kafka
+      - postgres
+      - timescaledb
+      - redis
+      - setup_database
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery
+      - ANALYZED_DATA_TOPIC=analyzed_data
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - ALERTS_TOPIC=sensor_alerts
+      # Database connections
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_PORT=5432
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    networks:
+      - marine_net
+    volumes:
+      - ./common:/opt/flink/usrlib/common
+    restart: on-failure
+
+  ml_prediction_job:
+    build:
+      context: ./ml_prediction
+    container_name: ml_prediction_job
+    ports:
+      - "8084:8081"
     depends_on:
       - kafka
       - redis
-      - postgres
+      - setup_database
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      REDIS_HOST: redis
-      POSTGRES_HOST: postgres
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - PREDICTIONS_TOPIC=pollution_predictions
+      # Database connections
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./common:/opt/flink/usrlib/common
     networks:
-      - marine-network
-    ports:
-      - "8083:8081"
+      - marine_net
+    restart: on-failure
 
-  ml_prediction_job:
-    build: ./ml_prediction
-    container_name: ml_prediction_job
-    depends_on:
-      - kafka
-      - timescaledb
-      - minio
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      TIMESCALE_HOST: timescaledb
-      MINIO_ENDPOINT: minio:9000
-    networks:
-      - marine-network
+  # DATABASE LAYER
+  postgres:
+    image: postgres:14-alpine
+    container_name: postgres
     ports:
-      - "8084:8081"
-
-  # ==================== CONSUMERS ====================
-  storage_consumer:
-    build: ./storage_consumer
-    container_name: storage_consumer
-    depends_on:
-      - kafka
-      - postgres
-      - timescaledb
-      - minio
+      - "5432:5432"
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      POSTGRES_HOST: postgres
-      TIMESCALE_HOST: timescaledb
-      MINIO_ENDPOINT: minio:9000
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=marine_pollution
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     networks:
-      - marine-network
+      - marine_net
     restart: unless-stopped
 
+  timescaledb:
+    image: timescale/timescaledb-ha:pg14-latest
+    platform: linux/amd64 
+    container_name: timescaledb
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=marine_pollution
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    networks:
+      - marine_net
+    restart: unless-stopped
+
+  # CONSUMER LAYER
+  storage_consumer:
+    build:
+      context: ./storage_consumer
+    container_name: storage_consumer
+    depends_on:
+      kafka:
+        condition: service_started
+      timescaledb:
+        condition: service_started
+      postgres:
+        condition: service_started
+      minio:
+        condition: service_started
+      create_buckets:
+        condition: service_completed_successfully
+      setup_database:
+        condition: service_completed_successfully
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      # Topic subscriptions
+      - BUOY_TOPIC=buoy_data
+      - SATELLITE_TOPIC=satellite_imagery
+      - PROCESSED_IMAGERY_TOPIC=processed_imagery
+      - ANALYZED_SENSOR_TOPIC=analyzed_sensor_data
+      - ANALYZED_TOPIC=analyzed_data
+      - HOTSPOTS_TOPIC=pollution_hotspots
+      - PREDICTIONS_TOPIC=pollution_predictions
+      - ALERTS_TOPIC=sensor_alerts
+    volumes:
+      - ./common:/opt/flink/usrlib/common
+    networks:
+      - marine_net
+    restart: on-failure
+
+  dashboard_consumer:
+    build:
+      context: ./dashboard_consumer
+    container_name: dashboard_consumer
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+      setup_database:
+        condition: service_completed_successfully
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Topic subscriptions (tutti i topic)
+    volumes:
+      - ./common:/app/common
+    networks:
+      - marine_net
+    restart: on-failure
+
+  alert_manager:
+    build:
+      context: ./alert_manager
+    container_name: alert_manager
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_started
+      setup_database:
+        condition: service_completed_successfully
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - ALERTS_TOPIC=sensor_alerts
+      # Enhanced notification configuration
+      - EMAIL_ENABLED=false
+      - EMAIL_SERVER=smtp.example.com
+      - EMAIL_PORT=587
+      - EMAIL_USER=alerts@example.com
+      - EMAIL_PASSWORD=password
+      - HIGH_PRIORITY_RECIPIENTS=emergency@example.com,operations@example.com
+      - MEDIUM_PRIORITY_RECIPIENTS=operations@example.com
+      - LOW_PRIORITY_RECIPIENTS=monitoring@example.com
+      # SMS configuration (optional)
+      - SMS_ENABLED=false
+      # Webhook configuration (optional)
+      - WEBHOOK_ENABLED=false
+      # Regional configuration
+      - REGIONAL_CONFIG={"upper_bay":{"email_recipients":["upperchesapeake@example.com"]}}
+    volumes:
+      - ./common:/opt/flink/usrlib/common
+    networks:
+      - marine_net
+    restart: on-failure
+
+  # DLQ Consumer
   dlq_consumer:
-    build: ./dlq_consumer
+    build:
+      context: ./dlq_consumer
     container_name: dlq_consumer
     depends_on:
       - kafka
-      - postgres
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      POSTGRES_HOST: postgres
-    networks:
-      - marine-network
-    restart: unless-stopped
-
-  alert_manager:
-    build: ./alert_manager
-    container_name: alert_manager
-    depends_on:
-      - kafka
-      - postgres
       - redis
+      - postgres
+      - create_dlq_topics
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      POSTGRES_HOST: postgres
-      REDIS_HOST: redis
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
     networks:
-      - marine-network
-    restart: unless-stopped
+      - marine_net
+    restart: on-failure
 
-  # ==================== NEW MODULAR DASHBOARD ====================
+  # VISUALIZATION LAYER
+  # STREAMLIT DASHBOARD
   dashboard:
-    build: ./dashboard
-    container_name: dashboard
-    depends_on:
-      - postgres
-      - timescaledb
-      - redis
-      - minio
-    environment:
-      POSTGRES_HOST: postgres
-      TIMESCALE_HOST: timescaledb
-      REDIS_HOST: redis
-      MINIO_ENDPOINT: minio:9000
-    networks:
-      - marine-network
+    build:
+      context: ./dashboard
+    container_name: marine_dashboard
     ports:
       - "8501:8501"
-    restart: unless-stopped
-
-  # ==================== OBSERVABILITY STACK ====================
-  # Elasticsearch for centralized logging
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.9.0
-    container_name: elasticsearch
     environment:
-      - discovery.type=single-node
-      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
-      - xpack.security.enabled=false
-      - xpack.monitoring.collection.enabled=true
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=marine_pollution
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - TIMESCALE_HOST=timescaledb
+      - TIMESCALE_DB=marine_pollution
+      - TIMESCALE_USER=postgres
+      - TIMESCALE_PASSWORD=postgres
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
     volumes:
-      - elasticsearch-data:/usr/share/elasticsearch/data
+      - ./dashboard:/app
     networks:
-      - marine-network
-    ports:
-      - "9200:9200"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # Kibana for log visualization
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.9.0
-    container_name: kibana
+      - marine_net
     depends_on:
-      - elasticsearch
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-      - xpack.monitoring.ui.container.elasticsearch.enabled=true
-    networks:
-      - marine-network
-    ports:
-      - "5601:5601"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      - redis
+      - postgres
+      - timescaledb
+      - minio
+    restart: on-failure
 
-  # Logstash for log processing
-  logstash:
-    image: docker.elastic.co/logstash/logstash:8.9.0
-    container_name: logstash
-    depends_on:
-      - elasticsearch
-    volumes:
-      - ./logstash/pipeline:/usr/share/logstash/pipeline
-      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml
-    environment:
-      - "LS_JAVA_OPTS=-Xmx1g -Xms1g"
-    networks:
-      - marine-network
-    ports:
-      - "5044:5044"
-      - "12201:12201/udp"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9600/_node/stats || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+networks:
+  marine_net:
+    driver: bridge
 
-  # Prometheus for metrics collection
-  prometheus:
-    image: prom/prometheus:v2.45.0
-    container_name: prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--storage.tsdb.retention.time=200h'
-      - '--web.enable-lifecycle'
-    volumes:
-      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    networks:
-      - marine-network
-    ports:
-      - "9090:9090"
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9090/-/healthy || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+volumes:
+  minio_data:
+  dashboard_data:
+  postgres_data:
+  timescaledb_data:

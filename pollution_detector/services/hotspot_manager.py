@@ -5,7 +5,10 @@ import json
 import math
 import logging
 import time
+import hashlib
+import uuid
 from datetime import datetime, timedelta
+from common.redis_keys import *  # Importa le chiavi standardizzate
 
 # Configurazione logging
 logging.basicConfig(
@@ -13,6 +16,88 @@ logging.basicConfig(
     format='[%(levelname)s] %(asctime)s - %(message)s'
 )
 logger = logging.getLogger("hotspot_manager")
+
+# Configurazione retry e circuit breaker
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 2  # secondi
+CIRCUIT_OPEN_THRESHOLD = 3  # fallimenti
+CIRCUIT_RESET_TIMEOUT = 60  # secondi
+
+class DatabaseCircuitBreaker:
+    """
+    Circuit breaker pattern per connessioni database
+    Previene fallimenti a cascata quando il database non è disponibile
+    """
+    def __init__(self, name, failure_threshold=CIRCUIT_OPEN_THRESHOLD, reset_timeout=CIRCUIT_RESET_TIMEOUT):
+        self.name = name
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF-OPEN
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        
+    def execute(self, func, *args, **kwargs):
+        """Esegue una funzione con circuit breaker pattern"""
+        if self.state == "OPEN":
+            # Verifica se è passato il timeout per passare a HALF-OPEN
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                logger.info(f"[CIRCUIT {self.name}] Transitioning to HALF-OPEN state")
+                self.state = "HALF-OPEN"
+            else:
+                logger.warning(f"[CIRCUIT {self.name}] Circuit OPEN, skipping operation")
+                raise CircuitOpenError(f"Circuit {self.name} is OPEN")
+                
+        try:
+            result = func(*args, **kwargs)
+            
+            # Se successo in HALF-OPEN, passa a CLOSED
+            if self.state == "HALF-OPEN":
+                self.state = "CLOSED"
+                self.failure_count = 0
+                logger.info(f"[CIRCUIT {self.name}] Success, transitioning to CLOSED")
+                
+            return result
+            
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            
+            if self.failure_count >= self.failure_threshold:
+                prev_state = self.state
+                self.state = "OPEN"
+                logger.warning(f"[CIRCUIT {self.name}] Circuit OPEN after {self.failure_count} failures. Previous state: {prev_state}")
+                
+            logger.error(f"[CIRCUIT {self.name}] Operation failed: {str(e)}")
+            raise
+
+class CircuitOpenError(Exception):
+    """Exception raised when circuit is open"""
+    pass
+
+class TransactionManager:
+    """
+    Gestisce transazioni database in modo sicuro con retry
+    """
+    def __init__(self, conn, max_retries=MAX_RETRIES):
+        self.conn = conn
+        self.max_retries = max_retries
+        
+    def execute_with_retry(self, operation_func):
+        """Esegue operazione con retry"""
+        for attempt in range(self.max_retries):
+            try:
+                with self.conn:  # Auto commit/rollback
+                    result = operation_func(self.conn)
+                return result
+            except psycopg2.Error as e:
+                if e.pgcode == '40001':  # Serialization failure
+                    wait_time = BACKOFF_FACTOR ** attempt
+                    logger.warning(f"Transaction conflict (attempt {attempt+1}/{self.max_retries}), retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                    continue
+                raise
+        
+        raise Exception(f"Transaction failed after {self.max_retries} attempts")
 
 class HotspotManager:
     def __init__(self):
@@ -42,194 +127,494 @@ class HotspotManager:
         self.timescale_conn = None
         self.redis_client = None
         
-        # Configirazione
+        # Circuit breakers
+        self.pg_circuit = DatabaseCircuitBreaker("postgres")
+        self.timescale_circuit = DatabaseCircuitBreaker("timescale")
+        self.redis_circuit = DatabaseCircuitBreaker("redis")
+        
+        # Configurazione
         self.spatial_bin_size = 0.05  # Circa 5km
         
         # Inizializza connessioni
-        self._connect()
+        self._connect_with_retry()
     
-    def _connect(self):
-        """Inizializza connessioni ai database"""
-        try:
-            self.pg_conn = psycopg2.connect(**self.pg_config)
-            logger.info("Connesso a PostgreSQL")
-            
-            self.timescale_conn = psycopg2.connect(**self.timescale_config)
-            logger.info("Connesso a TimescaleDB")
-            
-            self.redis_client = redis.Redis(**self.redis_config)
-            self.redis_client.ping()  # Verifica connessione
-            logger.info("Connesso a Redis")
-            
-            # Carica configurazione da Redis
+    def _connect_with_retry(self):
+        """Inizializza connessioni ai database con retry logic"""
+        # PostgreSQL
+        for attempt in range(MAX_RETRIES):
             try:
-                bin_size = self.redis_client.get("config:hotspot:spatial_bin_size")
-                if bin_size:
-                    self.spatial_bin_size = float(bin_size)
-                    logger.info(f"Configurazione caricata: spatial_bin_size={self.spatial_bin_size}")
+                self.pg_conn = psycopg2.connect(**self.pg_config)
+                logger.info("Connesso a PostgreSQL")
+                break
             except Exception as e:
-                logger.warning(f"Errore nel caricamento della configurazione: {e}")
+                wait_time = BACKOFF_FACTOR ** attempt
+                logger.warning(f"PostgreSQL connection attempt {attempt+1}/{MAX_RETRIES} failed: {e}. Retrying in {wait_time}s")
+                time.sleep(wait_time)
+                
+        # TimescaleDB
+        for attempt in range(MAX_RETRIES):
+            try:
+                self.timescale_conn = psycopg2.connect(**self.timescale_config)
+                logger.info("Connesso a TimescaleDB")
+                break
+            except Exception as e:
+                wait_time = BACKOFF_FACTOR ** attempt
+                logger.warning(f"TimescaleDB connection attempt {attempt+1}/{MAX_RETRIES} failed: {e}. Retrying in {wait_time}s")
+                time.sleep(wait_time)
         
+        # Redis
+        for attempt in range(MAX_RETRIES):
+            try:
+                self.redis_client = redis.Redis(**self.redis_config)
+                self.redis_client.ping()  # Verifica connessione
+                logger.info("Connesso a Redis")
+                
+                # Carica configurazione da Redis in modo sicuro
+                try:
+                    bin_size = self.redis_client.get("config:hotspot:spatial_bin_size")
+                    if bin_size:
+                        self.spatial_bin_size = float(bin_size)
+                        logger.info(f"Configurazione caricata: spatial_bin_size={self.spatial_bin_size}")
+                except Exception as config_error:
+                    logger.warning(f"Errore nel caricamento della configurazione: {config_error}")
+                
+                break
+            except Exception as e:
+                wait_time = BACKOFF_FACTOR ** attempt
+                logger.warning(f"Redis connection attempt {attempt+1}/{MAX_RETRIES} failed: {e}. Retrying in {wait_time}s")
+                time.sleep(wait_time)
+    
+    def _ensure_connections(self):
+        """Verifica e ripristina le connessioni ai database se necessario"""
+        try:
+            # Verifica PostgreSQL
+            if self.pg_conn is None or self.pg_conn.closed:
+                def reconnect_pg():
+                    self.pg_conn = psycopg2.connect(**self.pg_config)
+                    logger.info("Riconnesso a PostgreSQL")
+                
+                self.pg_circuit.execute(reconnect_pg)
+            
+            # Verifica TimescaleDB
+            if self.timescale_conn is None or self.timescale_conn.closed:
+                def reconnect_timescale():
+                    self.timescale_conn = psycopg2.connect(**self.timescale_config)
+                    logger.info("Riconnesso a TimescaleDB")
+                
+                self.timescale_circuit.execute(reconnect_timescale)
+            
+            # Verifica Redis
+            if self.redis_client is None:
+                def reconnect_redis():
+                    self.redis_client = redis.Redis(**self.redis_config)
+                    self.redis_client.ping()
+                    logger.info("Riconnesso a Redis")
+                
+                self.redis_circuit.execute(reconnect_redis)
+                
+        except CircuitOpenError as e:
+            logger.error(f"Circuito aperto, impossibile garantire connessioni: {e}")
+            # Fallback a connessioni esistenti
+            pass
         except Exception as e:
-            logger.error(f"Errore nella connessione ai database: {e}")
-            raise
+            logger.error(f"Errore nella riconnessione ai database: {e}")
+            # Retry completo se fallisce
+            self._connect_with_retry()
     
     def find_matching_hotspot(self, latitude, longitude, radius_km, pollutant_type):
         """Trova hotspot esistente che corrisponde spazialmente"""
         try:
+            self._ensure_connections()
+            
             # 1. Lookup rapido in Redis usando bin spaziali
-            lat_bin = math.floor(latitude / self.spatial_bin_size)
-            lon_bin = math.floor(longitude / self.spatial_bin_size)
-            key = f"spatial:{lat_bin}:{lon_bin}"
-            
-            nearby_hotspot_ids = self.redis_client.smembers(key)
-            
-            # Converti da byte a string
-            nearby_hotspot_ids = [hid.decode('utf-8') for hid in nearby_hotspot_ids]
-            
-            logger.info(f"Trovati {len(nearby_hotspot_ids)} potenziali hotspot in bin ({lat_bin},{lon_bin})")
+            nearby_hotspot_ids = self._find_nearby_hotspots_in_redis(latitude, longitude)
             
             # 2. Per ogni ID, verifica sovrapposizione spaziale
-            for hotspot_id in nearby_hotspot_ids:
-                hotspot_key = f"hotspot:{hotspot_id}:metadata"
-                hotspot_data_bytes = self.redis_client.get(hotspot_key)
-                
-                if not hotspot_data_bytes:
-                    continue
-                    
-                hotspot_data = json.loads(hotspot_data_bytes.decode('utf-8'))
-                
-                # Calcola sovrapposizione
-                distance = self._haversine_distance(
-                    latitude, longitude,
-                    hotspot_data["center_latitude"], 
-                    hotspot_data["center_longitude"]
-                )
-                
-                # Se la distanza è minore della somma dei raggi, c'è sovrapposizione
-                combined_radius = radius_km + hotspot_data["radius_km"]
-                if distance <= combined_radius * 0.8:  # 80% della somma per essere conservativi
-                    # Verifica anche tipo di inquinante
-                    if pollutant_type == hotspot_data["pollutant_type"]:
-                        logger.info(f"Trovato match: hotspot {hotspot_id} a distanza {distance:.2f}km")
-                        return hotspot_id
+            matching_hotspot = self._check_spatial_overlap(nearby_hotspot_ids, latitude, longitude, radius_km, pollutant_type)
+            if matching_hotspot:
+                return matching_hotspot
+            
+            # 3. Fallback: Se non trovato in Redis, cerca nel database
+            if not nearby_hotspot_ids:
+                db_hotspot = self._find_hotspot_in_database(latitude, longitude, radius_km, pollutant_type)
+                if db_hotspot:
+                    return db_hotspot
             
             logger.info(f"Nessun hotspot corrispondente trovato per ({latitude}, {longitude})")
             return None
-            
+                
         except Exception as e:
             logger.error(f"Errore nella ricerca di hotspot corrispondenti: {e}")
             return None
     
-    def create_or_update_hotspot(self, hotspot_data):
-        """Crea nuovo hotspot o aggiorna esistente"""
+    def _find_nearby_hotspots_in_redis(self, latitude, longitude):
+        """Trova hotspot vicini usando binning spaziale in Redis"""
         try:
+            lat_bin = math.floor(latitude / self.spatial_bin_size)
+            lon_bin = math.floor(longitude / self.spatial_bin_size)
+            
+            # Cerca nei bin adiacenti (9 bin totali)
+            nearby_hotspot_ids = set()
+            
+            def query_redis_bins():
+                result_set = set()
+                for delta_lat in [-1, 0, 1]:
+                    for delta_lon in [-1, 0, 1]:
+                        current_lat_bin = lat_bin + delta_lat
+                        current_lon_bin = lon_bin + delta_lon
+                        key = spatial_bin_key(current_lat_bin, current_lon_bin)
+                        
+                        bin_results = self.redis_client.smembers(key)
+                        if bin_results:
+                            result_set.update([hid.decode('utf-8') for hid in bin_results])
+                return result_set
+            
+            # Usa circuit breaker per operazione Redis
+            nearby_hotspot_ids = self.redis_circuit.execute(query_redis_bins)
+            if nearby_hotspot_ids:
+                logger.info(f"Trovati {len(nearby_hotspot_ids)} potenziali hotspot in bin spaziali")
+            
+            return nearby_hotspot_ids
+        except CircuitOpenError:
+            logger.warning("Redis circuit open, skipping Redis lookup")
+            return set()
+        except Exception as e:
+            logger.error(f"Errore nella ricerca Redis: {e}")
+            return set()
+    
+    def _check_spatial_overlap(self, hotspot_ids, latitude, longitude, radius_km, pollutant_type):
+        """Verifica se c'è sovrapposizione spaziale con gli hotspot trovati"""
+        if not hotspot_ids:
+            return None
+            
+        try:
+            for hotspot_id in hotspot_ids:
+                # Ottieni dati hotspot in modo sicuro
+                def get_hotspot_data():
+                    # Prova formato dashboard_consumer
+                    hotspot_hash_key = hotspot_key(hotspot_id)
+                    hotspot_data = self.redis_client.hgetall(hotspot_hash_key)
+                    if hotspot_data:
+                        # Converti da hash Redis a dizionario Python
+                        return {k.decode('utf-8'): v.decode('utf-8') for k, v in hotspot_data.items()}
+                    else:
+                        # Fallback a vecchio formato metadata
+                        hotspot_meta_key = hotspot_metadata_key(hotspot_id)
+                        hotspot_data_bytes = self.redis_client.get(hotspot_meta_key)
+                        if not hotspot_data_bytes:
+                            return None
+                        # Formato JSON serializzato
+                        return json.loads(hotspot_data_bytes.decode('utf-8'))
+                
+                # Usa circuit breaker
+                try:
+                    hotspot_data = self.redis_circuit.execute(get_hotspot_data)
+                    if not hotspot_data:
+                        continue
+                except CircuitOpenError:
+                    logger.warning("Redis circuit open, skipping hotspot data fetch")
+                    continue
+                
+                # Estrai coordinate, gestendo diversi formati
+                h_lat = float(hotspot_data.get("center_latitude", hotspot_data.get("latitude", 0)))
+                h_lon = float(hotspot_data.get("center_longitude", hotspot_data.get("longitude", 0)))
+                h_radius = float(hotspot_data.get("radius_km", 5.0))
+                h_pollutant = hotspot_data.get("pollutant_type", "unknown")
+                
+                # Calcola sovrapposizione
+                distance = self._haversine_distance(
+                    latitude, longitude, h_lat, h_lon
+                )
+                
+                # Criterio più flessibile (120% invece di 80%)
+                combined_radius = radius_km + h_radius
+                if distance <= combined_radius * 1.2:  # 20% margine di tolleranza
+                    # Verifica anche tipo di inquinante
+                    if self._is_same_pollutant_type(pollutant_type, h_pollutant):
+                        logger.info(f"Trovato match: hotspot {hotspot_id} a distanza {distance:.2f}km")
+                        return hotspot_id
+            
+            return None
+        except Exception as e:
+            logger.error(f"Errore nel controllo di sovrapposizione: {e}")
+            return None
+    
+    def _find_hotspot_in_database(self, latitude, longitude, radius_km, pollutant_type):
+        """Cerca hotspot nel database quando Redis fallisce"""
+        try:
+            def query_database():
+                with self.timescale_conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT hotspot_id, center_latitude, center_longitude, radius_km, pollutant_type
+                        FROM active_hotspots
+                        WHERE 
+                            center_latitude BETWEEN %s - %s AND %s + %s
+                            AND center_longitude BETWEEN %s - %s AND %s + %s
+                            AND last_updated_at > NOW() - INTERVAL '24 hours'
+                    """, (
+                        latitude, 5.0/111.0, latitude, 5.0/111.0,
+                        longitude, 5.0/(111.0*math.cos(math.radians(latitude))), 
+                        longitude, 5.0/(111.0*math.cos(math.radians(latitude)))
+                    ))
+                    
+                    results = []
+                    for record in cur.fetchall():
+                        db_id, db_lat, db_lon, db_radius, db_pollutant = record
+                        
+                        # Calcola distanza
+                        distance = self._haversine_distance(
+                            latitude, longitude, db_lat, db_lon
+                        )
+                        
+                        # Verifica sovrapposizione
+                        combined_radius = radius_km + db_radius
+                        if distance <= combined_radius * 1.2:  # 20% margine
+                            if self._is_same_pollutant_type(pollutant_type, db_pollutant):
+                                results.append((db_id, distance))
+                    
+                    # Ordina per distanza
+                    results.sort(key=lambda x: x[1])
+                    return results[0][0] if results else None
+            
+            # Usa circuit breaker
+            try:
+                result = self.timescale_circuit.execute(query_database)
+                if result:
+                    logger.info(f"Trovato match nel database: hotspot {result}")
+                return result
+            except CircuitOpenError:
+                logger.warning("Timescale circuit open, skipping database lookup")
+                return None
+        except Exception as e:
+            logger.error(f"Errore nella ricerca database: {e}")
+            return None
+    
+    def _is_same_pollutant_type(self, type1, type2):
+        """Verifica se due tipi di inquinanti sono considerati equivalenti"""
+        if type1 == type2:
+            return True
+        
+        # Mappa di sinonimi per i tipi di inquinanti
+        synonyms = {
+            "oil": ["oil_spill", "crude_oil", "petroleum"],
+            "chemical": ["chemical_spill", "toxic_chemicals"],
+            "sewage": ["waste_water", "sewage_discharge"],
+            "plastic": ["microplastics", "plastic_debris"],
+            "algae": ["algal_bloom", "red_tide"]
+        }
+        
+        # Controlla se i tipi sono sinonimi
+        for category, types in synonyms.items():
+            if (type1 == category or type1 in types) and (type2 == category or type2 in types):
+                return True
+        
+        return False
+    
+    def _acquire_lock(self, lock_name, timeout_seconds=10):
+        """Acquista un lock distribuito usando Redis"""
+        try:
+            lock_key = f"locks:hotspot:{lock_name}"
+            lock_value = str(uuid.uuid4())  # Valore univoco per identificare chi possiede il lock
+            
+            # Carica configurazione
+            def get_redis_config():
+                retry_count = int(self.redis_client.get("config:locks:retry_count") or 3)
+                retry_delay = int(self.redis_client.get("config:locks:retry_delay") or 100) / 1000.0
+                return retry_count, retry_delay
+                
+            # Usa circuit breaker
+            try:
+                retry_count, retry_delay = self.redis_circuit.execute(get_redis_config)
+            except CircuitOpenError:
+                # Valori di default se Redis non è disponibile
+                retry_count, retry_delay = 3, 0.1
+            
+            # Prova più volte ad acquisire il lock
+            for attempt in range(retry_count):
+                # Prova ad acquisire il lock
+                def set_lock():
+                    return self.redis_client.set(lock_key, lock_value, nx=True, ex=timeout_seconds)
+                
+                try:
+                    acquired = self.redis_circuit.execute(set_lock)
+                    if acquired:
+                        return lock_value
+                except CircuitOpenError:
+                    logger.warning("Redis circuit open, skipping lock acquisition")
+                    return None
+                    
+                # Attendi prima di riprovare
+                if attempt < retry_count - 1:
+                    time.sleep(retry_delay)
+            
+            return None
+        except Exception as e:
+            logger.error(f"Errore nell'acquisizione del lock: {e}")
+            return None
+
+    def _release_lock(self, lock_name, lock_value):
+        """Rilascia un lock distribuito solo se sei tu il proprietario"""
+        try:
+            lock_key = f"locks:hotspot:{lock_name}"
+            
+            # Script Lua per rilascio sicuro (rilascia solo se il valore corrisponde)
+            release_script = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            else
+                return 0
+            end
+            """
+            
+            # Esegui lo script in modo sicuro
+            def execute_script():
+                script = self.redis_client.register_script(release_script)
+                return script(keys=[lock_key], args=[lock_value])
+            
+            try:
+                self.redis_circuit.execute(execute_script)
+            except CircuitOpenError:
+                logger.warning("Redis circuit open, unable to release lock")
+        except Exception as e:
+            logger.error(f"Errore nel rilascio del lock: {e}")
+    
+    def create_or_update_hotspot(self, hotspot_data):
+        """Crea nuovo hotspot o aggiorna esistente con lock distribuito"""
+        try:
+            self._ensure_connections()
+            
             center_lat = hotspot_data["location"]["center_latitude"]
             center_lon = hotspot_data["location"]["center_longitude"]
             radius_km = hotspot_data["location"]["radius_km"]
             pollutant_type = hotspot_data["pollutant_type"]
             
-            # Cerca hotspot esistente
-            existing_hotspot_id = self.find_matching_hotspot(
-                center_lat, center_lon, radius_km, pollutant_type
-            )
+            # Crea un lock_name basato sulle coordinate e il tipo di inquinante
+            # (approssima le coordinate per ridurre i conflitti non necessari)
+            lat_bin = math.floor(center_lat * 100) / 100
+            lon_bin = math.floor(center_lon * 100) / 100
+            lock_name = f"{lat_bin}:{lon_bin}:{pollutant_type}"
             
-            if existing_hotspot_id:
-                # Aggiorna hotspot esistente
-                return self._update_hotspot(existing_hotspot_id, hotspot_data)
-            else:
-                # Crea nuovo hotspot
-                return self._create_hotspot(hotspot_data)
+            # Acquista il lock
+            lock_value = self._acquire_lock(lock_name)
+            if not lock_value:
+                logger.warning(f"Non è stato possibile acquisire il lock per {lock_name}, potenziale duplicazione")
+                # Proviamo comunque a cercare un hotspot esistente
+                existing_hotspot_id = self.find_matching_hotspot(
+                    center_lat, center_lon, radius_km, pollutant_type
+                )
                 
+                if existing_hotspot_id:
+                    # Se troviamo un match, aggiorniamolo
+                    return self._update_hotspot(existing_hotspot_id, hotspot_data)
+                else:
+                    # Altrimenti, restituiamo i dati originali
+                    return hotspot_data
+                
+            try:
+                # Cerca hotspot esistente
+                existing_hotspot_id = self.find_matching_hotspot(
+                    center_lat, center_lon, radius_km, pollutant_type
+                )
+                
+                if existing_hotspot_id:
+                    # Aggiorna hotspot esistente
+                    return self._update_hotspot(existing_hotspot_id, hotspot_data)
+                else:
+                    # Crea nuovo hotspot
+                    return self._create_hotspot(hotspot_data)
+            finally:
+                # Rilascia il lock in ogni caso
+                self._release_lock(lock_name, lock_value)
+                    
         except Exception as e:
             logger.error(f"Errore in create_or_update_hotspot: {e}")
             # Restituisci i dati originali in caso di errore
             return hotspot_data
     
     def _create_hotspot(self, hotspot_data):
-        """Crea nuovo hotspot nel database e in Redis"""
+        """Crea nuovo hotspot nel database"""
         try:
             hotspot_id = hotspot_data["hotspot_id"]
             center_lat = hotspot_data["location"]["center_latitude"]
             center_lon = hotspot_data["location"]["center_longitude"]
             
-            # Persistenza in PostgreSQL
-            with self.timescale_conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO active_hotspots (
-                        hotspot_id, center_latitude, center_longitude, radius_km,
-                        pollutant_type, severity, first_detected_at, last_updated_at,
-                        avg_risk_score, max_risk_score, source_data, spatial_hash
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    hotspot_id, center_lat, center_lon, hotspot_data["location"]["radius_km"],
-                    hotspot_data["pollutant_type"], hotspot_data["severity"],
-                    datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
-                    datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
-                    hotspot_data["avg_risk_score"], hotspot_data["max_risk_score"],
-                    json.dumps(hotspot_data), f"{math.floor(center_lat/0.05)}:{math.floor(center_lon/0.05)}"
-                ))
+            # Usa transaction manager per atomicità e retry
+            def create_transaction(conn):
+                with conn.cursor() as cur:
+                    # Inserisci in active_hotspots
+                    cur.execute("""
+                        INSERT INTO active_hotspots (
+                            hotspot_id, center_latitude, center_longitude, radius_km,
+                            pollutant_type, severity, first_detected_at, last_updated_at,
+                            update_count, avg_risk_score, max_risk_score, source_data, spatial_hash
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s)
+                        ON CONFLICT (hotspot_id) DO UPDATE SET
+                            center_latitude   = EXCLUDED.center_latitude,
+                            center_longitude  = EXCLUDED.center_longitude,
+                            radius_km         = EXCLUDED.radius_km,
+                            severity          = EXCLUDED.severity,
+                            last_updated_at   = EXCLUDED.last_updated_at,
+                            update_count      = active_hotspots.update_count + 1,
+                            avg_risk_score    = EXCLUDED.avg_risk_score,
+                            max_risk_score    = GREATEST(active_hotspots.max_risk_score, EXCLUDED.max_risk_score),
+                            source_data       = EXCLUDED.source_data,
+                            spatial_hash      = EXCLUDED.spatial_hash
+                    """, (
+                        hotspot_id, center_lat, center_lon, hotspot_data["location"]["radius_km"],
+                        hotspot_data["pollutant_type"], hotspot_data["severity"],
+                        datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
+                        datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
+                        hotspot_data["avg_risk_score"], hotspot_data["max_risk_score"],
+                        json.dumps(hotspot_data), f"{math.floor(center_lat/self.spatial_bin_size)}:{math.floor(center_lon/self.spatial_bin_size)}"
+                    ))
+                    
+                    # Inserisci anche la prima versione
+                    cur.execute("""
+                        INSERT INTO hotspot_versions (
+                            hotspot_id, center_latitude, center_longitude, radius_km,
+                            severity, risk_score, detected_at, snapshot_data
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        hotspot_id, center_lat, center_lon, hotspot_data["location"]["radius_km"],
+                        hotspot_data["severity"], hotspot_data["avg_risk_score"],
+                        datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
+                        json.dumps(hotspot_data)
+                    ))
+                    
+                    # Traccia evento di creazione
+                    cur.execute("""
+                        INSERT INTO hotspot_evolution (
+                            hotspot_id, timestamp, event_type, center_latitude, 
+                            center_longitude, radius_km, severity, risk_score, event_data
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        hotspot_id, datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
+                        "created", center_lat, center_lon, hotspot_data["location"]["radius_km"],
+                        hotspot_data["severity"], hotspot_data["avg_risk_score"],
+                        json.dumps({"creation_data": hotspot_data})
+                    ))
                 
-                # Inserisci anche la prima versione
-                cur.execute("""
-                    INSERT INTO hotspot_versions (
-                        hotspot_id, center_latitude, center_longitude, radius_km,
-                        severity, risk_score, detected_at, snapshot_data
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    hotspot_id, center_lat, center_lon, hotspot_data["location"]["radius_km"],
-                    hotspot_data["severity"], hotspot_data["avg_risk_score"],
-                    datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
-                    json.dumps(hotspot_data)
-                ))
-                
-                # Traccia evento di creazione
-                cur.execute("""
-                    INSERT INTO hotspot_evolution (
-                        hotspot_id, timestamp, event_type, center_latitude, 
-                        center_longitude, radius_km, severity, risk_score, event_data
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    hotspot_id, datetime.fromtimestamp(hotspot_data["detected_at"]/1000),
-                    "created", center_lat, center_lon, hotspot_data["location"]["radius_km"],
-                    hotspot_data["severity"], hotspot_data["avg_risk_score"],
-                    json.dumps({"creation_data": hotspot_data})
-                ))
-                
-            self.timescale_conn.commit()
+                # Nessun return esplicito richiesto in questo caso
             
-            # Cache in Redis
-            lat_bin = math.floor(center_lat / self.spatial_bin_size)
-            lon_bin = math.floor(center_lon / self.spatial_bin_size)
-            self.redis_client.sadd(f"spatial:{lat_bin}:{lon_bin}", hotspot_id)
+            # Esegui transazione con circuit breaker
+            try:
+                self.timescale_circuit.execute(
+                    lambda: TransactionManager(self.timescale_conn).execute_with_retry(create_transaction)
+                )
+            except CircuitOpenError:
+                logger.error("Timescale circuit open, skipping hotspot creation")
+                return hotspot_data
             
-            # Metadata cache
-            self.redis_client.set(
-                f"hotspot:{hotspot_id}:metadata",
-                json.dumps({
-                    "hotspot_id": hotspot_id,
-                    "center_latitude": center_lat,
-                    "center_longitude": center_lon,
-                    "radius_km": hotspot_data["location"]["radius_km"],
-                    "pollutant_type": hotspot_data["pollutant_type"],
-                    "severity": hotspot_data["severity"],
-                    "update_count": 1
-                }),
-                ex=86400  # 24 ore di cache
-            )
-            
-            # Incrementa contatore
-            self.redis_client.incr("counters:hotspots:total")
-            
-            # Marca come nuovo
+            # Aggiungi campi di relazione
             hotspot_data["is_new"] = True
+            hotspot_data["parent_hotspot_id"] = None
+            hotspot_data["derived_from"] = None
+            
             logger.info(f"Creato nuovo hotspot: {hotspot_id}")
             return hotspot_data
             
         except Exception as e:
             logger.error(f"Errore nella creazione di hotspot: {e}")
-            # Rollback
-            self.timescale_conn.rollback()
             # Restituisci i dati originali in caso di errore
             return hotspot_data
     
@@ -237,17 +622,31 @@ class HotspotManager:
         """Aggiorna hotspot esistente"""
         try:
             # Recupera dati correnti
-            with self.timescale_conn.cursor() as cur:
-                cur.execute("SELECT * FROM active_hotspots WHERE hotspot_id = %s", (existing_id,))
-                column_names = [desc[0] for desc in cur.description]
-                row = cur.fetchone()
-                
-                if not row:
-                    logger.warning(f"Hotspot {existing_id} non trovato nel database, creazione nuovo")
-                    new_data["hotspot_id"] = existing_id
-                    return self._create_hotspot(new_data)
-                
-                existing_data = dict(zip(column_names, row))
+            existing_data = None
+            
+            # Funzione per recuperare i dati esistenti
+            def get_existing_data():
+                with self.timescale_conn.cursor() as cur:
+                    cur.execute("SELECT * FROM active_hotspots WHERE hotspot_id = %s", (existing_id,))
+                    column_names = [desc[0] for desc in cur.description]
+                    row = cur.fetchone()
+                    
+                    if not row:
+                        return None
+                    
+                    return dict(zip(column_names, row))
+            
+            # Usa circuit breaker
+            try:
+                existing_data = self.timescale_circuit.execute(get_existing_data)
+            except CircuitOpenError:
+                logger.error("Timescale circuit open, skipping hotspot update")
+                return new_data
+            
+            if not existing_data:
+                logger.warning(f"Hotspot {existing_id} non trovato nel database, creazione nuovo")
+                new_data["hotspot_id"] = existing_id
+                return self._create_hotspot(new_data)
             
             # Calcola modifiche
             center_lat = new_data["location"]["center_latitude"]
@@ -257,8 +656,16 @@ class HotspotManager:
             update_time = datetime.fromtimestamp(new_data["detected_at"]/1000)
             update_count = existing_data["update_count"] + 1
             
-            # Conserva l'ID originale!
+            # Conserva l'ID originale
+            original_id = new_data.get("hotspot_id")
             new_data["hotspot_id"] = existing_id
+            
+            # Aggiungi campi di relazione
+            new_data["parent_hotspot_id"] = existing_id
+            
+            # Se questo è un hotspot rilevato come duplicato (ha un ID originale diverso)
+            if original_id != existing_id:
+                new_data["derived_from"] = original_id
             
             # Determina se ci sono cambiamenti significativi
             old_severity = existing_data["severity"]
@@ -282,82 +689,68 @@ class HotspotManager:
                 radius_change > prev_radius * 0.3         # Cambiamento raggio > 30%
             )
             
-            # Aggiorna database
-            with self.timescale_conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE active_hotspots 
-                    SET center_latitude = %s, center_longitude = %s, radius_km = %s,
-                        severity = %s, last_updated_at = %s, update_count = %s,
-                        avg_risk_score = %s, max_risk_score = %s, source_data = %s
-                    WHERE hotspot_id = %s
-                """, (
-                    center_lat, center_lon, new_data["location"]["radius_km"],
-                    new_severity, update_time, update_count,
-                    new_data["avg_risk_score"], 
-                    max(existing_data["max_risk_score"], new_data["max_risk_score"]),
-                    json.dumps(new_data), existing_id
-                ))
-                
-                # Inserisci nuova versione se ci sono cambiamenti significativi
-                if is_significant:
+            # Definisci l'operazione di aggiornamento
+            def update_transaction(conn):
+                with conn.cursor() as cur:
+                    # Aggiorna hotspot
                     cur.execute("""
-                        INSERT INTO hotspot_versions (
-                            hotspot_id, center_latitude, center_longitude, radius_km,
-                            severity, risk_score, detected_at, snapshot_data, is_significant_change
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        UPDATE active_hotspots 
+                        SET center_latitude = %s, center_longitude = %s, radius_km = %s,
+                            severity = %s, last_updated_at = %s, update_count = %s,
+                            avg_risk_score = %s, max_risk_score = %s, source_data = %s,
+                            spatial_hash = %s
+                        WHERE hotspot_id = %s
                     """, (
-                        existing_id, center_lat, center_lon, new_data["location"]["radius_km"],
-                        new_severity, new_data["avg_risk_score"], update_time,
-                        json.dumps(new_data), True
+                        center_lat, center_lon, new_data["location"]["radius_km"],
+                        new_severity, update_time, update_count,
+                        new_data["avg_risk_score"], 
+                        max(existing_data["max_risk_score"], new_data["max_risk_score"]),
+                        json.dumps(new_data),
+                        f"{math.floor(center_lat/self.spatial_bin_size)}:{math.floor(center_lon/self.spatial_bin_size)}",
+                        existing_id
                     ))
                     
-                    # Traccia evento di aggiornamento
-                    event_type = "severity_change" if severity_changed else "moved"
-                    cur.execute("""
-                        INSERT INTO hotspot_evolution (
-                            hotspot_id, timestamp, event_type, center_latitude, 
-                            center_longitude, radius_km, severity, risk_score, event_data
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        existing_id, update_time, event_type, 
-                        center_lat, center_lon, new_data["location"]["radius_km"],
-                        new_severity, new_data["avg_risk_score"],
-                        json.dumps({
-                            "movement_distance": movement_distance,
-                            "radius_change": radius_change,
-                            "old_severity": old_severity,
-                            "new_severity": new_severity
-                        })
-                    ))
+                    # Inserisci nuova versione se ci sono cambiamenti significativi
+                    if is_significant:
+                        cur.execute("""
+                            INSERT INTO hotspot_versions (
+                                hotspot_id, center_latitude, center_longitude, radius_km,
+                                severity, risk_score, detected_at, snapshot_data, is_significant_change
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            existing_id, center_lat, center_lon, new_data["location"]["radius_km"],
+                            new_severity, new_data["avg_risk_score"], update_time,
+                            json.dumps(new_data), True
+                        ))
+                        
+                        # Traccia evento di aggiornamento
+                        event_type = "severity_change" if severity_changed else "moved"
+                        cur.execute("""
+                            INSERT INTO hotspot_evolution (
+                                hotspot_id, timestamp, event_type, center_latitude, 
+                                center_longitude, radius_km, severity, risk_score, event_data
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            existing_id, update_time, event_type, 
+                            center_lat, center_lon, new_data["location"]["radius_km"],
+                            new_severity, new_data["avg_risk_score"],
+                            json.dumps({
+                                "movement_distance": movement_distance,
+                                "radius_change": radius_change,
+                                "old_severity": old_severity,
+                                "new_severity": new_severity,
+                                "original_id": original_id if original_id != existing_id else None
+                            })
+                        ))
             
-            self.timescale_conn.commit()
-            
-            # Aggiorna Redis
-            # Aggiorna posizione spaziale se necessario
-            old_lat_bin = math.floor(prev_lat / self.spatial_bin_size)
-            old_lon_bin = math.floor(prev_lon / self.spatial_bin_size)
-            new_lat_bin = math.floor(center_lat / self.spatial_bin_size)
-            new_lon_bin = math.floor(center_lon / self.spatial_bin_size)
-            
-            if old_lat_bin != new_lat_bin or old_lon_bin != new_lon_bin:
-                self.redis_client.srem(f"spatial:{old_lat_bin}:{old_lon_bin}", existing_id)
-                self.redis_client.sadd(f"spatial:{new_lat_bin}:{new_lon_bin}", existing_id)
-            
-            # Aggiorna metadati
-            self.redis_client.set(
-                f"hotspot:{existing_id}:metadata",
-                json.dumps({
-                    "hotspot_id": existing_id,
-                    "center_latitude": center_lat,
-                    "center_longitude": center_lon,
-                    "radius_km": new_data["location"]["radius_km"],
-                    "pollutant_type": new_data["pollutant_type"],
-                    "severity": new_severity,
-                    "update_count": update_count,
-                    "last_updated": update_time.isoformat()
-                }),
-                ex=86400  # 24 ore
-            )
+            # Esegui transazione con circuit breaker
+            try:
+                self.timescale_circuit.execute(
+                    lambda: TransactionManager(self.timescale_conn).execute_with_retry(update_transaction)
+                )
+            except CircuitOpenError:
+                logger.error("Timescale circuit open, skipping hotspot update")
+                return new_data
             
             # Aggiungi flag per indicare tipo di update
             new_data["is_update"] = True
@@ -371,8 +764,6 @@ class HotspotManager:
             
         except Exception as e:
             logger.error(f"Errore nell'aggiornamento di hotspot: {e}")
-            # Rollback
-            self.timescale_conn.rollback()
             # Restituisci i dati originali in caso di errore
             return new_data
     
