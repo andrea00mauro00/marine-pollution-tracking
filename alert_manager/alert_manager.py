@@ -758,7 +758,11 @@ def main():
         group_id='alert-manager-group',
         auto_offset_reset='latest',
         value_deserializer=deserialize_message,
-        enable_auto_commit=False
+        enable_auto_commit=False,
+        max_poll_interval_ms=300000,  # Aumentato a 5 minuti (default 300000)
+        max_poll_records=10,          # Ridotto numero massimo di record per poll (default 500)
+        session_timeout_ms=60000,     # Timeout sessione (default 10000)
+        heartbeat_interval_ms=10000   # Intervallo heartbeat (default 3000)
     )
     
     logger.info("Alert Manager avviato - in attesa di messaggi...")

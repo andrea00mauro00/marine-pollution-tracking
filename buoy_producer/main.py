@@ -10,6 +10,12 @@ KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "buoy_data")
 POLL_INTERVAL_SEC = int(os.getenv("GENERATE_INTERVAL_SECONDS", 30))
 DLQ_TOPIC = os.getenv("DLQ_TOPIC", "buoy_data_dlq")  # Dead Letter Queue
 
+# Global probability for events - starts at 100%
+EVENT_PROBABILITY = 1.0
+
+# Count of events so far, used to distribute event severity evenly
+EVENT_COUNT = 0
+
 # Logger setup
 logger.remove()
 logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
@@ -237,7 +243,9 @@ def update_location_state(location_id, lat, lon):
     return result
 
 def process_pollution_events(location_id):
-    """Process any active pollution events for this location"""
+    """Process any active pollution events for this location with global halving probability"""
+    global EVENT_PROBABILITY, EVENT_COUNT
+    
     state = location_states[location_id]
     current = state["current"]
     
@@ -254,7 +262,7 @@ def process_pollution_events(location_id):
         # If still active, apply effects and keep
         if event["duration"] > 0:
             if event["type"] == "oil_spill":
-                # Maintain elevated hydrocarbon levels
+                # Maintain elevated hydrocarbon levels - effect scaled by intensity
                 current["petroleum_hydrocarbons"] = max(
                     current["petroleum_hydrocarbons"],
                     state["baseline"]["petroleum_hydrocarbons"] * event["intensity"] * 5
@@ -266,7 +274,7 @@ def process_pollution_events(location_id):
                 # Suppress oxygen levels
                 current["dissolved_oxygen"] = min(
                     current["dissolved_oxygen"],
-                    state["baseline"]["dissolved_oxygen"] * 0.6
+                    state["baseline"]["dissolved_oxygen"] * (0.8 - event["intensity"] * 0.2)
                 )
                 
             elif event["type"] == "chemical_leak":
@@ -301,7 +309,7 @@ def process_pollution_events(location_id):
                 # Suppress oxygen levels
                 current["dissolved_oxygen"] = min(
                     current["dissolved_oxygen"],
-                    state["baseline"]["dissolved_oxygen"] * 0.5
+                    state["baseline"]["dissolved_oxygen"] * (0.7 - event["intensity"] * 0.2)
                 )
             
             # Add to updated list
@@ -312,45 +320,80 @@ def process_pollution_events(location_id):
     state["active_events"] = updated_events
     
     # Occasionally create a new random pollution event if no active events
-    # Higher chance than before (3% instead of 1%)
-    if not updated_events and random.random() < 0.03:
+    if not updated_events and random.random() < EVENT_PROBABILITY:
+        # Generate a random event type
         event_type = random.choice(["oil_spill", "chemical_leak", "algal_bloom"])
-        intensity = random.uniform(0.7, 1.0)  # 0.7-1.0 scale
-        duration = random.randint(10, 20)  # lasts for 10-20 update cycles (5-10 minutes)
+        
+        # Determine event intensity based on current event count to distribute event severity evenly
+        # Every 3rd event will be high intensity (0.7-1.0)
+        # Every 3rd+1 event will be medium intensity (0.4-0.7)
+        # Every 3rd+2 event will be low intensity (0.2-0.4)
+        remainder = EVENT_COUNT % 3
+        
+        if remainder == 0:  # High intensity
+            intensity = random.uniform(0.9, 1.0)
+            severity = "HIGH"
+        elif remainder == 1:  # Medium intensity
+            intensity = random.uniform(0.4, 0.7)
+            severity = "MEDIUM"
+        else:  # Low intensity
+            intensity = random.uniform(0.15, 0.3)
+            severity = "LOW"
+        
+        # Duration is scaled based on intensity but kept reasonable for a 10-minute demo
+        # For low intensity (0.2-0.4): 5-10 cycles (2.5-5 minutes)
+        # For medium intensity (0.4-0.7): 10-16 cycles (5-8 minutes)
+        # For high intensity (0.7-1.0): 15-20 cycles (7.5-10 minutes)
+        if intensity < 0.4:
+            duration = random.randint(5, 10)
+        elif intensity < 0.7:
+            duration = random.randint(10, 16)
+        else:
+            duration = random.randint(15, 20)
         
         # Create new event
         new_event = {
             "type": event_type,
             "intensity": intensity,
             "duration": duration,
-            "created_at": time.time()
+            "created_at": time.time(),
+            "severity": severity
         }
         
         # Apply immediate effects
         if event_type == "oil_spill":
-            # Oil spill drastically increases hydrocarbons
-            current["petroleum_hydrocarbons"] *= random.uniform(4.0, 8.0)
-            current["polycyclic_aromatic"] *= random.uniform(3.0, 6.0)
-            current["dissolved_oxygen"] *= random.uniform(0.5, 0.7)
-            logger.warning(f"🛢️ NEW oil spill event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
+            # Oil spill drastically increases hydrocarbons - effect scales with intensity
+            current["petroleum_hydrocarbons"] *= (3.0 + intensity * 5.0)
+            current["polycyclic_aromatic"] *= (2.0 + intensity * 4.0)
+            current["dissolved_oxygen"] *= (0.7 - intensity * 0.2)
+            logger.warning(f"🛢️ NEW {severity} oil spill event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
             
         elif event_type == "chemical_leak":
-            # Chemical leak drastically increases heavy metals
-            current["mercury"] *= random.uniform(5.0, 10.0)
-            current["lead"] *= random.uniform(4.0, 8.0)
-            current["cadmium"] *= random.uniform(4.0, 8.0)
-            logger.warning(f"⚗️ NEW chemical leak event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
+            # Chemical leak drastically increases heavy metals - effect scales with intensity
+            current["mercury"] *= (3.0 + intensity * 7.0)
+            current["lead"] *= (2.0 + intensity * 6.0)
+            current["cadmium"] *= (2.0 + intensity * 6.0)
+            logger.warning(f"⚗️ NEW {severity} chemical leak event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
             
         elif event_type == "algal_bloom":
-            # Algal bloom drastically increases chlorophyll and nutrients
-            current["chlorophyll_a"] *= random.uniform(5.0, 10.0)
-            current["nitrates"] *= random.uniform(3.0, 5.0)
-            current["phosphates"] *= random.uniform(3.0, 6.0)
-            current["dissolved_oxygen"] *= random.uniform(0.4, 0.6)
-            logger.warning(f"🌱 NEW algal bloom event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
+            # Algal bloom drastically increases chlorophyll and nutrients - effect scales with intensity
+            current["chlorophyll_a"] *= (3.0 + intensity * 7.0)
+            current["nitrates"] *= (2.0 + intensity * 3.0)
+            current["phosphates"] *= (2.0 + intensity * 4.0)
+            current["dissolved_oxygen"] *= (0.6 - intensity * 0.2)
+            logger.warning(f"🌱 NEW {severity} algal bloom event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
         
         # Add to active events
         state["active_events"] = [new_event]
+        
+        # Increment global event count
+        EVENT_COUNT += 1
+
+        # Halve the global probability for next event, but don't go below 0.005 (0.5%)
+        EVENT_PROBABILITY = max(0.005, EVENT_PROBABILITY / 2.0)
+        
+        # Log the new probability
+        logger.info(f"📉 Global event probability decreased to {EVENT_PROBABILITY:.1%}")
 
 def calculate_water_quality_index(data):
     """Calculates a Water Quality Index from sensor parameters"""
@@ -507,7 +550,9 @@ def main():
     prod = create_kafka_producer()
     logger.success("✅ Connected to Kafka")
     
-    logger.info("🔄 Mode: Realistic simulation with persistent pollution events")
+    logger.info("🔄 Mode: Realistic simulation with global halving probability")
+    logger.info(f"⚠️ First event 100% probability, then halves globally after each event to minimum 1%")
+    logger.info(f"📊 Event severity distributed evenly: HIGH → MEDIUM → LOW → repeat")
 
     while True:
         for loc in locs:

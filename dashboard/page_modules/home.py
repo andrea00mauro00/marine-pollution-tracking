@@ -635,43 +635,85 @@ def show_home_page(clients):
         # Pollution Trend Analysis
         st.markdown("<h2 class='sub-header'>Pollution Trend Analysis</h2>", unsafe_allow_html=True)
         
-        # Get sensor metrics over time
+        # Get sensor metrics over time - VERSIONE MIGLIORATA
         sensor_metrics_trend = None
         if timescale_client:
             try:
-                # Try to get sensor metrics by hour for last 24 hours
+                # Query migliorata per gestire valori NULL e garantire dati validi
                 sensor_metrics_query = """
                     SELECT 
                         time_bucket('1 hour', time) as hour,
                         AVG(water_quality_index) as avg_wqi,
-                        AVG(risk_score) as avg_risk,
-                        MAX(risk_score) as max_risk
+                        AVG(CASE WHEN risk_score IS NOT NULL AND risk_score > 0 THEN risk_score ELSE NULL END) as avg_risk,
+                        MAX(risk_score) as max_risk,
+                        COUNT(*) as data_points
                     FROM sensor_measurements
                     WHERE time > NOW() - INTERVAL '24 hours'
                     GROUP BY hour
                     ORDER BY hour
                 """
                 sensor_metrics_trend = timescale_client.execute_query(sensor_metrics_query)
+                
+                # Se la prima query non restituisce dati sul rischio, prova con la tabella pollution_metrics
+                if not sensor_metrics_trend or all(entry.get('avg_risk') is None for entry in sensor_metrics_trend if entry):
+                    backup_query = """
+                        SELECT 
+                            time_bucket('1 hour', time) as hour,
+                            NULL as avg_wqi,
+                            AVG(avg_risk_score) as avg_risk,
+                            MAX(max_risk_score) as max_risk,
+                            COUNT(*) as data_points
+                        FROM pollution_metrics
+                        WHERE time > NOW() - INTERVAL '24 hours'
+                        GROUP BY hour
+                        ORDER BY hour
+                    """
+                    pollution_metrics = timescale_client.execute_query(backup_query)
+                    
+                    # Se abbiamo trovato dati sul rischio, combiniamo con i dati WQI originali se disponibili
+                    if pollution_metrics and any(entry.get('avg_risk') is not None for entry in pollution_metrics if entry):
+                        if sensor_metrics_trend:
+                            # Creiamo un dizionario delle ore per combinare i dati
+                            wqi_by_hour = {}
+                            for entry in sensor_metrics_trend:
+                                if entry and 'hour' in entry:
+                                    hour_key = entry['hour'].isoformat() if hasattr(entry['hour'], 'isoformat') else str(entry['hour'])
+                                    wqi_by_hour[hour_key] = entry.get('avg_wqi')
+                            
+                            # Aggiungiamo i valori WQI alle metriche di inquinamento
+                            for entry in pollution_metrics:
+                                if entry and 'hour' in entry:
+                                    hour_key = entry['hour'].isoformat() if hasattr(entry['hour'], 'isoformat') else str(entry['hour'])
+                                    if hour_key in wqi_by_hour:
+                                        entry['avg_wqi'] = wqi_by_hour[hour_key]
+                        
+                        # Utilizziamo i dati di pollution_metrics
+                        sensor_metrics_trend = pollution_metrics
             except Exception as e:
-                try:
-                    # Fallback to different method if available
-                    sensor_metrics_trend = timescale_client.get_sensor_metrics_by_hour(hours=24)
-                except:
-                    st.warning("Could not get sensor metrics trend")
+                st.warning(f"Could not get sensor metrics trend: {str(e)}")
         
         if sensor_metrics_trend:
-            # Convert to DataFrame
+            # Convert to DataFrame con gestione robusta dei tipi
             trend_df = pd.DataFrame(sensor_metrics_trend)
             
-            if 'hour' in trend_df.columns:
+            if 'hour' in trend_df.columns and not trend_df.empty:
                 # Ensure hour column is datetime
                 trend_df['hour'] = pd.to_datetime(trend_df['hour'])
+                
+                # Gestione robusta delle colonne numeriche
+                for col in ['avg_risk', 'max_risk', 'avg_wqi']:
+                    if col in trend_df.columns:
+                        trend_df[col] = pd.to_numeric(trend_df[col], errors='coerce')
+                
+                # Verifico la disponibilità dei dati
+                has_risk_data = ('avg_risk' in trend_df.columns and not trend_df['avg_risk'].isna().all())
+                has_wqi_data = ('avg_wqi' in trend_df.columns and not trend_df['avg_wqi'].isna().all())
                 
                 # Create a dual-axis figure for water quality and risk
                 fig = make_subplots(specs=[[{"secondary_y": True}]])
                 
                 # Add water quality index if available
-                if 'avg_wqi' in trend_df.columns:
+                if has_wqi_data:
                     fig.add_trace(
                         go.Scatter(
                             x=trend_df['hour'],
@@ -682,8 +724,8 @@ def show_home_page(clients):
                         secondary_y=True
                     )
                 
-                # Add risk scores - Ensure they are visible even if WQI is not available
-                if 'avg_risk' in trend_df.columns:
+                # Add risk scores if available
+                if has_risk_data:
                     fig.add_trace(
                         go.Scatter(
                             x=trend_df['hour'],
@@ -693,19 +735,36 @@ def show_home_page(clients):
                         ),
                         secondary_y=False
                     )
-                
-                if 'max_risk' in trend_df.columns:
+                    
+                    # Max risk score
+                    if 'max_risk' in trend_df.columns and not trend_df['max_risk'].isna().all():
+                        fig.add_trace(
+                            go.Scatter(
+                                x=trend_df['hour'],
+                                y=trend_df['max_risk'],
+                                name="Maximum Risk",
+                                line=dict(color="#D32F2F", width=2, dash='dot')
+                            ),
+                            secondary_y=False
+                        )
+                # Se non abbiamo risk score ma abbiamo WQI, calcoliamo un pollution index
+                elif has_wqi_data:
+                    # Calcoliamo un pollution index come inverso del WQI
+                    trend_df['pollution_index'] = 100 - trend_df['avg_wqi']
+                    
                     fig.add_trace(
                         go.Scatter(
                             x=trend_df['hour'],
-                            y=trend_df['max_risk'],
-                            name="Maximum Risk",
-                            line=dict(color="#D32F2F", width=2, dash='dot')
+                            y=trend_df['pollution_index'],
+                            name="Pollution Index",
+                            line=dict(color="#FF5722", width=2)
                         ),
                         secondary_y=False
                     )
+                    
+                    st.info("Risk score data not available in sensor readings. Showing calculated Pollution Index (inverse of Water Quality Index).")
                 
-                # Update layout
+                # Update layout with better labels and hover
                 fig.update_layout(
                     title="Water Quality and Risk Trend (Last 24 Hours)",
                     xaxis_title="Time",
@@ -716,21 +775,39 @@ def show_home_page(clients):
                         xanchor="center",
                         x=0.5
                     ),
-                    hovermode="x unified"
+                    hovermode="x unified",
+                    hoverlabel=dict(
+                        bgcolor="white",
+                        font_size=12
+                    )
                 )
                 
-                # Ensure both y-axes are visible regardless of data availability
+                # Ensure both y-axes are visible and have appropriate ranges
+                # Calcola il range appropriato per risk e pollution
+                if has_risk_data:
+                    max_risk_value = max(
+                        trend_df['max_risk'].max() if 'max_risk' in trend_df.columns and not trend_df['max_risk'].isna().all() else 0,
+                        trend_df['avg_risk'].max() if 'avg_risk' in trend_df.columns and not trend_df['avg_risk'].isna().all() else 0
+                    )
+                    # Assicurati che il range non sia 0
+                    y_range = [0, max(max_risk_value * 1.1, 0.1)]
+                elif 'pollution_index' in trend_df.columns:
+                    y_range = [0, 100]
+                else:
+                    y_range = [0, 1]
+                
                 fig.update_yaxes(
-                    title_text="Risk Score", 
+                    title_text="Risk Score / Pollution Index", 
                     secondary_y=False,
-                    range=[0, trend_df['max_risk'].max() * 1.1 if 'max_risk' in trend_df.columns else 1]
+                    range=y_range
                 )
                 
-                fig.update_yaxes(
-                    title_text="Water Quality Index", 
-                    secondary_y=True,
-                    range=[0, 100]
-                )
+                if has_wqi_data:
+                    fig.update_yaxes(
+                        title_text="Water Quality Index", 
+                        secondary_y=True,
+                        range=[0, 100]
+                    )
                 
                 st.plotly_chart(fig, use_container_width=True)
             else:
