@@ -92,6 +92,60 @@ ENVIRONMENTAL_REGIONS = {
     }
 }
 
+# Memoria e limiti di esecuzione
+MAX_POINTS_IN_MEMORY = 1000      # Hard limit punti
+SOFT_CLEANUP_THRESHOLD = 800     # Soglia per cleanup proattivo
+MIN_POINTS_TO_KEEP = 100         # Minimum per clustering efficace
+
+# Retry configuration
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 2  # secondi
+
+class RedisCircuitBreaker:
+    """
+    Circuit breaker pattern per interazioni con Redis
+    Previene il fallimento a cascata quando Redis non è disponibile
+    """
+    def __init__(self, failure_threshold=3, reset_timeout=60):
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF-OPEN
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        
+    def execute(self, func, *args, **kwargs):
+        """Esegue una funzione con circuit breaker pattern"""
+        if self.state == "OPEN":
+            # Check if timeout has elapsed to transition to HALF-OPEN
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                self.state = "HALF-OPEN"
+                logger.info(f"[CIRCUIT] Transitioning to HALF-OPEN state")
+            else:
+                logger.warning(f"[CIRCUIT] Circuit OPEN, skipping operation")
+                return None
+                
+        try:
+            result = func(*args, **kwargs)
+            
+            # If successful in HALF-OPEN, transition to CLOSED
+            if self.state == "HALF-OPEN":
+                self.state = "CLOSED"
+                self.failure_count = 0
+                logger.info(f"[CIRCUIT] Success, transitioning to CLOSED")
+                
+            return result
+            
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            
+            if self.failure_count >= self.failure_threshold:
+                self.state = "OPEN"
+                logger.warning(f"[CIRCUIT] Circuit OPEN after {self.failure_count} failures")
+                
+            logger.error(f"[CIRCUIT] Operation failed: {e}")
+            return None
+
 class PollutionEventDetector(MapFunction):
     """
     Detects pollution events from sensor and imagery data
@@ -282,14 +336,31 @@ class AlertExtractor(MapFunction):
     """
     def __init__(self):
         self.redis_client = None
+        self.circuit_breaker = RedisCircuitBreaker()
         
     def open(self, runtime_context):
+        self._init_redis_with_retry()
+    
+    def _init_redis_with_retry(self):
+        """Initialize Redis connection with retry logic"""
         import redis
-        # Initialize Redis client
-        redis_host = os.environ.get("REDIS_HOST", "redis")
-        redis_port = int(os.environ.get("REDIS_PORT", "6379"))
-        self.redis_client = redis.Redis(host=redis_host, port=redis_port)
-        logger.info("AlertExtractor connected to Redis")
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Initialize Redis client
+                redis_host = os.environ.get("REDIS_HOST", "redis")
+                redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+                self.redis_client = redis.Redis(host=redis_host, port=redis_port)
+                # Test connection
+                self.redis_client.ping()
+                logger.info("AlertExtractor connected to Redis")
+                return
+            except Exception as e:
+                wait_time = BACKOFF_FACTOR ** attempt
+                logger.warning(f"Redis connection attempt {attempt+1}/{MAX_RETRIES} failed: {e}. Retrying in {wait_time}s")
+                time.sleep(wait_time)
+        
+        logger.error("Failed to connect to Redis after multiple attempts")
     
     def map(self, value):
         try:
@@ -316,24 +387,35 @@ class AlertExtractor(MapFunction):
                 
                 logger.info(f"[ALERT CHECK] Checking hotspot: severity={severity}, avg_risk={avg_risk}, is_update={is_update}")
                 
-                # Check cooldown for ALL hotspots, not just updates
+                # Check cooldown using circuit breaker
+                in_cooldown = False
                 if self.redis_client:
-                    cooldown_key = alert_cooldown_key(hotspot_id)
+                    def check_cooldown():
+                        cooldown_key = alert_cooldown_key(hotspot_id)
+                        return self.redis_client.exists(cooldown_key)
                     
-                    # Skip if in cooldown (for ANY hotspot)
-                    if self.redis_client.exists(cooldown_key):
+                    in_cooldown = self.circuit_breaker.execute(check_cooldown)
+                    
+                    # If circuit breaker is open or cooldown exists, skip
+                    if in_cooldown:
                         logger.info(f"[ALERT FILTERED] Hotspot {hotspot_id} is in cooldown period, skipping")
                         return None
                     
-                    # Set cooldown based on severity
-                    if severity == "high":
-                        cooldown_seconds = 900  # 15 minutes
-                    elif severity == "medium":
-                        cooldown_seconds = 1800  # 30 minutes
-                    else:
-                        cooldown_seconds = 3600  # 60 minutes
+                    # Set cooldown period safely
+                    def set_cooldown():
+                        cooldown_key = alert_cooldown_key(hotspot_id)
+                        # Set cooldown based on severity
+                        if severity == "high":
+                            cooldown_seconds = 900  # 15 minutes
+                        elif severity == "medium":
+                            cooldown_seconds = 1800  # 30 minutes
+                        else:
+                            cooldown_seconds = 3600  # 60 minutes
+                        
+                        self.redis_client.setex(cooldown_key, cooldown_seconds, "1")
                     
-                    self.redis_client.setex(cooldown_key, cooldown_seconds, "1")
+                    # Use circuit breaker to set cooldown
+                    self.circuit_breaker.execute(set_cooldown)
                 
                 # Check severity - if medium or high, this is an alert
                 if severity in ["medium", "high"]:
@@ -370,6 +452,11 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         self.hotspot_manager = None
         self.confidence_model = None
         
+        # Limiti di memoria
+        self.MAX_POINTS_IN_MEMORY = MAX_POINTS_IN_MEMORY
+        self.SOFT_CLEANUP_THRESHOLD = SOFT_CLEANUP_THRESHOLD
+        self.MIN_POINTS_TO_KEEP = MIN_POINTS_TO_KEEP
+        
     def open(self, runtime_context):
         # State to store pollution points
         points_descriptor = MapStateDescriptor(
@@ -394,10 +481,26 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Initialize HotspotManager
         self.hotspot_manager = HotspotManager()
         
-        # Load ML model from MinIO
-        self._load_confidence_model()
+        # Load ML model from MinIO with retry
+        self._load_confidence_model_with_retry()
         
         logger.info("[DEBUG] SpatialClusteringProcessor initialized with HotspotManager and ML Model")
+    
+    def _load_confidence_model_with_retry(self):
+        """Load the confidence estimation model with retry logic"""
+        for attempt in range(MAX_RETRIES):
+            try:
+                self._load_confidence_model()
+                if self.confidence_model:
+                    logger.info(f"Successfully loaded confidence model on attempt {attempt+1}")
+                    return
+            except Exception as e:
+                wait_time = BACKOFF_FACTOR ** attempt
+                logger.warning(f"Model loading attempt {attempt+1}/{MAX_RETRIES} failed: {e}. Retrying in {wait_time}s")
+                time.sleep(wait_time)
+        
+        logger.error("Failed to load confidence model after multiple attempts, using heuristic method")
+        self.confidence_model = None
     
     def _load_confidence_model(self):
         """Load the confidence estimation model from MinIO"""
@@ -475,28 +578,11 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             self.points_state.put(point_key, json.dumps(point_data))
             logger.info(f"[DEBUG] Stored point: {point_key}")
             
-            # Check if this is the first event - if so, schedule initial timer
-            if self.first_event_processed.value() is None:
-                # Schedule an initial clustering after a short delay
-                current_time = ctx.timestamp() or int(time.time() * 1000)
-                next_trigger = current_time + 10000  # 10 seconds from now
-                ctx.timer_service().register_processing_time_timer(next_trigger)
-                self.timer_state.update(next_trigger)
-                logger.info(f"[DEBUG] Scheduled initial clustering at {next_trigger}")
-                
-                # Mark first event as processed
-                self.first_event_processed.update(True)
-            else:
-                # Set timer for clustering (if not already set or too far in future)
-                current_time = ctx.timestamp() or int(time.time() * 1000)
-                existing_timer = self.timer_state.value()
-                
-                # Schedule a timer if none exists or if existing timer is too far in the future
-                if existing_timer is None or (existing_timer - current_time) > CLUSTERING_INTERVAL_MS:
-                    trigger_time = current_time + CLUSTERING_INTERVAL_MS
-                    ctx.timer_service().register_processing_time_timer(trigger_time)
-                    self.timer_state.update(trigger_time)
-                    logger.info(f"[DEBUG] Scheduled clustering at {trigger_time} (in {CLUSTERING_INTERVAL_MS/1000} seconds)")
+            # NUOVO: Controlla limiti di memoria dopo ogni inserimento
+            self._enforce_memory_limits()
+            
+            # MIGLIORATO: Timer deterministico basato su time windows
+            self._schedule_deterministic_timer(ctx)
             
             # Debug: Count total points in state
             point_count = sum(1 for _ in self.points_state.keys())
@@ -506,11 +592,157 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             logger.error(f"[ERROR] Error in spatial clustering processor: {e}")
             traceback.print_exc()
     
+    def _schedule_deterministic_timer(self, ctx):
+        """Schedule deterministic timer based on time windows"""
+        try:
+            # Check if first event
+            if self.first_event_processed.value() is None:
+                # Mark first event as processed
+                self.first_event_processed.update(True)
+                
+                # Schedule an initial clustering after a short delay
+                current_time = ctx.timestamp() or int(time.time() * 1000)
+                next_trigger = current_time + 10000  # 10 seconds from now
+                ctx.timer_service().register_processing_time_timer(next_trigger)
+                self.timer_state.update(next_trigger)
+                logger.info(f"[TIMER] Scheduled initial clustering at {next_trigger}")
+                return
+            
+            # Get current time
+            current_time = ctx.timestamp() or int(time.time() * 1000)
+            
+            # Calculate deterministic window boundary
+            window_start = (current_time // CLUSTERING_INTERVAL_MS) * CLUSTERING_INTERVAL_MS
+            next_window = window_start + CLUSTERING_INTERVAL_MS
+            
+            # Get existing timer
+            existing_timer = self.timer_state.value()
+            
+            # Only schedule if different from existing
+            if existing_timer != next_window:
+                # Cancel existing timer if present
+                if existing_timer is not None:
+                    ctx.timer_service().delete_processing_time_timer(existing_timer)
+                
+                # Register new timer
+                ctx.timer_service().register_processing_time_timer(next_window)
+                self.timer_state.update(next_window)
+                logger.info(f"[TIMER] Scheduled deterministic clustering at {next_window}")
+        except Exception as e:
+            logger.error(f"[TIMER ERROR] Error scheduling timer: {e}")
+            self._schedule_recovery_timer(ctx)
+    
+    def _schedule_recovery_timer(self, ctx):
+        """Fallback timer in case of errors"""
+        try:
+            current_time = int(time.time() * 1000)
+            recovery_time = current_time + CLUSTERING_INTERVAL_MS
+            ctx.timer_service().register_processing_time_timer(recovery_time)
+            self.timer_state.update(recovery_time)
+            logger.info(f"[RECOVERY] Scheduled recovery timer at {recovery_time}")
+        except Exception as e:
+            logger.error(f"[RECOVERY FAILED] Unable to schedule recovery timer: {e}")
+    
+    def _enforce_memory_limits(self):
+        """Enforce memory limits to prevent OOM errors"""
+        try:
+            # Count points
+            points_count = sum(1 for _ in self.points_state.keys())
+            
+            # Apply hard limit
+            if points_count >= self.MAX_POINTS_IN_MEMORY:
+                logger.warning(f"[MEMORY] Hard limit reached: {points_count} points")
+                self._aggressive_cleanup()
+            # Apply soft limit
+            elif points_count >= self.SOFT_CLEANUP_THRESHOLD:
+                logger.info(f"[MEMORY] Soft limit reached: {points_count} points")
+                self._smart_cleanup()
+        except Exception as e:
+            logger.error(f"[MEMORY] Error enforcing memory limits: {e}")
+    
+    def _aggressive_cleanup(self):
+        """Aggressive cleanup to enforce hard memory limit"""
+        try:
+            # Collect points with timestamps
+            point_timestamps = []
+            for point_key in list(self.points_state.keys()):
+                point_json = self.points_state.get(point_key)
+                if point_json:
+                    point = json.loads(point_json)
+                    point_timestamps.append((point["timestamp"], point_key))
+            
+            # Sort by timestamp (oldest first)
+            point_timestamps.sort()
+            
+            # Calculate points to remove
+            target_count = self.SOFT_CLEANUP_THRESHOLD
+            points_to_remove = max(0, len(point_timestamps) - target_count)
+            
+            # Ensure we don't remove too many points
+            points_to_remove = min(points_to_remove, len(point_timestamps) - self.MIN_POINTS_TO_KEEP)
+            
+            # Remove oldest points
+            removed_count = 0
+            for timestamp, point_key in point_timestamps[:points_to_remove]:
+                self.points_state.remove(point_key)
+                removed_count += 1
+            
+            logger.info(f"[CLEANUP] Aggressive cleanup removed {removed_count} oldest points")
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error in aggressive cleanup: {e}")
+    
+    def _smart_cleanup(self):
+        """Smart cleanup based on point quality"""
+        try:
+            # Collect points with priority scores
+            point_priorities = []
+            current_time = int(time.time() * 1000)
+            
+            for point_key in list(self.points_state.keys()):
+                point_json = self.points_state.get(point_key)
+                if point_json:
+                    point = json.loads(point_json)
+                    
+                    # Calculate priority score (higher = more important)
+                    age_hours = (current_time - point["timestamp"]) / (1000 * 60 * 60)
+                    recency_score = max(0, 24 - age_hours) / 24  # 0-1, more recent is better
+                    risk_score = point["risk_score"]  # 0-1, higher is better
+                    
+                    # Bonus for source diversity
+                    source_bonus = 0.1 if point["source_type"] == "satellite" else 0.0
+                    
+                    # Calculate final priority
+                    priority = (recency_score * 0.4) + (risk_score * 0.5) + source_bonus
+                    point_priorities.append((priority, point_key))
+            
+            # Sort by priority (lowest first = to be removed)
+            point_priorities.sort()
+            
+            # Calculate points to remove (20% of low priority)
+            points_to_remove = max(0, min(len(point_priorities) // 5, 
+                                       len(point_priorities) - self.MIN_POINTS_TO_KEEP))
+            
+            # Remove lowest priority points
+            removed_count = 0
+            for priority, point_key in point_priorities[:points_to_remove]:
+                self.points_state.remove(point_key)
+                removed_count += 1
+            
+            logger.info(f"[CLEANUP] Smart cleanup removed {removed_count} low-priority points")
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error in smart cleanup: {e}")
+    
     def on_timer(self, timestamp, ctx):
         try:
+            # Verify this is the expected timer
+            expected_timer = self.timer_state.value()
+            if expected_timer != timestamp:
+                logger.warning(f"[TIMER] Unexpected timer {timestamp}, expected {expected_timer}")
+                return
+            
             # Reset timer state
             self.timer_state.clear()
-            logger.info(f"[DEBUG] Timer triggered at {timestamp}")
+            logger.info(f"[TIMER] Timer triggered at {timestamp}")
             
             # Collect all points
             points = []
@@ -537,11 +769,8 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
                     logger.info(f"[HOTSPOT GENERATED] Single-point test hotspot: {managed_hotspot['hotspot_id']} (confidence: {managed_hotspot['confidence_score']})")
                     yield json.dumps(managed_hotspot)
                 
-                # Schedule next timer
-                next_trigger = int(time.time() * 1000) + CLUSTERING_INTERVAL_MS
-                ctx.timer_service().register_processing_time_timer(next_trigger)
-                self.timer_state.update(next_trigger)
-                logger.info(f"[DEBUG] Scheduled next clustering at {next_trigger}")
+                # Schedule next deterministic timer
+                self._schedule_next_deterministic_timer(ctx, timestamp)
                 return
             
             # Perform DBSCAN clustering
@@ -583,27 +812,30 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             
             logger.info(f"[DEBUG] Published {hotspots_published} hotspots")
             
-            # Clean up old points
+            # Clean up old points - improved cleanup
             self._clean_old_points()
             
-            # Schedule next timer
-            next_trigger = int(time.time() * 1000) + CLUSTERING_INTERVAL_MS
-            ctx.timer_service().register_processing_time_timer(next_trigger)
-            self.timer_state.update(next_trigger)
-            logger.info(f"[DEBUG] Scheduled next clustering at {next_trigger}")
+            # Schedule next deterministic timer
+            self._schedule_next_deterministic_timer(ctx, timestamp)
         
         except Exception as e:
             logger.error(f"[ERROR] Error in clustering timer: {e}")
             traceback.print_exc()
             
             # Ensure next timer is scheduled even on error
-            try:
-                next_trigger = int(time.time() * 1000) + CLUSTERING_INTERVAL_MS
-                ctx.timer_service().register_processing_time_timer(next_trigger)
-                self.timer_state.update(next_trigger)
-                logger.info(f"[DEBUG] Scheduled next clustering after error at {next_trigger}")
-            except Exception as timer_error:
-                logger.error(f"[ERROR] Failed to schedule next timer: {timer_error}")
+            self._schedule_recovery_timer(ctx)
+    
+    def _schedule_next_deterministic_timer(self, ctx, current_timestamp):
+        """Schedule next deterministic timer"""
+        try:
+            # Calculate next window boundary
+            next_trigger = ((current_timestamp // CLUSTERING_INTERVAL_MS) + 1) * CLUSTERING_INTERVAL_MS
+            ctx.timer_service().register_processing_time_timer(next_trigger)
+            self.timer_state.update(next_trigger)
+            logger.info(f"[TIMER] Scheduled next clustering at {next_trigger}")
+        except Exception as e:
+            logger.error(f"[TIMER ERROR] Error scheduling next timer: {e}")
+            self._schedule_recovery_timer(ctx)
     
     def _create_single_point_hotspot(self, point):
         """Create a test hotspot from a single point"""
@@ -870,24 +1102,27 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
     
     def _clean_old_points(self):
         """Remove old points from state"""
-        current_time = int(time.time() * 1000)
-        keys_to_remove = []
-        
-        for point_key in list(self.points_state.keys()):
-            point_json = self.points_state.get(point_key)
-            if point_json:
-                point = json.loads(point_json)
-                timestamp = point["timestamp"]
-                
-                # Remove points older than TIME_WINDOW_HOURS
-                if (current_time - timestamp) > (TIME_WINDOW_HOURS * 60 * 60 * 1000):
-                    keys_to_remove.append(point_key)
-        
-        for key in keys_to_remove:
-            self.points_state.remove(key)
-        
-        if keys_to_remove:
-            logger.info(f"[DEBUG] Cleaned {len(keys_to_remove)} old points")
+        try:
+            current_time = int(time.time() * 1000)
+            keys_to_remove = []
+            
+            for point_key in list(self.points_state.keys()):
+                point_json = self.points_state.get(point_key)
+                if point_json:
+                    point = json.loads(point_json)
+                    timestamp = point["timestamp"]
+                    
+                    # Remove points older than TIME_WINDOW_HOURS
+                    if (current_time - timestamp) > (TIME_WINDOW_HOURS * 60 * 60 * 1000):
+                        keys_to_remove.append(point_key)
+            
+            for key in keys_to_remove:
+                self.points_state.remove(key)
+            
+            if keys_to_remove:
+                logger.info(f"[DEBUG] Cleaned {len(keys_to_remove)} old points")
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error in old points cleanup: {e}")
     
     def _haversine_distance(self, lat1, lon1, lat2, lon2):
         """Calculate distance between two points in kilometers"""
@@ -902,6 +1137,36 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         r = 6371  # Radius of earth in kilometers
         
         return c * r
+
+# Funzione per la chiave spaziale
+def create_spatial_key(data):
+    try:
+        event = json.loads(data).get("pollution_event_detection")
+        if not event or "location" not in event:
+            return "default_key"
+            
+        lat = event["location"]["latitude"]
+        lon = event["location"]["longitude"]
+        
+        # Determina la cella principale
+        grid_lat = int(lat / 0.5)
+        grid_lon = int(lon / 0.5)
+        
+        # Calcola distanza dai bordi in gradi
+        lat_remainder = lat % 0.5
+        lon_remainder = lon % 0.5
+        
+        # Se il punto è vicino al confine (entro 5km ~ 0.05 gradi), 
+        # usa una chiave speciale che sarà sempre inviata allo stesso task
+        border_distance = 0.05
+        if (lat_remainder < border_distance or lat_remainder > (0.5 - border_distance) or
+            lon_remainder < border_distance or lon_remainder > (0.5 - border_distance)):
+            return "boundary_region"
+            
+        return f"grid_{grid_lat}_{grid_lon}"
+    except Exception as e:
+        logger.error(f"[SPATIAL KEY] Error creating spatial key: {e}")
+        return "default_key"
 
 def wait_for_services():
     """Wait for Kafka to be available"""
@@ -1024,9 +1289,9 @@ def main():
     # 4. Send all events to analyzed_data topic
     all_events.add_sink(analyzed_producer).name("Publish_All_Analyzed_Data")
     
-    # 7. Perform spatial clustering
+    # 7. Perform spatial clustering - MODIFICATO: usa create_spatial_key
     hotspots = all_events \
-        .key_by(lambda x: "global_key") \
+        .key_by(create_spatial_key) \
         .process(SpatialClusteringProcessor(), output_type=Types.STRING()) \
         .name("Spatial_Clustering")
     

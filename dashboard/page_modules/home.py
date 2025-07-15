@@ -205,7 +205,7 @@ def show_home_page(clients):
                     summary["severity_distribution"] = {
                         "high": active_hotspots.get("high_severity", 0),
                         "medium": active_hotspots.get("medium_severity", 0),
-                        "low": active_hotspots.get("low_severity", 0)
+                        "low": active_hotspots.get("low_severity", 0)  # Manteniamo 'low' per gli hotspot
                     }
                     summary["updated_at"] = int(time.time() * 1000)
                     data_source = "real"  # TimescaleDB data is considered real but not real-time
@@ -219,8 +219,8 @@ def show_home_page(clients):
                 if alerts:
                     summary["alerts_count"] = len(alerts)
                     
-                    # Count alerts by severity
-                    severity_counts = {"high": 0, "medium": 0, "low": 0}
+                    # Count alerts by severity - solo high e medium per gli alert
+                    severity_counts = {"high": 0, "medium": 0}
                     for alert in alerts:
                         severity = alert.get("severity")
                         if severity in severity_counts:
@@ -234,21 +234,27 @@ def show_home_page(clients):
     hotspots_count = int(summary.get("hotspots_count", 0))
     alerts_count = int(summary.get("alerts_count", 0))
     
-    # Get severity distribution
+    # Get severity distribution for hotspots (include low)
     try:
         if isinstance(summary.get("severity_distribution"), str):
-            severity_dist = json.loads(summary.get("severity_distribution", '{"low": 0, "medium": 0, "high": 0}'))
+            severity_dist = json.loads(summary.get("severity_distribution", '{"medium": 0, "high": 0, "low": 0}'))
         else:
-            severity_dist = summary.get("severity_distribution", {"low": 0, "medium": 0, "high": 0})
+            severity_dist = summary.get("severity_distribution", {"medium": 0, "high": 0, "low": 0})
     except:
-        severity_dist = {"low": 0, "medium": 0, "high": 0}
+        severity_dist = {"medium": 0, "high": 0, "low": 0}
     
     high_severity = severity_dist.get("high", 0)
     medium_severity = severity_dist.get("medium", 0)
     low_severity = severity_dist.get("low", 0)
     
-    # Get alert severity distribution - implementazione migliorata come in alerts.py
-    severity_counts = {"high": 0, "medium": 0, "low": 0}
+    # Verifica che la somma delle severità sia uguale al totale degli hotspot
+    total_severity = high_severity + medium_severity + low_severity
+    if total_severity != hotspots_count and total_severity > 0:
+        # Se i conteggi non corrispondono ma abbiamo dei dati, aggiorniamo il conteggio totale
+        hotspots_count = total_severity
+    
+    # Get alert severity distribution - solo high e medium per gli alert
+    severity_counts = {"high": 0, "medium": 0}
 
     # Se abbiamo già recuperato gli alerts, riutilizziamoli per il conteggio
     if 'alerts' in locals() and alerts:
@@ -270,9 +276,12 @@ def show_home_page(clients):
     # Usa i conteggi calcolati
     high_alerts = severity_counts["high"]
     medium_alerts = severity_counts["medium"]
-    low_alerts = severity_counts["low"]
-    if alerts_count == 0:
-        alerts_count = high_alerts + medium_alerts + low_alerts
+    
+    # Verifica che la somma delle severità sia uguale al totale degli alert
+    total_alerts_severity = high_alerts + medium_alerts
+    if total_alerts_severity != alerts_count and total_alerts_severity > 0:
+        # Se i conteggi non corrispondono ma abbiamo dei dati, aggiorniamo il conteggio totale
+        alerts_count = total_alerts_severity
     
     # Calculate time since last update
     last_updated = summary.get("updated_at", int(time.time() * 1000))
@@ -316,7 +325,7 @@ def show_home_page(clients):
     # Usa le colonne native di Streamlit per la prima riga
     col1, col2, col3, col4 = st.columns(4)
     
-    # Metric 1: Active Hotspots
+    # Metric 1: Active Hotspots - Includiamo anche la severità "low"
     with col1:
         st.markdown(f"""
             <div class='metric-card'>
@@ -330,7 +339,7 @@ def show_home_page(clients):
             </div>
         """, unsafe_allow_html=True)
     
-    # Metric 2: Active Alerts
+    # Metric 2: Active Alerts - Solo high e medium
     with col2:
         st.markdown(f"""
             <div class='metric-card'>
@@ -339,7 +348,6 @@ def show_home_page(clients):
                 <div style='font-size:0.8rem;margin-top:5px;'>
                     <span class="status-high">{high_alerts} High</span> 
                     <span class="status-medium" style='margin-left:5px;'>{medium_alerts} Medium</span>
-                    <span class="status-low" style='margin-left:5px;'>{low_alerts} Low</span>
                 </div>
             </div>
         """, unsafe_allow_html=True)
@@ -564,7 +572,7 @@ def show_home_page(clients):
                             "id": h.get("hotspot_id", h.get("id", "")),
                             "latitude": lat,
                             "longitude": lon,
-                            "severity": h.get("severity", "low"),
+                            "severity": h.get("severity", "medium"),
                             "pollutant_type": h.get("pollutant_type", "unknown").replace("_", " ").title(),
                             "radius_km": radius,
                             "risk_score": risk
@@ -600,7 +608,7 @@ def show_home_page(clients):
                     color_discrete_map={
                         "high": "#e53935",
                         "medium": "#ff9800",
-                        "low": "#4caf50"
+                        "low": "#4caf50"  # Manteniamo il colore per hotspot con severità "low"
                     },
                     size_max=15,
                     opacity=0.8,
@@ -926,7 +934,7 @@ def show_home_page(clients):
             colors = {
                 'high': '#e53935',
                 'medium': '#ff9800',
-                'low': '#4caf50'
+                'low': '#4caf50'  # Manteniamo il colore per hotspot con severità "low"
             }
             
             # Create bar chart
