@@ -43,73 +43,203 @@ AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Metrics for tracking performance
+class SimpleMetrics:
+    """Simple metrics tracking system"""
+    def __init__(self):
+        self.start_time = time.time()
+        self.processed_count = 0
+        self.error_count = 0
+        self.image_count = 0
+    
+    def record_processed(self):
+        """Record a successfully processed message"""
+        self.processed_count += 1
+        if self.processed_count % 10 == 0:  # Log less frequently for images
+            self.log_metrics()
+    
+    def record_error(self):
+        """Record a processing error"""
+        self.error_count += 1
+    
+    def record_image(self):
+        """Record a processed image"""
+        self.image_count += 1
+    
+    def log_metrics(self):
+        """Log current performance metrics"""
+        elapsed = time.time() - self.start_time
+        log_event("metrics_update", "Performance metrics", {
+            "processed_count": self.processed_count,
+            "error_count": self.error_count,
+            "image_count": self.image_count,
+            "images_per_hour": round((self.image_count / elapsed) * 3600, 2) if elapsed > 0 else 0,
+            "uptime_seconds": int(elapsed)
+        })
+
+# Global metrics object
+metrics = SimpleMetrics()
+
+# Funzione per logging strutturato
+def log_event(event_type, message, data=None):
+    """Structured logging function"""
+    log_data = {
+        "event_type": event_type,
+        "component": "satellite_producer",
+        "timestamp": datetime.now().isoformat()
+    }
+    if data:
+        log_data.update(data)
+    logger.info(f"{message}", extra={"data": json.dumps(log_data)})
+
+# Funzione generica di retry con backoff esponenziale
+def retry_operation(operation, max_attempts=5, initial_delay=1):
+    """Retry function with exponential backoff"""
+    attempt = 0
+    delay = initial_delay
+    
+    while attempt < max_attempts:
+        try:
+            return operation()
+        except Exception as e:
+            attempt += 1
+            if attempt >= max_attempts:
+                raise
+            
+            log_event("retry_operation", f"Operation failed (attempt {attempt}/{max_attempts}): {str(e)}, retrying in {delay}s", {
+                "error_type": type(e).__name__,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "delay": delay
+            })
+            time.sleep(delay)
+            delay *= 2  # Exponential backoff
+    
+    # Should never reach here because the last attempt raises an exception
+    raise Exception(f"Operation failed after {max_attempts} attempts")
+
 def build_sh_config() -> SHConfig:
+    """Build Sentinel Hub config from environment variables"""
     cfg = SHConfig()
+    
+    # Get config from toml file if available
     toml_path = UTILS_DIR / "config" / "config.toml"
     cfg_toml = {}
     if toml_path.exists():
         import tomli
         cfg_toml = tomli.loads(toml_path.read_text()).get("default-profile", {})
 
+    # Set configuration from environment variables with fallback to toml
     cfg.sh_client_id = os.getenv("SH_CLIENT_ID", cfg_toml.get("sh_client_id"))
     cfg.sh_client_secret = os.getenv("SH_CLIENT_SECRET", cfg_toml.get("sh_client_secret"))
-    
-    # Add these two lines
     cfg.sh_token_url = os.getenv("SH_TOKEN_URL", "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token")
     cfg.sh_base_url = os.getenv("SH_BASE_URL", "https://sh.dataspace.copernicus.eu")
 
     if not cfg.sh_client_id or not cfg.sh_client_secret:
-        logger.critical("❌ SH_CLIENT_ID / SH_CLIENT_SECRET missing.")
+        log_event("credential_missing", "SH_CLIENT_ID / SH_CLIENT_SECRET missing")
         sys.exit(1)
-    logger.info("Authenticated with Sentinel-Hub")
+    
+    log_event("sentinel_auth", "Authenticated with Sentinel Hub")
     return cfg
 
 def get_minio_client():
-    client = boto3.client(
-        "s3",
-        endpoint_url=f"http://{MINIO_ENDPOINT}",
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
-    )
-    # Create bucket if it doesn't exist
+    """Create MinIO client with retry logic"""
+    def create_client():
+        client = boto3.client(
+            "s3",
+            endpoint_url=f"http://{MINIO_ENDPOINT}",
+            aws_access_key_id=AWS_ACCESS_KEY,
+            aws_secret_access_key=AWS_SECRET_KEY,
+        )
+        # Test connection by listing buckets
+        client.list_buckets()
+        return client
+    
     try:
-        client.head_bucket(Bucket=MINIO_BUCKET)
-    except ClientError:
-        client.create_bucket(Bucket=MINIO_BUCKET)
-        logger.success(f"Created MinIO bucket '{MINIO_BUCKET}'")
-    return client
+        client = retry_operation(create_client, max_attempts=5, initial_delay=2)
+        log_event("minio_connected", "Connected to MinIO")
+        
+        # Create bucket if it doesn't exist
+        try:
+            client.head_bucket(Bucket=MINIO_BUCKET)
+            log_event("bucket_exists", f"MinIO bucket '{MINIO_BUCKET}' exists")
+        except ClientError:
+            client.create_bucket(Bucket=MINIO_BUCKET)
+            log_event("bucket_created", f"Created MinIO bucket '{MINIO_BUCKET}'")
+            
+        return client
+    except Exception as e:
+        log_event("minio_connection_failed", f"Failed to connect to MinIO: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e)
+        })
+        return None
 
-def pick_best_scene(cfg: SHConfig, bbox):
-    catalog = SentinelHubCatalog(cfg)
-    end = date.today()
-    start = end - timedelta(days=DAYS_LOOKBACK)
-    search = catalog.search(
-        collection="sentinel-2-l2a",  # CORRECT: parameter with correct name
-        bbox=bbox,
-        time=(start.isoformat(), end.isoformat()),
-        filter=f"eo:cloud_cover < {CLOUD_LIMIT}",
-        limit=1,
-    )
-    return next(search, None)
+def pick_best_scene(cfg: SHConfig, bbox, buoy_id):
+    """Find the best satellite scene with retry logic"""
+    def search_scenes():
+        catalog = SentinelHubCatalog(cfg)
+        end = date.today()
+        start = end - timedelta(days=DAYS_LOOKBACK)
+        search = catalog.search(
+            collection="sentinel-2-l2a",  # CORRECT: parameter with correct name
+            bbox=bbox,
+            time=(start.isoformat(), end.isoformat()),
+            filter=f"eo:cloud_cover < {CLOUD_LIMIT}",
+            limit=1,
+        )
+        return next(search, None)
+    
+    try:
+        scene = retry_operation(search_scenes, max_attempts=3, initial_delay=2)
+        if scene:
+            log_event("scene_found", f"Found suitable scene for buoy {buoy_id}", {
+                "scene_id": scene.get("id"),
+                "cloud_cover": scene.get("properties", {}).get("eo:cloud_cover"),
+                "datetime": scene.get("properties", {}).get("datetime")
+            })
+        else:
+            log_event("scene_not_found", f"No suitable scene found for buoy {buoy_id}", {
+                "cloud_limit": CLOUD_LIMIT,
+                "days_lookback": DAYS_LOOKBACK
+            })
+        return scene
+    except Exception as e:
+        log_event("scene_search_error", f"Error searching for scene: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "buoy_id": buoy_id
+        })
+        return None
 
 def create_kafka_producer():
-    """Creates a regular Kafka producer"""
-    logger.info("Creating Kafka JSON producer")
-    for _ in range(5):
-        try:
-            return KafkaProducer(
-                bootstrap_servers=KAFKA_BROKERS,
-                value_serializer=lambda v: json.dumps(v).encode('utf-8')
-            )
-        except Exception as e:
-            logger.warning(f"Kafka not reachable, retrying in 5s: {e}")
-            time.sleep(5)
-    logger.critical("Failed to connect to Kafka after 5 attempts. Exiting.")
-    sys.exit(1)
+    """Creates a regular Kafka producer with retry logic"""
+    log_event("kafka_init", "Creating Kafka JSON producer", {
+        "bootstrap_servers": KAFKA_BROKERS
+    })
+    
+    def connect_to_kafka():
+        return KafkaProducer(
+            bootstrap_servers=KAFKA_BROKERS,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+    
+    try:
+        producer = retry_operation(connect_to_kafka, max_attempts=5, initial_delay=5)
+        log_event("kafka_connected", "Successfully connected to Kafka")
+        return producer
+    except Exception as e:
+        log_event("kafka_connection_failed", "Failed to connect to Kafka after multiple attempts", {
+            "error": str(e)
+        })
+        sys.exit(1)
 
 def on_delivery_error(err, msg):
     """Error callback for Kafka producer"""
-    logger.error(f'Message delivery failed: {err}')
+    log_event("kafka_delivery_error", f"Message delivery failed", {
+        "error": str(err)
+    })
+    
     # Send to DLQ if possible
     try:
         dlq_producer = KafkaProducer(
@@ -130,54 +260,192 @@ def on_delivery_error(err, msg):
         }
         dlq_producer.send(DLQ_TOPIC, error_msg)
         dlq_producer.flush()
-        logger.info(f"Message sent to DLQ topic {DLQ_TOPIC}")
+        log_event("dlq_sent", f"Message sent to DLQ", {
+            "dlq_topic": DLQ_TOPIC
+        })
     except Exception as e:
-        logger.error(f"Failed to send to DLQ: {e}")
-        logger.error(traceback.format_exc())
+        log_event("dlq_error", f"Failed to send to DLQ: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e)
+        })
+
+def send_to_kafka(producer, payload):
+    """Send payload to Kafka with retry logic"""
+    def send_operation():
+        future = producer.send(
+            KAFKA_TOPIC, 
+            value=payload
+        )
+        # Wait for the send to complete
+        record_metadata = future.get(timeout=10)
+        return record_metadata
+    
+    try:
+        metadata = retry_operation(send_operation, max_attempts=3, initial_delay=2)
+        log_event("kafka_sent", f"Message sent to Kafka successfully", {
+            "topic": KAFKA_TOPIC,
+            "partition": metadata.partition,
+            "offset": metadata.offset
+        })
+        return True
+    except Exception as e:
+        log_event("kafka_send_error", f"Failed to send message to Kafka: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "topic": KAFKA_TOPIC
+        })
+        
+        # Try to send to DLQ
+        try:
+            dlq_producer = KafkaProducer(
+                bootstrap_servers=KAFKA_BROKERS,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8")
+            )
+            error_msg = {
+                "original_topic": KAFKA_TOPIC,
+                "error": str(e),
+                "timestamp": int(time.time() * 1000),
+                "data": payload
+            }
+            dlq_producer.send(DLQ_TOPIC, error_msg)
+            dlq_producer.flush()
+            log_event("dlq_sent", f"Message sent to DLQ", {
+                "dlq_topic": DLQ_TOPIC
+            })
+        except Exception as dlq_err:
+            log_event("dlq_error", f"Failed to send to DLQ: {str(dlq_err)}", {
+                "error_type": type(dlq_err).__name__,
+                "error_message": str(dlq_err)
+            })
+            
+        return False
+
+def save_to_minio(minio_client, key, data, content_type="application/json"):
+    """Save data to MinIO with retry logic"""
+    def save_operation():
+        minio_client.put_object(
+            Bucket=MINIO_BUCKET,
+            Key=key,
+            Body=data,
+            ContentType=content_type
+        )
+        return True
+    
+    try:
+        retry_operation(save_operation, max_attempts=3, initial_delay=2)
+        log_event("minio_saved", f"Data saved to MinIO successfully", {
+            "bucket": MINIO_BUCKET,
+            "key": key,
+            "size_bytes": len(data) if isinstance(data, bytes) else len(data.encode('utf-8')) if isinstance(data, str) else "unknown"
+        })
+        return True
+    except Exception as e:
+        log_event("minio_save_error", f"Failed to save data to MinIO: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "bucket": MINIO_BUCKET,
+            "key": key
+        })
+        return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     logger.add(lambda m: print(m, end=""), level="INFO")
     
+    log_event("app_start", "Starting Satellite Image Producer")
+    
     # Create Kafka producer
     producer = create_kafka_producer()
-    logger.success("✅ Connected to Kafka")
     
-    sh_cfg = build_sh_config()
+    # Create MinIO client
     minio_cli = get_minio_client()
+    if not minio_cli:
+        log_event("app_exit", "Exiting due to MinIO connection failure")
+        sys.exit(1)
+    
+    # Build Sentinel Hub config
+    sh_cfg = build_sh_config()
+    
+    log_event("app_config", f"Application configuration", {
+        "poll_interval_sec": POLL_SECONDS,
+        "cloud_limit_percent": CLOUD_LIMIT,
+        "days_lookback": DAYS_LOOKBACK
+    })
 
-    logger.info(f"🛰️ Fetch every {POLL_SECONDS}s, clouds < {CLOUD_LIMIT}%")
-
-    while True:
-        for buoy_id, lat, lon, radius_km in fetch_buoy_positions():
-            bbox = bbox_around(lat, lon, radius_km)
-            scene = pick_best_scene(sh_cfg, bbox)
-            if not scene:
-                logger.warning(f"🛰️ No scene <{CLOUD_LIMIT}% for buoy {buoy_id}")
-                continue
-
-            aoi_bbox, aoi_size = get_aoi_bbox_and_size(list(bbox), resolution=10)
-            req = true_color_image_request_processing(
-                aoi_bbox, aoi_size, sh_cfg,
-                start_time_single_image=scene["properties"]["datetime"][:10],
-                end_time_single_image=scene["properties"]["datetime"][:10],
-            )
-            imgs = req.get_data(save_data=False)
-            if not imgs:
-                logger.warning(f"🛰️ Download failed for buoy {buoy_id}")
-                continue
-
-            try:
-                payload = process_image(
-                    imgs,
-                    macroarea_id="BUOY",
-                    microarea_id=buoy_id,
-                    bbox=list(bbox),
-                    iteration=0,
-                )
+    try:
+        while True:
+            cycle_start = time.time()
+            
+            for buoy_id, lat, lon, radius_km in fetch_buoy_positions():
+                process_start = time.time()
                 
-                # Check that payload is not None
-                if payload:
+                # Create bounding box around buoy
+                bbox = bbox_around(lat, lon, radius_km)
+                
+                # Find best scene
+                scene = pick_best_scene(sh_cfg, bbox, buoy_id)
+                if not scene:
+                    continue
+
+                try:
+                    # Prepare AOI parameters
+                    aoi_bbox, aoi_size = get_aoi_bbox_and_size(list(bbox), resolution=10)
+                    
+                    # Create image request
+                    req = true_color_image_request_processing(
+                        aoi_bbox, aoi_size, sh_cfg,
+                        start_time_single_image=scene["properties"]["datetime"][:10],
+                        end_time_single_image=scene["properties"]["datetime"][:10],
+                    )
+                    
+                    # Get image data with retry
+                    def get_image_data():
+                        return req.get_data(save_data=False)
+                    
+                    try:
+                        imgs = retry_operation(get_image_data, max_attempts=3, initial_delay=5)
+                        if not imgs or len(imgs) == 0:
+                            log_event("image_empty", f"No image data received for buoy {buoy_id}")
+                            continue
+                            
+                        log_event("image_retrieved", f"Retrieved image data for buoy {buoy_id}", {
+                            "image_count": len(imgs),
+                            "scene_id": scene["id"]
+                        })
+                    except Exception as e:
+                        log_event("image_retrieval_error", f"Failed to retrieve image data: {str(e)}", {
+                            "error_type": type(e).__name__,
+                            "error_message": str(e),
+                            "buoy_id": buoy_id
+                        })
+                        continue
+
+                    # Process image
+                    try:
+                        payload = process_image(
+                            imgs,
+                            macroarea_id="BUOY",
+                            microarea_id=buoy_id,
+                            bbox=list(bbox),
+                            iteration=0,
+                        )
+                        
+                        if not payload:
+                            log_event("processing_error", f"Image processing failed for buoy {buoy_id}")
+                            continue
+                            
+                        log_event("image_processed", f"Successfully processed image for buoy {buoy_id}")
+                        
+                        # Record processed image
+                        metrics.record_image()
+                    except Exception as e:
+                        log_event("processing_error", f"Error processing image: {str(e)}", {
+                            "error_type": type(e).__name__,
+                            "error_message": str(e),
+                            "buoy_id": buoy_id
+                        })
+                        continue
+                    
                     # --- save JSON to MinIO --------------------------------------------------
                     # Get current date for partitioning
                     current_date = datetime.now()
@@ -189,58 +457,73 @@ def main() -> None:
                     # Correct path according to defined structure
                     json_key = f"satellite_imagery/sentinel2/year={year}/month={month}/day={day}/metadata_{scene['id']}_{timestamp}.json"
                     
-                    minio_cli.put_object(
-                        Bucket=MINIO_BUCKET,
-                        Key=json_key,
-                        Body=json.dumps(payload).encode("utf-8"),
-                        ContentType="application/json",
-                    )
-
+                    # Serialize payload for storage
+                    if isinstance(payload, str):
+                        json_data = payload
+                    else:
+                        json_data = json.dumps(payload)
+                    
+                    # Save to MinIO
+                    minio_success = save_to_minio(minio_cli, json_key, json_data)
+                    
+                    if not minio_success:
+                        log_event("minio_error", f"Failed to save data to MinIO for buoy {buoy_id}")
+                        # Continue anyway to try sending to Kafka
+                    
                     # --- send to Kafka --------------------------------------------------------
-                    try:
-                        # Prepare the message payload
-                        if isinstance(payload, str):
-                            kafka_payload = json.loads(payload)
-                        else:
-                            kafka_payload = payload
-                            
-                        # Send to Kafka
-                        producer.send(KAFKA_TOPIC, value=kafka_payload) \
-                                .add_callback(on_send_success) \
-                                .add_errback(on_send_error)
-                        producer.flush()
+                    # Prepare the message payload
+                    if isinstance(payload, str):
+                        kafka_payload = json.loads(payload)
+                    else:
+                        kafka_payload = payload
                         
-                        logger.info(f"🛰️ Buoy {buoy_id} → image + metadata JSON sent")
-                    except Exception as e:
-                        logger.error(f"🛰️ Kafka send error: {e}")
-                        # Send to DLQ
-                        try:
-                            dlq_producer = KafkaProducer(
-                                bootstrap_servers=KAFKA_BROKERS,
-                                value_serializer=lambda v: json.dumps(v).encode("utf-8")
-                            )
-                            error_msg = {
-                                "original_topic": KAFKA_TOPIC,
-                                "error": str(e),
-                                "timestamp": int(time.time() * 1000),
-                                "data": payload if isinstance(payload, dict) else json.loads(payload) if isinstance(payload, str) else None
-                            }
-                            dlq_producer.send(DLQ_TOPIC, error_msg)
-                            dlq_producer.flush()
-                            logger.info(f"Message sent to DLQ topic {DLQ_TOPIC}")
-                        except Exception as dlq_err:
-                            logger.error(f"Failed to send to DLQ: {dlq_err}")
-                else:
-                    logger.warning(f"🛰️ Buoy {buoy_id} → image process failed, no payload")
-            except Exception as e:
-                logger.error(f"🛰️ Buoy {buoy_id} → processing error: {e}")
-                logger.error(traceback.format_exc())
+                    # Send to Kafka
+                    kafka_success = send_to_kafka(producer, kafka_payload)
+                    
+                    if kafka_success:
+                        # Record successful processing
+                        metrics.record_processed()
+                        
+                        log_event("buoy_complete", f"Successfully processed buoy {buoy_id}", {
+                            "processing_time_ms": int((time.time() - process_start) * 1000)
+                        })
+                    else:
+                        # Record error
+                        metrics.record_error()
+                        
+                except Exception as e:
+                    metrics.record_error()
+                    log_event("buoy_processing_error", f"Error processing buoy {buoy_id}: {str(e)}", {
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                        "traceback": traceback.format_exc(),
+                        "buoy_id": buoy_id
+                    })
 
-        time.sleep(POLL_SECONDS)
+            # Calculate cycle duration and sleep for remaining time
+            cycle_duration = time.time() - cycle_start
+            sleep_time = max(0, POLL_SECONDS - cycle_duration)
+            
+            log_event("cycle_complete", f"Completed processing cycle", {
+                "cycle_duration_sec": round(cycle_duration, 1),
+                "sleep_time_sec": round(sleep_time, 1)
+            })
+            
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        log_event("app_shutdown", "Application shutdown requested by user")
+    except Exception as e:
+        log_event("app_error", f"Unexpected error: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc()
+        })
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logger.warning("Interrupted by keyboard — exit.")
+        log_event("app_shutdown", "Interrupted by keyboard — exit.")

@@ -20,22 +20,104 @@ EVENT_COUNT = 0
 logger.remove()
 logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
 
+# Metrics for tracking performance
+class SimpleMetrics:
+    """Simple metrics tracking system"""
+    def __init__(self):
+        self.start_time = time.time()
+        self.processed_count = 0
+        self.error_count = 0
+        self.event_count = 0
+    
+    def record_processed(self):
+        """Record a successfully processed message"""
+        self.processed_count += 1
+        if self.processed_count % 100 == 0:
+            self.log_metrics()
+    
+    def record_error(self):
+        """Record a processing error"""
+        self.error_count += 1
+    
+    def record_event(self):
+        """Record a pollution event"""
+        self.event_count += 1
+    
+    def log_metrics(self):
+        """Log current performance metrics"""
+        elapsed = time.time() - self.start_time
+        log_event("metrics_update", "Performance metrics", {
+            "processed_count": self.processed_count,
+            "error_count": self.error_count,
+            "event_count": self.event_count,
+            "messages_per_second": round(self.processed_count / elapsed if elapsed > 0 else 0, 2),
+            "uptime_seconds": int(elapsed)
+        })
+
+# Global metrics object
+metrics = SimpleMetrics()
+
 # Global state to maintain consistent data between runs
 location_states = {}
 
+# Funzione per logging strutturato
+def log_event(event_type, message, data=None):
+    """Structured logging function"""
+    log_data = {
+        "event_type": event_type,
+        "component": "buoy_simulator",
+        "timestamp": datetime.now().isoformat()
+    }
+    if data:
+        log_data.update(data)
+    logger.info(f"{message}", extra={"data": json.dumps(log_data)})
+
+# Funzione generica di retry con backoff esponenziale
+def retry_operation(operation, max_attempts=5, initial_delay=1):
+    """Retry function with exponential backoff"""
+    attempt = 0
+    delay = initial_delay
+    
+    while attempt < max_attempts:
+        try:
+            return operation()
+        except Exception as e:
+            attempt += 1
+            if attempt >= max_attempts:
+                raise
+            
+            log_event("retry_operation", f"Operation failed (attempt {attempt}/{max_attempts}): {str(e)}, retrying in {delay}s", {
+                "error_type": type(e).__name__,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "delay": delay
+            })
+            time.sleep(delay)
+            delay *= 2  # Exponential backoff
+    
+    # Should never reach here because the last attempt raises an exception
+    raise Exception(f"Operation failed after {max_attempts} attempts")
+
 def create_kafka_producer():
     """Creates a Kafka JSON producer with retries"""
-    logger.info("Creating Kafka JSON producer")
-    for _ in range(5):
-        try:
-            return KafkaProducer(
-                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-                value_serializer=lambda v: json.dumps(v).encode("utf-8"))
-        except NoBrokersAvailable:
-            logger.warning("Kafka not reachable, retrying in 5s...")
-            time.sleep(5)
-    logger.critical("Kafka unavailable. Exiting.")
-    sys.exit(1)
+    log_event("kafka_init", "Creating Kafka JSON producer", {
+        "bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS
+    })
+    
+    def connect_to_kafka():
+        return KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"))
+    
+    try:
+        producer = retry_operation(connect_to_kafka, max_attempts=5, initial_delay=5)
+        log_event("kafka_connected", "Successfully connected to Kafka")
+        return producer
+    except Exception as e:
+        log_event("kafka_connection_failed", "Failed to connect to Kafka after multiple attempts", {
+            "error": str(e)
+        })
+        sys.exit(1)
 
 def initialize_location_state(location_id, lat, lon):
     """Initialize the baseline state for a location if not already present"""
@@ -85,6 +167,14 @@ def initialize_location_state(location_id, lat, lon):
         "active_events": [],
         "last_update": time.time()
     }
+    
+    log_event("location_initialized", f"Initialized location state", {
+        "location_id": location_id,
+        "latitude": lat,
+        "longitude": lon,
+        "is_coastal": is_coastal,
+        "is_tropical": is_tropical
+    })
 
 def is_location_coastal(lat, lon):
     """Simple check if location is likely coastal based on latitude/longitude"""
@@ -135,6 +225,8 @@ def get_daily_factor():
 
 def update_location_state(location_id, lat, lon):
     """Update the location state based on time patterns and events"""
+    start_time = time.time()
+    
     if location_id not in location_states:
         initialize_location_state(location_id, lat, lon)
     
@@ -240,11 +332,19 @@ def update_location_state(location_id, lat, lon):
     result["latitude"] = lat
     result["longitude"] = lon
     
+    # Log completion
+    processing_time = time.time() - start_time
+    log_event("state_updated", f"Updated location state", {
+        "location_id": location_id,
+        "processing_time_ms": int(processing_time * 1000)
+    })
+    
     return result
 
 def process_pollution_events(location_id):
     """Process any active pollution events for this location with global halving probability"""
     global EVENT_PROBABILITY, EVENT_COUNT
+    start_time = time.time()
     
     state = location_states[location_id]
     current = state["current"]
@@ -314,7 +414,13 @@ def process_pollution_events(location_id):
             
             # Add to updated list
             updated_events.append(event)
-            logger.info(f"🔄 Active {event['type']} at {location_id} (remaining: {event['duration']} cycles)")
+            log_event("event_active", f"Active {event['type']} at {location_id}", {
+                "location_id": location_id,
+                "event_type": event["type"],
+                "duration_remaining": event["duration"],
+                "intensity": event["intensity"],
+                "severity": event["severity"]
+            })
     
     # Store updated events list
     state["active_events"] = updated_events
@@ -366,14 +472,26 @@ def process_pollution_events(location_id):
             current["petroleum_hydrocarbons"] *= (3.0 + intensity * 5.0)
             current["polycyclic_aromatic"] *= (2.0 + intensity * 4.0)
             current["dissolved_oxygen"] *= (0.7 - intensity * 0.2)
-            logger.warning(f"🛢️ NEW {severity} oil spill event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
+            log_event("event_new", f"NEW {severity} oil spill event", {
+                "location_id": location_id,
+                "event_type": "oil_spill",
+                "intensity": round(intensity, 2),
+                "duration": duration,
+                "severity": severity
+            })
             
         elif event_type == "chemical_leak":
             # Chemical leak drastically increases heavy metals - effect scales with intensity
             current["mercury"] *= (3.0 + intensity * 7.0)
             current["lead"] *= (2.0 + intensity * 6.0)
             current["cadmium"] *= (2.0 + intensity * 6.0)
-            logger.warning(f"⚗️ NEW {severity} chemical leak event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
+            log_event("event_new", f"NEW {severity} chemical leak event", {
+                "location_id": location_id,
+                "event_type": "chemical_leak",
+                "intensity": round(intensity, 2),
+                "duration": duration,
+                "severity": severity
+            })
             
         elif event_type == "algal_bloom":
             # Algal bloom drastically increases chlorophyll and nutrients - effect scales with intensity
@@ -381,19 +499,39 @@ def process_pollution_events(location_id):
             current["nitrates"] *= (2.0 + intensity * 3.0)
             current["phosphates"] *= (2.0 + intensity * 4.0)
             current["dissolved_oxygen"] *= (0.6 - intensity * 0.2)
-            logger.warning(f"🌱 NEW {severity} algal bloom event at {location_id} (intensity: {intensity:.2f}, duration: {duration} cycles)")
+            log_event("event_new", f"NEW {severity} algal bloom event", {
+                "location_id": location_id,
+                "event_type": "algal_bloom",
+                "intensity": round(intensity, 2),
+                "duration": duration,
+                "severity": severity
+            })
         
         # Add to active events
         state["active_events"] = [new_event]
         
         # Increment global event count
         EVENT_COUNT += 1
+        
+        # Update metrics
+        metrics.record_event()
 
         # Halve the global probability for next event, but don't go below 0.005 (0.5%)
         EVENT_PROBABILITY = max(0.005, EVENT_PROBABILITY / 4.0)
         
         # Log the new probability
-        logger.info(f"📉 Global event probability decreased to {EVENT_PROBABILITY:.1%}")
+        log_event("event_probability", f"Global event probability decreased", {
+            "new_probability": round(EVENT_PROBABILITY, 3),
+            "event_count": EVENT_COUNT
+        })
+    
+    # Log completion
+    processing_time = time.time() - start_time
+    log_event("events_processed", f"Processed pollution events", {
+        "location_id": location_id,
+        "active_events": len(updated_events),
+        "processing_time_ms": int(processing_time * 1000)
+    })
 
 def calculate_water_quality_index(data):
     """Calculates a Water Quality Index from sensor parameters"""
@@ -537,88 +675,178 @@ def validate_sensor_data(data):
     for param, (min_val, max_val) in valid_ranges.items():
         if param in data and data[param] is not None:
             # Ensure value is within range
+            if data[param] < min_val or data[param] > max_val:
+                log_event("data_validation", f"Parameter {param} out of range, fixing", {
+                    "parameter": param,
+                    "original_value": data[param],
+                    "min_value": min_val,
+                    "max_value": max_val
+                })
             data[param] = max(min_val, min(max_val, data[param]))
     
     return data
 
+def send_to_kafka(producer, topic, data):
+    """Send data to Kafka with retry logic"""
+    def send_operation():
+        future = producer.send(topic, value=data)
+        producer.flush()
+        return future.get(timeout=10)  # Wait for the result with a timeout
+    
+    try:
+        retry_operation(send_operation, max_attempts=3, initial_delay=1)
+        log_event("kafka_sent", f"Data sent to Kafka successfully", {
+            "topic": topic,
+            "location_id": data.get("sensor_id", "unknown")
+        })
+        return True
+    except Exception as e:
+        log_event("kafka_send_error", f"Failed to send data to Kafka: {str(e)}", {
+            "error_type": type(e).__name__,
+            "topic": topic,
+            "location_id": data.get("sensor_id", "unknown")
+        })
+        return False
+
+def send_to_dlq(data, error, original_topic):
+    """Send failed message to Dead Letter Queue"""
+    try:
+        dlq_producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        )
+        error_msg = {
+            "original_topic": original_topic,
+            "error": str(error),
+            "timestamp": int(time.time() * 1000),
+            "data": data
+        }
+        dlq_producer.send(DLQ_TOPIC, error_msg)
+        dlq_producer.flush()
+        log_event("dlq_sent", f"Message sent to DLQ", {
+            "dlq_topic": DLQ_TOPIC,
+            "original_topic": original_topic,
+            "error": str(error)
+        })
+        return True
+    except Exception as dlq_err:
+        log_event("dlq_error", f"Failed to send to DLQ: {str(dlq_err)}", {
+            "error_type": type(dlq_err).__name__,
+            "dlq_topic": DLQ_TOPIC
+        })
+        return False
+
 # Main loop
 def main():
+    log_event("app_start", "Starting Buoy Simulator")
+    
     # Load location data
-    locs = yaml.safe_load(open("locations.yml"))
+    try:
+        locs = yaml.safe_load(open("locations.yml"))
+        log_event("locations_loaded", f"Loaded {len(locs)} locations from file")
+    except Exception as e:
+        log_event("location_load_error", f"Failed to load locations: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e)
+        })
+        sys.exit(1)
     
     # Create Kafka producer
     prod = create_kafka_producer()
-    logger.success("✅ Connected to Kafka")
     
-    logger.info("🔄 Mode: Realistic simulation with global halving probability")
-    logger.info(f"⚠️ First event 100% probability, then halves globally after each event to minimum 1%")
-    logger.info(f"📊 Event severity distributed evenly: HIGH → MEDIUM → LOW → repeat")
+    log_event("simulation_mode", "Running in realistic simulation mode", {
+        "first_event_probability": EVENT_PROBABILITY,
+        "event_severity_distribution": "HIGH → MEDIUM → LOW → repeat"
+    })
 
-    while True:
-        for loc in locs:
-            # Get location info
-            location_id = loc["id"]
-            lat = loc["lat"]
-            lon = loc["lon"]
+    try:
+        while True:
+            cycle_start = time.time()
             
-            # Update the state and get current data
-            buoy = update_location_state(location_id, lat, lon)
+            for loc in locs:
+                # Get location info
+                location_id = loc["id"]
+                lat = loc["lat"]
+                lon = loc["lon"]
+                
+                process_start = time.time()
+                
+                # Update the state and get current data
+                buoy = update_location_state(location_id, lat, lon)
+                
+                # Process any active pollution events
+                process_pollution_events(location_id)
+                
+                # Validate data to ensure realistic values
+                buoy = validate_sensor_data(buoy)
+                
+                # Add timestamp
+                buoy["timestamp"] = int(time.time()*1000)
+                
+                # Calculate Water Quality Index
+                buoy["water_quality_index"] = calculate_water_quality_index(buoy)
+                
+                # Send data to Kafka
+                success = send_to_kafka(prod, KAFKA_TOPIC, buoy)
+                
+                if not success:
+                    # Send to DLQ
+                    send_to_dlq(buoy, "Failed to send to Kafka", KAFKA_TOPIC)
+                
+                # Record successful processing
+                metrics.record_processed()
+                
+                # Log detailed data
+                log_event("buoy_data", f"Generated data for {location_id}", {
+                    "location_id": location_id,
+                    "coordinates": {"lat": lat, "lon": lon},
+                    "environmental": {
+                        "ph": round(buoy.get("ph", 0), 2),
+                        "temperature": round(buoy.get("temperature", 0), 1),
+                        "wind_speed": round(buoy.get("wind_speed", 0), 1)
+                    },
+                    "sea_conditions": {
+                        "wave_height": round(buoy.get("wave_height", 0), 1),
+                        "pressure": round(buoy.get("pressure", 0), 1)
+                    },
+                    "water_quality": {
+                        "wqi": round(buoy.get("water_quality_index", 0), 1),
+                        "microplastics": round(buoy.get("microplastics", 0), 2),
+                        "mercury": round(buoy.get("mercury", 0), 5),
+                        "lead": round(buoy.get("lead", 0), 5),
+                        "petroleum_hydrocarbons": round(buoy.get("petroleum_hydrocarbons", 0), 3),
+                        "nitrates": round(buoy.get("nitrates", 0), 2),
+                        "phosphates": round(buoy.get("phosphates", 0), 3),
+                        "coliform_bacteria": buoy.get("coliform_bacteria", 0),
+                        "chlorophyll_a": round(buoy.get("chlorophyll_a", 0), 2)
+                    },
+                    "processing_time_ms": int((time.time() - process_start) * 1000)
+                })
             
-            # Process any active pollution events
-            process_pollution_events(location_id)
+            # Calculate cycle duration and sleep for remaining time
+            cycle_duration = time.time() - cycle_start
+            sleep_time = max(0, POLL_INTERVAL_SEC - cycle_duration)
             
-            # Validate data to ensure realistic values
-            buoy = validate_sensor_data(buoy)
+            log_event("cycle_complete", f"Completed data generation cycle", {
+                "locations_processed": len(locs),
+                "cycle_duration_sec": round(cycle_duration, 1),
+                "sleep_time_sec": round(sleep_time, 1)
+            })
             
-            # Add timestamp
-            buoy["timestamp"] = int(time.time()*1000)
-            
-            # Calculate Water Quality Index
-            buoy["water_quality_index"] = calculate_water_quality_index(buoy)
-            
-            # Send data to Kafka
-            try:
-                prod.send(KAFKA_TOPIC, value=buoy)
-            except Exception as e:
-                logger.error(f"Error sending data for {location_id}: {e}")
-                # Send to DLQ
-                try:
-                    dlq_producer = KafkaProducer(
-                        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-                        value_serializer=lambda v: json.dumps(v).encode("utf-8")
-                    )
-                    error_msg = {
-                        "original_topic": KAFKA_TOPIC,
-                        "error": str(e),
-                        "timestamp": int(time.time() * 1000),
-                        "data": buoy
-                    }
-                    dlq_producer.send(DLQ_TOPIC, error_msg)
-                    dlq_producer.flush()
-                    logger.info(f"Message sent to DLQ topic {DLQ_TOPIC}")
-                except Exception as dlq_err:
-                    logger.error(f"Failed to send to DLQ: {dlq_err}")
-            
-            # Detailed log of sent data
-            logger.info(f"→ SENT {loc['id']} ({loc['lat']}, {loc['lon']})")
-            logger.info(f"  📊 Environmental: pH={buoy.get('ph', 'N/A'):.2f}, Temp={buoy.get('temperature', 'N/A'):.1f}°C, Wind={buoy.get('wind_speed', 'N/A'):.1f}kt")
-            logger.info(f"  🌊 Sea: Waves={buoy.get('wave_height', 'N/A'):.1f}m, Pressure={buoy.get('pressure', 'N/A'):.1f}hPa")
-            logger.info(f"  🔬 WQI={buoy.get('water_quality_index', 'N/A'):.1f}")
-            logger.info(f"  🧪 Microplastics={buoy.get('microplastics', 'N/A'):.2f} part/m³")
-            logger.info(f"  ⚗️ Metals: Hg={buoy.get('mercury', 'N/A'):.5f}mg/L, Pb={buoy.get('lead', 'N/A'):.5f}mg/L")
-            logger.info(f"  🛢️ Hydrocarbons: TPH={buoy.get('petroleum_hydrocarbons', 'N/A'):.3f}mg/L")
-            logger.info(f"  🌱 Nutrients: NO3={buoy.get('nitrates', 'N/A'):.2f}mg/L, PO4={buoy.get('phosphates', 'N/A'):.3f}mg/L")
-            logger.info(f"  🦠 Biological: Coliform={buoy.get('coliform_bacteria', 'N/A')}, Chlorophyll={buoy.get('chlorophyll_a', 'N/A'):.2f}μg/L")
-            logger.info("  " + "-"*80)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
-        # Flush producer
-        prod.flush()
-            
-        logger.info(f"Sleep {POLL_INTERVAL_SEC} seconds\n")
-        time.sleep(POLL_INTERVAL_SEC)
+    except KeyboardInterrupt:
+        log_event("app_shutdown", "Application shutdown requested by user")
+    except Exception as e:
+        log_event("app_error", f"Unexpected error: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": traceback.format_exc()
+        })
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logger.warning("Interrupted from keyboard — exit.")
+        log_event("app_shutdown", "Interrupted from keyboard — exit.")
