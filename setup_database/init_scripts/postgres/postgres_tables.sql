@@ -68,3 +68,14 @@ CREATE TABLE IF NOT EXISTS alert_notification_config (
 CREATE INDEX IF NOT EXISTS idx_alert_notification_config_region ON alert_notification_config(region_id);
 CREATE INDEX IF NOT EXISTS idx_alert_notification_config_severity ON alert_notification_config(severity_level);
 CREATE INDEX IF NOT EXISTS idx_alert_notification_config_active ON alert_notification_config(active);
+
+-- Aggiungi indici per ottimizzare le query spaziali
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_lat ON pollution_alerts(latitude);
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_lon ON pollution_alerts(longitude);
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_latlon ON pollution_alerts(latitude, longitude);
+
+-- Aggiungi indice composito per le query che usano pollutant_type e status insieme
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_type_status ON pollution_alerts(pollutant_type, status);
+
+-- Ottimizza le query temporali
+CREATE INDEX IF NOT EXISTS idx_pollution_alerts_time_status ON pollution_alerts(alert_time, status);

@@ -390,7 +390,7 @@ def process_pollution_events(location_id):
         EVENT_COUNT += 1
 
         # Halve the global probability for next event, but don't go below 0.005 (0.5%)
-        EVENT_PROBABILITY = max(0.005, EVENT_PROBABILITY / 2.0)
+        EVENT_PROBABILITY = max(0.005, EVENT_PROBABILITY / 4.0)
         
         # Log the new probability
         logger.info(f"📉 Global event probability decreased to {EVENT_PROBABILITY:.1%}")

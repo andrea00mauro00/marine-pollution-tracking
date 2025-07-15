@@ -149,6 +149,9 @@ def init_postgres():
             password=POSTGRES_PASSWORD
         ) as conn:
             with conn.cursor() as cur:
+                # Imposta timeout predefinito
+                cur.execute("SET statement_timeout = '30000';")  # 30 secondi
+                
                 # Esegui tutti gli script SQL nella directory init_scripts/postgres
                 script_dir = Path("init_scripts/postgres")
                 for sql_file in sorted(script_dir.glob("*.sql")):
@@ -156,6 +159,33 @@ def init_postgres():
                     with open(sql_file, "r") as f:
                         sql_script = f.read()
                         cur.execute(sql_script)
+                
+                # Aggiorna lo schema della tabella pollution_alerts se necessario
+                try:
+                    logger.info("Verifica e aggiunta colonne necessarie alla tabella pollution_alerts")
+                    cur.execute("""
+                        ALTER TABLE IF EXISTS pollution_alerts 
+                        ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
+                        ADD COLUMN IF NOT EXISTS superseded_by TEXT DEFAULT NULL,
+                        ADD COLUMN IF NOT EXISTS supersedes TEXT DEFAULT NULL,
+                        ADD COLUMN IF NOT EXISTS recommendations JSONB DEFAULT NULL
+                    """)
+                    
+                    # Crea indici per le nuove colonne
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_status ON pollution_alerts(status);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_superseded_by ON pollution_alerts(superseded_by);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_supersedes ON pollution_alerts(supersedes);")
+                    
+                    # Aggiunta indici spaziali
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_lat ON pollution_alerts(latitude);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_lon ON pollution_alerts(longitude);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_latlon ON pollution_alerts(latitude, longitude);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_type_status ON pollution_alerts(pollutant_type, status);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_pollution_alerts_time_status ON pollution_alerts(alert_time, status);")
+                    
+                    logger.info("✅ Schema pollution_alerts aggiornato con successo")
+                except Exception as e:
+                    logger.warning(f"Errore nell'aggiornamento dello schema pollution_alerts: {e}")
                 
                 conn.commit()
                 logger.info("✅ Schema PostgreSQL inizializzato con successo")
@@ -173,7 +203,7 @@ def init_redis():
         # Pulisci tutte le chiavi esistenti
         existing_keys = r.keys("hotspot:*") + r.keys("spatial:*") + r.keys("config:*") + \
                         r.keys("counters:*") + r.keys("dashboard:*") + r.keys("alert:*") + \
-                        r.keys("locks:*")  # Aggiunto locks:*
+                        r.keys("locks:*") + r.keys("recommendations:*")  # Aggiunto recommendations:*
         if existing_keys:
             r.delete(*existing_keys)
             logger.info(f"Rimosse {len(existing_keys)} chiavi Redis esistenti")
@@ -193,10 +223,13 @@ def init_redis():
         r.set("config:cache:predictions_ttl", "7200")          # TTL per previsioni (2 ore)
         r.set("config:dashboard:max_items", "50")              # Numero massimo elementi in liste dashboard
         
-        # Configurazioni per lock distribuiti (nuove)
+        # Configurazioni per lock distribuiti
         r.set("config:locks:hotspot_ttl", "10")                # TTL per lock hotspot (10 secondi)
         r.set("config:locks:retry_count", "3")                 # Numero tentativi per acquisire lock
         r.set("config:locks:retry_delay", "100")               # Delay tra tentativi (ms)
+        
+        # Configurazioni per raccomandazioni
+        r.set("config:recommendations:ttl", "86400")           # TTL per raccomandazioni (24 ore)
         
         # Inizializza contatori
         r.set("counters:hotspots:total", "0")                  # Totale hotspot rilevati
@@ -206,12 +239,16 @@ def init_redis():
         r.set("counters:alerts:by_severity:high", "0")         # Alert per severità
         r.set("counters:alerts:by_severity:medium", "0")
         r.set("counters:alerts:by_severity:low", "0")
+        r.set("counters:alerts:superseded", "0")               # Alert sostituiti
         r.set("counters:hotspots:active", "0")                 # Hotspot attivi
         r.set("counters:hotspots:inactive", "0")               # Hotspot inattivi
         
         # Crea strutture di base per tracciamento
         r.sadd("hotspot:indices", "spatial")
         r.sadd("dashboard:indices", "hotspots", "alerts", "predictions")
+        
+        # Crea strutture di base per alert
+        r.sadd("dashboard:alerts:types", "active", "superseded")
         
         # Impostazione TTL
         r.set("config:cache:hotspot_metadata_ttl", "86400")    # 24 ore

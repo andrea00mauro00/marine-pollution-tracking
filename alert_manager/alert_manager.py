@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import logging
+import math
 import redis
 import requests
 import psycopg2
@@ -298,21 +299,37 @@ def send_intervention_webhook(alert_data, recommendations):
         logger.error(f"Error sending webhook: {e}")
         return False
 
-import math
-from datetime import datetime
-from psycopg2.extras import Json
+def send_email_notification(alert_data, recommendations, recipients):
+    """Invia notifiche email agli stakeholder"""
+    # Implementazione semplificata per esempio
+    logger.info(f"Email inviata a {len(recipients)} destinatari")
+    return True
 
 def process_alert(data, postgres_conn, redis_conn, notification_configs):
     """Processa alert e invia notifiche"""
     try:
+        # Aggiunto logging del tempo di elaborazione
+        start_time = time.time()
+        logger.info(f"Inizio elaborazione alert, timestamp: {start_time}")
+        
+        # Impostazione timeout per le query
+        with postgres_conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '10000';")  # 10 secondi di timeout
+            postgres_conn.commit()
+        
         # Verifica presenza di hotspot_id
         if 'hotspot_id' not in data:
             logger.warning("Alert senza hotspot_id ricevuto, ignorato")
             return
             
         # Estrai informazioni dall'alert
-        alert_id = data.get('alert_id', f"alert_{str(uuid.uuid4())}")
         hotspot_id = data['hotspot_id']
+        # Genera l'alert_id derivandolo dall'hotspot_id
+        alert_id = data.get('alert_id', f"alert_{hotspot_id}")
+        
+        # Log informativo
+        logger.info(f"Processando alert ID: {alert_id} da hotspot {hotspot_id}")
+        
         severity = data.get('severity', 'medium')  # Default a medium se non specificato
         pollutant_type = data.get('pollutant_type', 'unknown')  # Default a unknown se non specificato
         
@@ -330,13 +347,16 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
         
         # 1. Verifica se esiste già record in database
         with postgres_conn.cursor() as cur:
-            cur.execute("SELECT alert_id FROM pollution_alerts WHERE alert_id = %s", (alert_id,))
+            cur.execute("SELECT alert_id, status FROM pollution_alerts WHERE alert_id = %s", (alert_id,))
             existing_alert = cur.fetchone()
             if existing_alert:
-                # Non usciamo subito, potrebbe essere necessario aggiornare il record
-                logger.info(f"Alert {alert_id} già presente in database, verificheremo se aggiornare")
+                existing_id, existing_status = existing_alert
+                if existing_status == 'superseded':
+                    logger.info(f"Alert {alert_id} già presente ma superseded, continuiamo aggiornamento")
+                else:
+                    logger.info(f"Alert {alert_id} già presente con status {existing_status}, verificheremo se aggiornare")
             
-            # 2. NUOVA LOGICA: Verifica se esiste un alert spazialmente vicino entro 500 metri
+            # 2. Verifica se esiste un alert spazialmente vicino entro 500 metri
             # Usa un raggio di ricerca di 0.005 gradi (circa 500 metri all'equatore)
             spatial_threshold = 0.005
             
@@ -354,99 +374,137 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 
                 return c * r
             
-            # Prima prova con PostGIS se disponibile
+            # Ottimizza la ricerca spaziale per evitare blocchi
             try:
-                cur.execute("""
-                    SELECT EXISTS (
-                        SELECT 1 FROM information_schema.tables 
-                        WHERE table_name = 'spatial_ref_sys'
-                    )
-                """)
-                has_postgis = cur.fetchone()[0]
+                # Prima verifica se la tabella è vuota per evitare query inutili
+                cur.execute("SELECT COUNT(*) FROM pollution_alerts LIMIT 1")
+                table_has_data = cur.fetchone()[0] > 0
                 
-                if has_postgis:
-                    cur.execute("""
-                        SELECT alert_id, source_id, pollutant_type, severity, alert_time, status, latitude, longitude
-                        FROM pollution_alerts 
-                        WHERE 
-                            ST_DWithin(
-                                ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography,
-                                ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
-                                500  -- 500 metri
-                            )
-                            AND pollutant_type = %s
-                            AND status = 'active'
-                            AND alert_time > NOW() - INTERVAL '24 hours'
-                    """, (longitude, latitude, pollutant_type))
+                # Se la tabella è vuota, salta completamente la ricerca spaziale
+                if not table_has_data:
+                    logger.info("Tabella pollution_alerts vuota, skippo la ricerca spaziale")
+                    nearby_alerts = []
                 else:
-                    # Fallback a bounding box se PostGIS non è disponibile
-                    raise Exception("PostGIS non disponibile")
+                    # Prova la ricerca con PostGIS
+                    try:
+                        cur.execute("""
+                            SELECT EXISTS (
+                                SELECT 1 FROM information_schema.tables 
+                                WHERE table_name = 'spatial_ref_sys'
+                            )
+                        """)
+                        has_postgis = cur.fetchone()[0]
+                        
+                        if has_postgis:
+                            cur.execute("""
+                                SELECT alert_id, source_id, pollutant_type, severity, alert_time, status, latitude, longitude
+                                FROM pollution_alerts 
+                                WHERE 
+                                    ST_DWithin(
+                                        ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography,
+                                        ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                                        500  -- 500 metri
+                                    )
+                                    AND pollutant_type = %s
+                                    AND status = 'active'
+                                    AND alert_time > NOW() - INTERVAL '24 hours'
+                                    AND alert_id <> %s  -- Esclude l'alert stesso
+                            """, (longitude, latitude, pollutant_type, alert_id))
+                        else:
+                            raise Exception("PostGIS non disponibile")
+                    except Exception as e:
+                        logger.warning(f"Fallback a ricerca semplificata: {e}")
+                        
+                        # Ricerca semplificata che usa solo indici esistenti
+                        # e evita la query spaziale costosa
+                        cur.execute("""
+                            SELECT alert_id, source_id, pollutant_type, severity, alert_time, status, latitude, longitude
+                            FROM pollution_alerts 
+                            WHERE 
+                                pollutant_type = %s AND
+                                status = 'active' AND
+                                alert_time > NOW() - INTERVAL '24 hours' AND
+                                alert_id <> %s
+                            LIMIT 20
+                        """, (pollutant_type, alert_id))
+                    
+                    nearby_alerts = cur.fetchall()
+                    
+                    # Filtra manualmente per distanza solo se abbiamo risultati
+                    if nearby_alerts:
+                        logger.info(f"Trovati {len(nearby_alerts)} alert da filtrare per distanza")
+                        filtered_alerts = []
+                        for alert in nearby_alerts:
+                            nearby_alert_id, nearby_source_id, nearby_pollutant, nearby_severity, nearby_time, nearby_status, nearby_lat, nearby_lon = alert
+                            
+                            # Calcola distanza effettiva in km
+                            distance = haversine(latitude, longitude, nearby_lat, nearby_lon)
+                            
+                            # Se entro 500 metri, considera come candidato
+                            if distance <= 0.5:
+                                filtered_alerts.append((alert, distance))
+                        
+                        nearby_alerts = [a[0] for a in filtered_alerts]
+                        logger.info(f"Dopo filtro distanza: {len(nearby_alerts)} alert validi")
             except Exception as e:
-                logger.warning(f"Fallback a bounding box per la ricerca spaziale: {e}")
-                
-                # Usa bounding box per selezionare candidati, poi verifica distanza esatta
-                cur.execute("""
-                    SELECT alert_id, source_id, pollutant_type, severity, alert_time, status, latitude, longitude
-                    FROM pollution_alerts 
-                    WHERE 
-                        ABS(latitude - %s) < %s AND 
-                        ABS(longitude - %s) < %s AND
-                        pollutant_type = %s AND
-                        status = 'active' AND
-                        alert_time > NOW() - INTERVAL '24 hours'
-                """, (latitude, spatial_threshold, longitude, spatial_threshold, pollutant_type))
+                logger.error(f"Errore nella ricerca spaziale: {e}")
+                nearby_alerts = []  # In caso di errore, procedi senza alert vicini
             
-            nearby_alerts = cur.fetchall()
             superseded_alert = None
             
             if nearby_alerts:
-                # Filtra alert per distanza effettiva
-                filtered_alerts = []
-                for alert in nearby_alerts:
-                    nearby_lat = float(alert[6])
-                    nearby_lon = float(alert[7])
-                    
-                    # Calcola distanza effettiva in km
-                    distance = haversine(latitude, longitude, nearby_lat, nearby_lon)
-                    
-                    # Se entro 500 metri, considera come candidato
-                    if distance <= 0.5:
-                        filtered_alerts.append((alert, distance))
+                # Ordina per severità (decrescente) e distanza (crescente)
+                severity_ranks = {'high': 3, 'medium': 2, 'low': 1}
+                filtered_alerts.sort(key=lambda x: (-severity_ranks.get(x[3], 0), 0))  # x[3] è la severità
                 
-                # Se abbiamo trovato alert vicini
-                if filtered_alerts:
-                    # Ordina per severità (decrescente) e distanza (crescente)
-                    severity_ranks = {'high': 3, 'medium': 2, 'low': 1}
-                    filtered_alerts.sort(key=lambda x: (-severity_ranks.get(x[0][3], 0), x[1]))
+                # Seleziona l'alert più vicino/più severo
+                nearby_alert = filtered_alerts[0]
+                nearby_alert_id = nearby_alert[0]
+                nearby_source_id = nearby_alert[1]
+                nearby_severity = nearby_alert[3]
+                
+                logger.info(f"Trovato alert vicino {nearby_alert_id} per lo stesso inquinante {pollutant_type}")
+                
+                # Strategia di gestione:
+                # Se il nuovo alert è più severo, sostituisci il vecchio
+                # Altrimenti, skippa il nuovo
+                if severity_ranks.get(severity, 0) > severity_ranks.get(nearby_severity, 0):
+                    logger.info(f"Nuovo alert ha severità più alta ({severity} > {nearby_severity}), sostituisco {nearby_alert_id}")
                     
-                    # Seleziona l'alert più vicino/più severo
-                    nearby_alert, distance = filtered_alerts[0]
-                    nearby_alert_id = nearby_alert[0]
-                    nearby_source_id = nearby_alert[1]
-                    nearby_severity = nearby_alert[3]
+                    # Marchia il vecchio alert come sostituito
+                    cur.execute("""
+                        UPDATE pollution_alerts
+                        SET status = 'superseded', superseded_by = %s
+                        WHERE alert_id = %s
+                    """, (alert_id, nearby_alert_id))
                     
-                    logger.info(f"Trovato alert spazialmente vicino {nearby_alert_id} per lo stesso inquinante {pollutant_type} (distanza: {distance:.2f} km)")
-                    
-                    # Strategia di gestione:
-                    # Se il nuovo alert è più severo, sostituisci il vecchio
-                    # Altrimenti, skippa il nuovo
-                    if severity_ranks.get(severity, 0) > severity_ranks.get(nearby_severity, 0):
-                        logger.info(f"Nuovo alert ha severità più alta ({severity} > {nearby_severity}), sostituisco {nearby_alert_id}")
+                    # Aggiorna anche in Redis
+                    try:
+                        # Aggiorna lo stato dell'alert in Redis
+                        redis_conn.hset(f"alert:{nearby_alert_id}", "status", "superseded")
+                        redis_conn.hset(f"alert:{nearby_alert_id}", "superseded_by", alert_id)
                         
-                        # Marchia il vecchio alert come sostituito
-                        cur.execute("""
-                            UPDATE pollution_alerts
-                            SET status = 'superseded', superseded_by = %s
-                            WHERE alert_id = %s
-                        """, (alert_id, nearby_alert_id))
+                        # Rimuovi l'alert dalla lista degli attivi e aggiungilo ai superseded
+                        redis_conn.zrem("dashboard:alerts:active", nearby_alert_id)
+                        redis_conn.sadd("dashboard:alerts:superseded", nearby_alert_id)
                         
-                        # Aggiungi relazione al nuovo alert
-                        superseded_alert = nearby_alert_id
-                        data['parent_hotspot_id'] = nearby_source_id
-                        data['supersedes'] = nearby_alert_id
-                    else:
-                        logger.info(f"Alert esistente ha severità uguale/maggiore ({nearby_severity} >= {severity}), skippiamo il nuovo")
-                        return
+                        # Rimuovi dai set di severità
+                        redis_conn.srem(f"dashboard:alerts:by_severity:{nearby_severity}", nearby_alert_id)
+                        
+                        logger.info(f"Stato alert {nearby_alert_id} aggiornato a 'superseded' in Redis")
+                    except Exception as re:
+                        logger.warning(f"Errore nell'aggiornamento stato alert in Redis: {re}")
+                    
+                    # Aggiungi relazione al nuovo alert
+                    superseded_alert = nearby_alert_id
+                    data['parent_hotspot_id'] = nearby_source_id
+                    data['supersedes'] = nearby_alert_id
+                else:
+                    logger.info(f"Alert esistente ha severità uguale/maggiore ({nearby_severity} >= {severity}), skippiamo il nuovo")
+                    end_time = time.time()
+                    processing_time = end_time - start_time
+                    logger.info(f"Elaborazione alert completata in {processing_time:.2f} secondi (skippato)")
+                    return
             
             # 3. Verifica anche per hotspot_id (controllo originale) per retrocompatibilità
             if not existing_alert:  # Solo se non è un aggiornamento di un alert esistente
@@ -454,12 +512,16 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                     SELECT alert_id FROM pollution_alerts 
                     WHERE source_id = %s AND alert_time > NOW() - INTERVAL '30 minutes'
                     AND status = 'active'
-                """, (hotspot_id,))
+                    AND alert_id <> %s  -- Esclude l'alert stesso
+                """, (hotspot_id, alert_id))
                 recent_alert = cur.fetchone()
                 
                 # Skip QUALSIASI alert se c'è un alert recente per questo hotspot
                 if recent_alert and not superseded_alert:
                     logger.info(f"Alert recente già presente per hotspot {hotspot_id}, skippiamo")
+                    end_time = time.time()
+                    processing_time = end_time - start_time
+                    logger.info(f"Elaborazione alert completata in {processing_time:.2f} secondi (skippato)")
                     return
         
         # Determina regione (semplificata per questo esempio)
@@ -536,29 +598,15 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
         
         # Salva alert nel database
         with postgres_conn.cursor() as cur:
-            # Verifica prima se la tabella ha i nuovi campi status, superseded_by e supersedes
-            # Se non esistono, li crea
-            try:
-                cur.execute("""
-                    ALTER TABLE pollution_alerts 
-                    ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
-                    ADD COLUMN IF NOT EXISTS superseded_by TEXT DEFAULT NULL,
-                    ADD COLUMN IF NOT EXISTS supersedes TEXT DEFAULT NULL
-                """)
-                postgres_conn.commit()
-                logger.info("Verificata presenza dei campi status, superseded_by e supersedes nella tabella pollution_alerts")
-            except Exception as e:
-                logger.warning(f"Errore nella verifica/creazione colonne: {e}")
-                postgres_conn.rollback()
             
-            # CORREZIONE: Utilizzare ON CONFLICT DO UPDATE per aggiornare record esistenti
+            # Utilizziamo ON CONFLICT DO UPDATE per aggiornare record esistenti
             cur.execute("""
                 INSERT INTO pollution_alerts (
                     alert_id, source_id, source_type, alert_type, alert_time,
                     severity, latitude, longitude, pollutant_type, risk_score,
                     message, details, processed, notifications_sent, status, recommendations,
-                    supersedes
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    supersedes, parent_hotspot_id, derived_from
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (alert_id) DO UPDATE SET
                     alert_type = EXCLUDED.alert_type,
                     alert_time = EXCLUDED.alert_time,
@@ -575,7 +623,9 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                     END,
                     status = EXCLUDED.status,
                     recommendations = EXCLUDED.recommendations,
-                    supersedes = EXCLUDED.supersedes
+                    supersedes = EXCLUDED.supersedes,
+                    parent_hotspot_id = EXCLUDED.parent_hotspot_id,
+                    derived_from = EXCLUDED.derived_from
             """, (
                 alert_id,
                 hotspot_id,
@@ -593,13 +643,15 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 Json(notifications_sent),
                 'active',  # status
                 Json(recommendations),  # recommendations
-                data.get('supersedes')  # supersedes - riferimento all'alert sostituito
+                data.get('supersedes'),  # supersedes - riferimento all'alert sostituito
+                parent_hotspot_id,
+                derived_from
             ))
             
             postgres_conn.commit()
             logger.info(f"Alert {alert_id} salvato/aggiornato con raccomandazioni di intervento")
         
-        # NUOVA FUNZIONALITÀ: Salva le raccomandazioni anche in Redis per accesso rapido
+        # Salva le raccomandazioni anche in Redis per accesso rapido
         try:
             if redis_conn and recommendations:
                 # Salva le raccomandazioni in Redis
@@ -620,6 +672,10 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 redis_conn.hset(alert_key, "timestamp", str(int(alert_time.timestamp() * 1000)))
                 redis_conn.hset(alert_key, "has_recommendations", "true")
                 
+                # Se questo alert ha sostituito un altro, salva anche questa informazione
+                if 'supersedes' in data:
+                    redis_conn.hset(alert_key, "supersedes", data['supersedes'])
+                
                 # Aggiungi alle strutture dati di dashboard
                 redis_conn.zadd("dashboard:alerts:active", {alert_id: int(alert_time.timestamp())})
                 redis_conn.sadd(f"dashboard:alerts:by_severity:{severity}", alert_id)
@@ -627,13 +683,19 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 # Imposta TTL
                 redis_conn.expire(alert_key, 3600 * 24)  # 24 ore TTL
                 redis_conn.expire(f"dashboard:alerts:by_severity:{severity}", 3600 * 6)  # 6 ore TTL
+                redis_conn.expire(recommendations_key, 3600 * 24)  # 24 ore TTL
                 
                 # Aggiorna il dashboard:summary
                 update_alert_counters(redis_conn)
                 
-                logger.info(f"Raccomandazioni per alert {alert_id} salvate in Redis")
+                logger.info(f"Alert {alert_id} e raccomandazioni salvate in Redis")
         except Exception as e:
             logger.warning(f"Errore nel salvataggio delle raccomandazioni in Redis: {e}")
+        
+        # Aggiunto logging del tempo di elaborazione
+        end_time = time.time()
+        processing_time = end_time - start_time
+        logger.info(f"Elaborazione alert completata con successo in {processing_time:.2f} secondi")
     
     except Exception as e:
         try:
@@ -651,15 +713,31 @@ def update_alert_counters(redis_conn):
         medium_alerts = redis_conn.scard("dashboard:alerts:by_severity:medium") or 0
         low_alerts = redis_conn.scard("dashboard:alerts:by_severity:low") or 0
         total_alerts = redis_conn.zcard("dashboard:alerts:active") or 0
+        superseded_alerts = redis_conn.scard("dashboard:alerts:superseded") or 0
         
         # Aggiornamento summary con dati accurati
         severity_distribution = json.dumps({"high": high_alerts, "medium": medium_alerts, "low": low_alerts})
         redis_conn.hset("dashboard:summary", "alerts_count", str(total_alerts))
         redis_conn.hset("dashboard:summary", "severity_distribution", severity_distribution)
+        redis_conn.hset("dashboard:summary", "superseded_count", str(superseded_alerts))
         redis_conn.hset("dashboard:summary", "updated_at", str(int(time.time() * 1000)))
+        
+        # Aggiorna anche il formato alternativo per retrocompatibilità
+        redis_conn.hset("dashboard:metrics", "alerts_high", str(high_alerts))
+        redis_conn.hset("dashboard:metrics", "alerts_medium", str(medium_alerts))
+        redis_conn.hset("dashboard:metrics", "alerts_low", str(low_alerts))
+        redis_conn.hset("dashboard:metrics", "alerts_total", str(total_alerts))
+        redis_conn.hset("dashboard:metrics", "alerts_superseded", str(superseded_alerts))
+        
+        # Aggiorna anche counters per retrocompatibilità
+        redis_conn.set("counters:alerts:active", str(total_alerts))
+        redis_conn.set("counters:alerts:by_severity:high", str(high_alerts))
+        redis_conn.set("counters:alerts:by_severity:medium", str(medium_alerts))
+        redis_conn.set("counters:alerts:by_severity:low", str(low_alerts))
         
         # Imposta TTL per il summary
         redis_conn.expire("dashboard:summary", 300)  # 5 minuti TTL
+        redis_conn.expire("dashboard:metrics", 300)  # 5 minuti TTL
     except Exception as e:
         logger.warning(f"Errore nell'aggiornamento dei contatori alert: {e}")
 
@@ -751,7 +829,7 @@ def main():
     # Carica configurazioni notifica
     notification_configs = load_notification_config(postgres_conn)
     
-    # Consumer Kafka
+    # Consumer Kafka con configurazioni ottimizzate
     consumer = KafkaConsumer(
         ALERTS_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -759,13 +837,15 @@ def main():
         auto_offset_reset='latest',
         value_deserializer=deserialize_message,
         enable_auto_commit=False,
-        max_poll_interval_ms=300000,  # Aumentato a 5 minuti (default 300000)
-        max_poll_records=10,          # Ridotto numero massimo di record per poll (default 500)
-        session_timeout_ms=60000,     # Timeout sessione (default 10000)
-        heartbeat_interval_ms=10000   # Intervallo heartbeat (default 3000)
+        # Configurazioni migliorate per evitare timeout
+        max_poll_interval_ms=600000,  # 10 minuti (raddoppiato)
+        max_poll_records=5,           # Ridotto da 10 a 5 per elaborare meno messaggi per batch
+        session_timeout_ms=120000,    # Aumentato a 120 secondi (2 minuti)
+        request_timeout_ms=150000     # Aumentato a 150 secondi (2.5 minuti)
     )
     
     logger.info("Alert Manager avviato - in attesa di messaggi...")
+    logger.info("NOTA: Alert Manager è l'UNICO responsabile della gestione degli alert")
     
     try:
         for message in consumer:
@@ -788,7 +868,8 @@ def main():
             
             except Exception as e:
                 logger.error(f"Errore elaborazione alert: {e}")
-                # Non committiamo l'offset in caso di errore
+                # Commit dell'offset anche in caso di errore per evitare loop infiniti
+                consumer.commit()
     
     except KeyboardInterrupt:
         logger.info("Interruzione richiesta - arresto in corso...")

@@ -8,3 +8,4 @@ redis
 pandas
 uuid
 pyarrow 
+rasterio

@@ -4,14 +4,20 @@ import time
 import logging
 import math
 import uuid
+import boto3
+import pandas as pd
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from datetime import datetime, timedelta
 import psycopg2
 from psycopg2.extras import Json
 from kafka import KafkaConsumer
 import sys
+from botocore.client import Config
+from io import BytesIO
 sys.path.append('/opt/flink/usrlib')
 from common.redis_keys import *  # Importa le chiavi standardizzate
-
 
 # Configurazione logging
 logging.basicConfig(
@@ -37,7 +43,13 @@ POSTGRES_DB = os.environ.get("POSTGRES_DB", "marine_pollution")
 POSTGRES_USER = os.environ.get("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 
-# Topic names
+# MinIO configuration
+MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
+MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
+MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").lower() == "true"
+
+# Topic names - NOTA: ALERTS_TOPIC rimosso intenzionalmente
 BUOY_TOPIC = os.environ.get("BUOY_TOPIC", "buoy_data")
 SATELLITE_TOPIC = os.environ.get("SATELLITE_TOPIC", "satellite_imagery")
 PROCESSED_IMAGERY_TOPIC = os.environ.get("PROCESSED_IMAGERY_TOPIC", "processed_imagery")
@@ -45,7 +57,6 @@ ANALYZED_SENSOR_TOPIC = os.environ.get("ANALYZED_SENSOR_TOPIC", "analyzed_sensor
 ANALYZED_TOPIC = os.environ.get("ANALYZED_TOPIC", "analyzed_data")
 HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
 PREDICTIONS_TOPIC = os.environ.get("PREDICTIONS_TOPIC", "pollution_predictions")
-ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
 
 # Spatial bin size (deve corrispondere a quello di HotspotManager)
 SPATIAL_BIN_SIZE = 0.05
@@ -81,6 +92,327 @@ def connect_postgres():
     except Exception as e:
         logger.error(f"Errore connessione a PostgreSQL: {e}")
         raise
+
+def connect_minio():
+    """Crea connessione a MinIO"""
+    try:
+        # Configurazione per evitare problemi di parsing
+        boto_config = Config(
+            connect_timeout=10,
+            read_timeout=10,
+            retries={'max_attempts': 3},
+            s3={'addressing_style': 'path'},
+            signature_version='s3v4'
+        )
+        
+        # Crea client S3
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=f'{"https" if MINIO_SECURE else "http"}://{MINIO_ENDPOINT}',
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            config=boto_config,
+            verify=MINIO_SECURE
+        )
+        
+        # Verifica connessione
+        s3_client.list_buckets()
+        logger.info(f"Connessione a MinIO stabilita")
+        return s3_client
+    except Exception as e:
+        logger.error(f"Errore connessione a MinIO: {e}")
+        raise
+
+def get_partition_path(timestamp):
+    """Genera il percorso di partizionamento basato sul timestamp"""
+    try:
+        dt = datetime.fromtimestamp(timestamp / 1000 if timestamp > 1e10 else timestamp)
+        return f"year={dt.year}/month={dt.month:02d}/day={dt.day:02d}"
+    except Exception as e:
+        # In caso di errore, usa la data corrente
+        dt = datetime.now()
+        logger.warning(f"Errore nel calcolo del partition path: {e}, utilizzo data corrente")
+        return f"year={dt.year}/month={dt.month:02d}/day={dt.day:02d}"
+
+def save_buoy_data_to_minio(data, s3_client):
+    """Salva dati buoy nel layer Bronze con la struttura specificata"""
+    try:
+        # Estrai timestamp e ID
+        timestamp = data['timestamp']
+        sensor_id = str(data['sensor_id'])
+        
+        # Genera percorso partizionato
+        partition_path = get_partition_path(timestamp)
+        
+        # Genera nome file
+        dt = datetime.fromtimestamp(timestamp / 1000 if timestamp > 1e10 else timestamp)
+        file_name = f"buoy_{sensor_id}_{int(dt.timestamp()*1000)}.json"
+        
+        # Percorso completo
+        key = f"buoy_data/{partition_path}/{file_name}"
+        
+        # Salva JSON in MinIO
+        s3_client.put_object(
+            Bucket="bronze",
+            Key=key,
+            Body=json.dumps(data).encode('utf-8'),
+            ContentType="application/json"
+        )
+        
+        logger.info(f"Salvati dati buoy in MinIO: bronze/{key}")
+        return True
+    except Exception as e:
+        logger.error(f"Errore salvataggio dati buoy in MinIO: {e}")
+        return False
+
+def save_satellite_data_to_minio(data, s3_client):
+    """Salva dati satellite nel layer Bronze con la struttura specificata"""
+    try:
+        # Estrai timestamp e ID
+        timestamp = data.get('timestamp', int(time.time() * 1000))
+        scene_id = data.get('scene_id', str(uuid.uuid4()))
+        
+        # Genera percorso partizionato
+        partition_path = get_partition_path(timestamp)
+        
+        # Percorso completo per i metadati
+        dt = datetime.fromtimestamp(timestamp / 1000 if timestamp > 1e10 else timestamp)
+        metadata_file = f"metadata_{scene_id}_{int(dt.timestamp()*1000)}.json"
+        metadata_key = f"satellite_imagery/sentinel2/{partition_path}/{metadata_file}"
+        
+        # Salva metadati in MinIO
+        metadata = {k: v for k, v in data.items() if k != 'image_data'}
+        s3_client.put_object(
+            Bucket="bronze",
+            Key=metadata_key,
+            Body=json.dumps(metadata).encode('utf-8'),
+            ContentType="application/json"
+        )
+        
+        # Se ci sono dati immagine, salvali separatamente
+        if 'image_data' in data and data['image_data']:
+            image_file = f"sat_img_{scene_id}_{int(dt.timestamp()*1000)}.jpg"
+            image_key = f"satellite_imagery/sentinel2/{partition_path}/{image_file}"
+            
+            # Salva immagine in MinIO
+            # Nota: questo è un esempio, l'implementazione reale dipende da come sono codificati i dati immagine
+            image_data = data['image_data']
+            if isinstance(image_data, str):
+                # Se è base64, decodifica
+                import base64
+                image_bytes = base64.b64decode(image_data)
+            elif isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                image_bytes = json.dumps(image_data).encode('utf-8')
+                
+            s3_client.put_object(
+                Bucket="bronze",
+                Key=image_key,
+                Body=image_bytes,
+                ContentType="image/jpeg"
+            )
+            
+            logger.info(f"Salvata immagine satellite in MinIO: bronze/{image_key}")
+        
+        logger.info(f"Salvati metadati satellite in MinIO: bronze/{metadata_key}")
+        return True
+    except Exception as e:
+        logger.error(f"Errore salvataggio dati satellite in MinIO: {e}")
+        return False
+
+def save_analyzed_data_to_minio(data, data_type, s3_client):
+    """Salva dati analizzati nel layer Silver con la struttura specificata"""
+    try:
+        # Estrai timestamp e ID
+        timestamp = data.get('timestamp', int(time.time() * 1000))
+        source_id = data.get('source_id', str(uuid.uuid4()))
+        if 'location' in data and 'sensor_id' in data['location']:
+            source_id = data['location']['sensor_id']
+        
+        # Genera percorso partizionato
+        partition_path = get_partition_path(timestamp)
+        
+        # Percorso completo
+        dt = datetime.fromtimestamp(timestamp / 1000 if timestamp > 1e10 else timestamp)
+        file_name = f"analyzed_{source_id}_{int(dt.timestamp()*1000)}.parquet"
+        
+        # Determina il sottopercorso (buoy/satellite)
+        sub_path = "buoy" if data_type == "buoy" else "satellite"
+        
+        key = f"analyzed_data/{sub_path}/{partition_path}/{file_name}"
+        
+        # Correzione per strutture vuote
+        data_copy = {}
+        for k, v in data.items():
+            if isinstance(v, dict) and len(v) == 0:
+                data_copy[k] = {"_empty": None}
+            else:
+                data_copy[k] = v
+        
+        # Converti dati in DataFrame
+        df = pd.DataFrame([data_copy])
+        
+        # Converti in parquet
+        table = pa.Table.from_pandas(df)
+        buffer = BytesIO()
+        pq.write_table(table, buffer)
+        buffer.seek(0)
+        
+        # Salva Parquet in MinIO
+        s3_client.put_object(
+            Bucket="silver",
+            Key=key,
+            Body=buffer.getvalue(),
+            ContentType="application/octet-stream"
+        )
+        
+        logger.info(f"Salvati dati analizzati in MinIO: silver/{key}")
+        return True
+    except Exception as e:
+        logger.error(f"Errore salvataggio dati analizzati in MinIO: {e}")
+        return False
+
+def save_processed_imagery_to_minio(data, s3_client):
+    """Salva immagini processate nel layer Silver con la struttura specificata"""
+    try:
+        # Estrai timestamp e ID
+        timestamp = data.get('timestamp', int(time.time() * 1000))
+        image_id = data.get('image_id', str(uuid.uuid4()))
+        
+        # Genera percorso partizionato
+        partition_path = get_partition_path(timestamp)
+        
+        # Percorso completo per i metadati in parquet
+        dt = datetime.fromtimestamp(timestamp / 1000 if timestamp > 1e10 else timestamp)
+        parquet_file = f"analyzed_{image_id}_{int(dt.timestamp()*1000)}.parquet"
+        parquet_key = f"analyzed_data/satellite/{partition_path}/{parquet_file}"
+        
+        # Converti metadati in DataFrame
+        metadata = {k: v for k, v in data.items() if k != 'processed_image'}
+        df = pd.DataFrame([metadata])
+        
+        # Converti in parquet
+        table = pa.Table.from_pandas(df)
+        buffer = BytesIO()
+        pq.write_table(table, buffer)
+        buffer.seek(0)
+        
+        # Salva metadati in MinIO
+        s3_client.put_object(
+            Bucket="silver",
+            Key=parquet_key,
+            Body=buffer.getvalue(),
+            ContentType="application/octet-stream"
+        )
+        
+        # Se ci sono dati immagine processati, salvali come GeoTIFF
+        if 'processed_image' in data and data['processed_image']:
+            geotiff_file = f"processed_{image_id}_{int(dt.timestamp()*1000)}.geotiff"
+            geotiff_key = f"analyzed_data/satellite/{partition_path}/{geotiff_file}"
+            
+            # Implementazione reale dipende da come sono codificati i dati immagine
+            # Questo è un esempio semplificato
+            image_data = data['processed_image']
+            if isinstance(image_data, str):
+                # Se è base64, decodifica
+                import base64
+                image_bytes = base64.b64decode(image_data)
+            elif isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                image_bytes = json.dumps(image_data).encode('utf-8')
+                
+            s3_client.put_object(
+                Bucket="silver",
+                Key=geotiff_key,
+                Body=image_bytes,
+                ContentType="image/tiff"
+            )
+            
+            logger.info(f"Salvata immagine processata in MinIO: silver/{geotiff_key}")
+        
+        logger.info(f"Salvati metadati immagine processata in MinIO: silver/{parquet_key}")
+        return True
+    except Exception as e:
+        logger.error(f"Errore salvataggio immagine processata in MinIO: {e}")
+        return False
+
+def save_hotspot_to_minio(data, s3_client):
+    """Salva hotspot nel layer Gold con la struttura specificata"""
+    try:
+        # Estrai timestamp e ID
+        timestamp = data.get('detected_at', int(time.time() * 1000))
+        hotspot_id = data.get('hotspot_id', str(uuid.uuid4()))
+        
+        # Genera percorso partizionato
+        partition_path = get_partition_path(timestamp)
+        
+        # Percorso completo
+        dt = datetime.fromtimestamp(timestamp / 1000 if timestamp > 1e10 else timestamp)
+        file_name = f"hotspot_{hotspot_id}_{int(dt.timestamp()*1000)}.parquet"
+        key = f"hotspots/{partition_path}/{file_name}"
+        
+        # Converti dati in DataFrame
+        df = pd.DataFrame([data])
+        
+        # Converti in parquet
+        table = pa.Table.from_pandas(df)
+        buffer = BytesIO()
+        pq.write_table(table, buffer)
+        buffer.seek(0)
+        
+        # Salva Parquet in MinIO
+        s3_client.put_object(
+            Bucket="gold",
+            Key=key,
+            Body=buffer.getvalue(),
+            ContentType="application/octet-stream"
+        )
+        
+        logger.info(f"Salvato hotspot in MinIO: gold/{key}")
+        return True
+    except Exception as e:
+        logger.error(f"Errore salvataggio hotspot in MinIO: {e}")
+        return False
+
+def save_prediction_to_minio(data, s3_client):
+    """Salva previsione nel layer Gold con la struttura specificata"""
+    try:
+        # Estrai timestamp e ID
+        timestamp = data.get('generated_at', int(time.time() * 1000))
+        prediction_set_id = data.get('prediction_set_id', str(uuid.uuid4()))
+        
+        # Genera percorso partizionato
+        partition_path = get_partition_path(timestamp)
+        
+        # Percorso completo
+        dt = datetime.fromtimestamp(timestamp / 1000 if timestamp > 1e10 else timestamp)
+        file_name = f"prediction_{prediction_set_id}_{int(dt.timestamp()*1000)}.parquet"
+        key = f"predictions/{partition_path}/{file_name}"
+        
+        # Converti dati in DataFrame
+        df = pd.DataFrame([data])
+        
+        # Converti in parquet
+        table = pa.Table.from_pandas(df)
+        buffer = BytesIO()
+        pq.write_table(table, buffer)
+        buffer.seek(0)
+        
+        # Salva Parquet in MinIO
+        s3_client.put_object(
+            Bucket="gold",
+            Key=key,
+            Body=buffer.getvalue(),
+            ContentType="application/octet-stream"
+        )
+        
+        logger.info(f"Salvata previsione in MinIO: gold/{key}")
+        return True
+    except Exception as e:
+        logger.error(f"Errore salvataggio previsione in MinIO: {e}")
+        return False
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     """Calcola distanza tra due punti in km"""
@@ -160,9 +492,12 @@ def check_spatial_duplicate(lat, lon, radius_km, pollutant_type, conn, max_dista
         logger.error(f"Errore nel controllo duplicati spaziali: {e}")
         return False, None
 
-def process_buoy_data(data, timescale_conn):
+def process_buoy_data(data, timescale_conn, s3_client):
     """Processa dati dalle boe"""
     try:
+        # Salva nel layer Bronze di MinIO
+        save_buoy_data_to_minio(data, s3_client)
+        
         with timescale_conn.cursor() as cur:
             # Estrazione campi
             timestamp = datetime.fromtimestamp(data['timestamp'] / 1000)
@@ -195,9 +530,34 @@ def process_buoy_data(data, timescale_conn):
         timescale_conn.rollback()
         logger.error(f"Errore processamento dati buoy: {e}")
 
-def process_analyzed_sensor_data(data, timescale_conn):
+def process_satellite_imagery(data, s3_client):
+    """Processa dati immagini satellitari"""
+    try:
+        # Salva nel layer Bronze di MinIO
+        save_satellite_data_to_minio(data, s3_client)
+        logger.info(f"Salvati dati immagine satellitare")
+        return True
+    except Exception as e:
+        logger.error(f"Errore processamento immagine satellitare: {e}")
+        return False
+
+def process_processed_imagery(data, s3_client):
+    """Processa dati immagini processate"""
+    try:
+        # Salva nel layer Silver di MinIO
+        save_processed_imagery_to_minio(data, s3_client)
+        logger.info(f"Salvati dati immagine processata")
+        return True
+    except Exception as e:
+        logger.error(f"Errore processamento immagine processata: {e}")
+        return False
+
+def process_analyzed_sensor_data(data, timescale_conn, s3_client):
     """Processa dati sensori analizzati"""
     try:
+        # Salva nel layer Silver di MinIO
+        save_analyzed_data_to_minio(data, "buoy", s3_client)
+        
         with timescale_conn.cursor() as cur:
             # Estrazione dati
             timestamp = datetime.fromtimestamp(data['timestamp'] / 1000)
@@ -237,12 +597,29 @@ def process_analyzed_sensor_data(data, timescale_conn):
         timescale_conn.rollback()
         logger.error(f"Errore processamento dati sensore analizzati: {e}")
 
-def process_pollution_hotspots(data, timescale_conn, postgres_conn):
+def process_analyzed_data(data, s3_client):
+    """Processa dati analizzati generici"""
+    try:
+        # Determina il tipo di dati
+        source_type = data.get("source_type", "unknown")
+        
+        # Salva nel layer Silver di MinIO
+        save_analyzed_data_to_minio(data, source_type, s3_client)
+        logger.info(f"Salvati dati analizzati di tipo {source_type}")
+        return True
+    except Exception as e:
+        logger.error(f"Errore processamento dati analizzati: {e}")
+        return False
+
+def process_pollution_hotspots(data, timescale_conn, postgres_conn, s3_client):
     """Processa hotspot inquinamento"""
     timescale_modified = False
     postgres_modified = False
     
     try:
+        # Salva nel layer Gold di MinIO
+        save_hotspot_to_minio(data, s3_client)
+        
         hotspot_id = data['hotspot_id']
         is_update = data.get('is_update', False)
         detected_at = datetime.fromtimestamp(data['detected_at'] / 1000)
@@ -439,9 +816,12 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn):
             postgres_conn.rollback()
         logger.error(f"Errore processamento hotspot: {e}")
 
-def process_pollution_predictions(data, timescale_conn):
+def process_pollution_predictions(data, timescale_conn, s3_client):
     """Processa previsioni inquinamento"""
     try:
+        # Salva nel layer Gold di MinIO
+        save_prediction_to_minio(data, s3_client)
+        
         prediction_set_id = data['prediction_set_id']
         hotspot_id = data['hotspot_id']
         generated_at = datetime.fromtimestamp(data['generated_at'] / 1000)
@@ -512,77 +892,6 @@ def process_pollution_predictions(data, timescale_conn):
         timescale_conn.rollback()
         logger.error(f"Errore processamento previsioni: {e}")
 
-def process_sensor_alerts(data, postgres_conn):
-    """Processa alert sensori"""
-    try:
-        # Verifico la presenza di hotspot_id
-        if 'hotspot_id' not in data:
-            logger.warning("Alert senza hotspot_id ricevuto, ignorato")
-            return
-            
-        with postgres_conn.cursor() as cur:
-            # Genera alert_id se non presente
-            alert_id = data.get('alert_id', f"alert_{str(uuid.uuid4())}")
-            source_id = data['hotspot_id']
-            
-            # Verifica se l'alert esiste già
-            cur.execute("SELECT alert_id FROM pollution_alerts WHERE alert_id = %s", (alert_id,))
-            if cur.fetchone():
-                logger.info(f"Alert {alert_id} già presente, skip")
-                return
-            
-            # Determina tipo di alert
-            alert_type = 'new'
-            if data.get('is_update'):
-                alert_type = 'update'
-            if data.get('severity_changed'):
-                alert_type = 'severity_change'
-                
-            alert_time = datetime.fromtimestamp(data['detected_at'] / 1000)
-            
-            # Crea messaggio descrittivo
-            message = f"Alert {alert_type.upper()}: {data['severity'].upper()} level {data['pollutant_type']} detected"
-            
-            # Estrai campi di relazione
-            parent_hotspot_id = data.get('parent_hotspot_id')
-            derived_from = data.get('derived_from')
-            
-            # Arricchisci i dettagli con informazioni di relazione
-            details = dict(data)
-            if parent_hotspot_id:
-                details['parent_hotspot_id'] = parent_hotspot_id
-            if derived_from:
-                details['derived_from'] = derived_from
-            
-            cur.execute("""
-                INSERT INTO pollution_alerts (
-                    alert_id, source_id, source_type, alert_type, alert_time,
-                    severity, latitude, longitude, pollutant_type, risk_score,
-                    message, details, processed, notifications_sent
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                alert_id,
-                source_id,
-                'hotspot',
-                alert_type,
-                alert_time,
-                data['severity'],
-                data['location']['center_latitude'],
-                data['location']['center_longitude'],
-                data['pollutant_type'],
-                data['max_risk_score'],
-                message,
-                Json(details),
-                False,  # processed
-                Json({})  # notifications_sent
-            ))
-            
-            postgres_conn.commit()
-            logger.info(f"Salvato alert {alert_id} per hotspot {source_id}")
-    except Exception as e:
-        postgres_conn.rollback()
-        logger.error(f"Errore processamento alert: {e}")
-
 def deserialize_message(message):
     """Deserializza messaggi Kafka supportando sia JSON che formati binari"""
     try:
@@ -609,7 +918,14 @@ def main():
     timescale_conn = connect_timescaledb()
     postgres_conn = connect_postgres()
     
-    # Consumer Kafka
+    # Connessione a MinIO (salvataggio dati)
+    try:
+        s3_client = connect_minio()
+        logger.info("MinIO disponibile, i dati verranno salvati anche in formato Parquet/JSON")
+    except Exception as e:
+        logger.warning(f"MinIO non disponibile, salvataggio solo in database: {e}")
+        s3_client = None
+    
     # Consumer Kafka con configurazioni ottimizzate
     consumer = KafkaConsumer(
         BUOY_TOPIC,
@@ -619,7 +935,6 @@ def main():
         ANALYZED_TOPIC,
         HOTSPOTS_TOPIC,
         PREDICTIONS_TOPIC,
-        ALERTS_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id='storage-consumer-group',
         auto_offset_reset='latest',
@@ -633,6 +948,7 @@ def main():
     )
     
     logger.info("Storage Consumer avviato - in attesa di messaggi...")
+    logger.info("NOTA: Gli alert sono gestiti esclusivamente da alert_manager.py")
     
     try:
         for message in consumer:
@@ -646,22 +962,54 @@ def main():
                 
             try:
                 if topic == BUOY_TOPIC:
-                    process_buoy_data(data, timescale_conn)
+                    if s3_client:
+                        process_buoy_data(data, timescale_conn, s3_client)
+                    else:
+                        process_buoy_data(data, timescale_conn, None)
+                        
+                elif topic == SATELLITE_TOPIC:
+                    if s3_client:
+                        process_satellite_imagery(data, s3_client)
+                    else:
+                        logger.info("Dati satellite ricevuti ma MinIO non disponibile, skip")
+                        
+                elif topic == PROCESSED_IMAGERY_TOPIC:
+                    if s3_client:
+                        process_processed_imagery(data, s3_client)
+                    else:
+                        logger.info("Immagine processata ricevuta ma MinIO non disponibile, skip")
+                        
                 elif topic == ANALYZED_SENSOR_TOPIC:
-                    process_analyzed_sensor_data(data, timescale_conn)
+                    if s3_client:
+                        process_analyzed_sensor_data(data, timescale_conn, s3_client)
+                    else:
+                        process_analyzed_sensor_data(data, timescale_conn, None)
+                        
+                elif topic == ANALYZED_TOPIC:
+                    if s3_client:
+                        process_analyzed_data(data, s3_client)
+                    else:
+                        logger.info("Dati analizzati ricevuti ma MinIO non disponibile, skip")
+                        
                 elif topic == HOTSPOTS_TOPIC:
-                    process_pollution_hotspots(data, timescale_conn, postgres_conn)
+                    if s3_client:
+                        process_pollution_hotspots(data, timescale_conn, postgres_conn, s3_client)
+                    else:
+                        process_pollution_hotspots(data, timescale_conn, postgres_conn, None)
+                        
                 elif topic == PREDICTIONS_TOPIC:
-                    process_pollution_predictions(data, timescale_conn)
-                elif topic == ALERTS_TOPIC:
-                    process_sensor_alerts(data, postgres_conn)
+                    if s3_client:
+                        process_pollution_predictions(data, timescale_conn, s3_client)
+                    else:
+                        process_pollution_predictions(data, timescale_conn, None)
                 
                 # Commit dell'offset solo se elaborazione riuscita
                 consumer.commit()
             
             except Exception as e:
                 logger.error(f"Errore elaborazione messaggio da {topic}: {e}")
-                # Non committiamo l'offset in caso di errore
+                # Commit dell'offset anche in caso di errore per evitare loop infiniti
+                consumer.commit()
                 
     except KeyboardInterrupt:
         logger.info("Interruzione richiesta - arresto in corso...")
