@@ -10,13 +10,12 @@ This job:
 5. Publishes comprehensive predictions to pollution_predictions topic
 
 Optimizations:
-1. Parallel processing with keyed streams for horizontal scalability
-2. Efficient ML model loading with broadcast state
-3. Enhanced caching and error handling
-4. Improved fault tolerance and state management
-5. Structured logging for enhanced observability
-6. Performance metrics tracking
-7. Comprehensive retry mechanisms for external services
+1. Enhanced structured logging for better observability
+2. Performance metrics tracking and reporting
+3. Improved error handling and resilience
+4. Robust retry mechanisms with exponential backoff
+5. Circuit breaker pattern for external services
+6. Comprehensive service health checks
 """
 
 import os
@@ -42,15 +41,9 @@ sys.path.append('/opt/flink/usrlib')
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
 from pyflink.datastream.connectors import FlinkKafkaConsumer, FlinkKafkaProducer
 from pyflink.common.serialization import SimpleStringSchema
-from pyflink.datastream.functions import (
-    MapFunction, FilterFunction, KeyedProcessFunction, 
-    BroadcastProcessFunction, KeyedBroadcastProcessFunction, RuntimeContext
-)
+from pyflink.datastream.functions import MapFunction, FilterFunction, KeyedProcessFunction
 from pyflink.common import WatermarkStrategy, Time, TypeInformation
-from pyflink.datastream.state import (
-    ValueStateDescriptor, MapStateDescriptor, 
-    BroadcastState, ListStateDescriptor
-)
+from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
 from pyflink.common.typeinfo import Types
 
 # Import Redis keys
@@ -308,19 +301,6 @@ ECOSYSTEM_SENSITIVITY = {
     }
 }
 
-# Create descriptors for broadcast state
-ML_MODELS_STATE_DESCRIPTOR = MapStateDescriptor(
-    "ml_models", 
-    Types.STRING(),
-    Types.PICKLED_BYTE_ARRAY()
-)
-
-CONFIG_STATE_DESCRIPTOR = MapStateDescriptor(
-    "config", 
-    Types.STRING(),
-    Types.STRING()
-)
-
 # Add structured logging function
 def log_event(event_type, message, data=None, severity="info"):
     """
@@ -537,268 +517,27 @@ class PerformanceMetrics:
 metrics = PerformanceMetrics()
 
 
-class MLModelLoader(MapFunction):
+class PollutionSpreadPredictor(MapFunction):
     """
-    Loads ML models from MinIO and broadcasts them to all downstream tasks.
-    This implementation centralizes model loading to avoid redundant downloads.
-    """
-    
-    def __init__(self):
-        self.models = {}
-        self.config = {}
-        self.last_load_attempt = 0
-        self.retry_interval_ms = 60000  # Retry every minute
-        self.load_timeout_ms = 300000   # 5 minutes timeout for loading
-    
-    def map(self, value):
-        current_time = int(time.time() * 1000)
-        
-        # Check if it's time to load/refresh models
-        if not self.models or (current_time - self.last_load_attempt) > self.retry_interval_ms:
-            self.last_load_attempt = current_time
-            
-            # Log model loading start
-            log_event(
-                "model_loading_start",
-                "Starting model loading process",
-                {"retry_interval_ms": self.retry_interval_ms}
-            )
-            
-            self._load_models_from_minio()
-        
-        return {
-            "models": self.models,
-            "config": self.config,
-            "timestamp": current_time
-        }
-    
-    def _load_models_from_minio(self):
-        """Load ML models from MinIO with retry logic"""
-        try:
-            import boto3
-            from botocore.exceptions import ClientError
-            
-            # Create S3 client for MinIO
-            def create_s3_client():
-                return boto3.client(
-                    's3',
-                    endpoint_url=f'http://{MINIO_ENDPOINT}',
-                    aws_access_key_id=MINIO_ACCESS_KEY,
-                    aws_secret_access_key=MINIO_SECRET_KEY
-                )
-            
-            # Use retry operation for S3 client creation
-            s3_client = retry_operation(create_s3_client)
-            
-            # Load models with retry logic
-            models_to_load = {
-                "oil_spill_model": "diffusion_prediction/oil_spill_model_v1.pkl",
-                "chemical_model": "diffusion_prediction/chemical_model_v1.pkl"
-            }
-            
-            loaded_models_count = 0
-            failed_models_count = 0
-            
-            for model_name, model_key in models_to_load.items():
-                try:
-                    # Create a lambda for the model loading operation
-                    load_operation = lambda: s3_client.get_object(Bucket="models", Key=model_key)['Body'].read()
-                    
-                    # Log model loading attempt
-                    log_event(
-                        "model_loading_attempt",
-                        f"Attempting to load {model_name}",
-                        {"model_key": model_key, "bucket": "models"}
-                    )
-                    
-                    # Use retry_operation with the defined lambda
-                    model_bytes = retry_operation(load_operation)
-                    
-                    # Store raw bytes - unpickling will happen in worker tasks
-                    self.models[model_name] = model_bytes
-                    
-                    # Record success metrics
-                    metrics.record_model_load(success=True)
-                    metrics.record_minio_operation(success=True)
-                    loaded_models_count += 1
-                    
-                    # Log successful model loading
-                    log_event(
-                        "model_loaded",
-                        f"Successfully loaded {model_name}",
-                        {"model_key": model_key, "model_size_bytes": len(model_bytes)}
-                    )
-                    
-                except Exception as e:
-                    # Record failure metrics
-                    metrics.record_model_load(success=False)
-                    metrics.record_minio_operation(success=False)
-                    failed_models_count += 1
-                    
-                    # Log model loading failure
-                    log_event(
-                        "model_loading_error",
-                        f"Failed to load {model_name}",
-                        {
-                            "model_key": model_key,
-                            "error_type": type(e).__name__,
-                            "error_message": str(e)
-                        },
-                        "error"
-                    )
-                    
-                    # Keep existing model if available, otherwise set to None
-                    if model_name not in self.models:
-                        self.models[model_name] = None
-            
-            # Load configuration with retry logic
-            try:
-                config_key = "ml_prediction/config.json"
-                
-                # Create a lambda for the config loading operation
-                load_config_operation = lambda: json.loads(
-                    s3_client.get_object(Bucket="configs", Key=config_key)['Body'].read()
-                )
-                
-                # Log config loading attempt
-                log_event(
-                    "config_loading_attempt",
-                    "Attempting to load configuration",
-                    {"config_key": config_key, "bucket": "configs"}
-                )
-                
-                # Use retry_operation with the defined lambda
-                self.config = retry_operation(load_config_operation)
-                
-                # Record success metrics
-                metrics.record_minio_operation(success=True)
-                
-                # Log successful config loading
-                log_event(
-                    "config_loaded",
-                    "Successfully loaded configuration",
-                    {"config_key": config_key, "config_items": len(self.config)}
-                )
-                
-            except Exception as e:
-                # Record failure metrics
-                metrics.record_minio_operation(success=False)
-                
-                # Log config loading failure
-                log_event(
-                    "config_loading_error",
-                    "Failed to load configuration",
-                    {
-                        "config_key": config_key,
-                        "error_type": type(e).__name__,
-                        "error_message": str(e)
-                    },
-                    "error"
-                )
-                
-                # Keep existing config if available, otherwise set to empty dict
-                if not self.config:
-                    self.config = {}
-            
-            # Log summary of model loading process
-            log_event(
-                "model_loading_complete",
-                "Model loading process completed",
-                {
-                    "models_loaded": loaded_models_count,
-                    "models_failed": failed_models_count,
-                    "config_loaded": bool(self.config)
-                }
-            )
-                
-        except Exception as e:
-            # Log unexpected error in the loading process
-            log_event(
-                "model_loading_process_error",
-                "Unexpected error in model loading process",
-                {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "traceback": traceback.format_exc()
-                },
-                "error"
-            )
-
-
-class HotspotKeySelector:
-    """
-    Key selector function for partitioning hotspots across parallel tasks.
-    Uses region or location-based partitioning for better data locality.
-    """
-    
-    def get_key(self, hotspot_json_str):
-        try:
-            hotspot = json.loads(hotspot_json_str)
-            
-            # Prefer region ID if available for more meaningful partitioning
-            region_id = None
-            env_ref = hotspot.get("environmental_reference", {})
-            if env_ref:
-                region_id = env_ref.get("region_id")
-            
-            # If region is not available, use geographic grid cell
-            if not region_id:
-                location = hotspot.get("location", {})
-                if location:
-                    lat = location.get("center_latitude", location.get("center_lat"))
-                    lon = location.get("center_longitude", location.get("center_lon"))
-                    
-                    if lat is not None and lon is not None:
-                        # Create grid cells of approximately 1 degree
-                        grid_lat = int(lat)
-                        grid_lon = int(lon)
-                        region_id = f"grid_{grid_lat}_{grid_lon}"
-            
-            # Fallback to hotspot ID for load distribution if no spatial info
-            if not region_id:
-                hotspot_id = hotspot.get("hotspot_id", "unknown")
-                # Use first few chars of hotspot ID for consistent routing
-                region_id = f"id_{hotspot_id[:5]}"
-                
-            return region_id
-        except Exception as e:
-            # Log the error with structured logging
-            log_event(
-                "key_selection_error",
-                "Error in hotspot key selection",
-                {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "using_default_key": True
-                },
-                "warning"
-            )
-            # For any parsing error, return a default key
-            return "default_key"
-
-
-class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
-    """
-    Main processor for pollution hotspot predictions with broadcast state for models.
-    Uses broadcast state to efficiently share ML models across parallel tasks.
+    Predicts the spread of detected pollution hotspots using ML models
+    and provides impact assessment and cleanup recommendations
     """
     
     def __init__(self):
         self.prediction_intervals = [6, 12, 24, 48]  # Hours to predict ahead
         self.redis_client = None
-        self.prediction_cache = {}  # In-memory cache
-        self.cache_ttl_ms = REDIS_CACHE_TTL * 1000  # Convert to milliseconds
+        self.oil_spill_model = None
+        self.chemical_model = None
+        self.default_model = None
+        # Circuit breaker state for Redis
         self.redis_error_count = 0
         self.redis_circuit_open = False
         self.circuit_reset_time = 0
         self.circuit_reset_interval_ms = 30000  # 30 seconds
-        # Store descriptor reference for accessing the state
-        self.models_state_descriptor = ML_MODELS_STATE_DESCRIPTOR
-    
+        
     def open(self, runtime_context):
-        # Log processor initialization
         log_event(
-            "processor_init",
+            "predictor_init", 
             "Initializing pollution prediction processor",
             {
                 "prediction_intervals": self.prediction_intervals,
@@ -806,7 +545,7 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
             }
         )
         
-        # Initialize Redis client with connection pooling
+        # Initialize Redis client with retry and connection pooling
         try:
             # Define Redis connection function for retry
             def connect_to_redis():
@@ -846,17 +585,213 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
             )
             self.redis_client = None
         
-        # Initialize local state for tracking processed hotspots
-        self.last_prediction_timestamps = {}
-    
-    def process_element(self, value, ctx):
+        # Load ML models from MinIO with robust error handling
+        self._load_diffusion_models()
+        
+    def _load_diffusion_models(self):
+        """Load diffusion prediction models from MinIO with enhanced resilience"""
+        load_start_time = time.time()
+        
+        log_event(
+            "model_loading_start",
+            "Starting model loading process",
+            {"model_types": ["oil_spill", "chemical_discharge"]}
+        )
+        
+        try:
+            import boto3
+            from botocore.exceptions import ClientError
+            
+            # Create S3 client for MinIO with retry
+            def create_s3_client():
+                return boto3.client(
+                    's3',
+                    endpoint_url=f'http://{MINIO_ENDPOINT}',
+                    aws_access_key_id=MINIO_ACCESS_KEY,
+                    aws_secret_access_key=MINIO_SECRET_KEY
+                )
+            
+            s3_client = retry_operation(create_s3_client)
+            metrics.record_minio_operation(success=True)
+            
+            # Load oil spill diffusion model with retry
+            oil_model_key = "diffusion_prediction/oil_spill_model_v1.pkl"
+            try:
+                # Define model loading operation for retry
+                def load_oil_model():
+                    log_event(
+                        "model_loading_attempt",
+                        f"Loading oil spill diffusion model",
+                        {"model_key": oil_model_key, "bucket": "models"}
+                    )
+                    response = s3_client.get_object(Bucket="models", Key=oil_model_key)
+                    return response['Body'].read()
+                
+                # Use retry for model loading
+                model_bytes = retry_operation(load_oil_model)
+                self.oil_spill_model = pickle.loads(model_bytes)
+                
+                # Record metrics
+                metrics.record_model_load(success=True)
+                metrics.record_minio_operation(success=True)
+                
+                log_event(
+                    "model_loaded",
+                    "Oil spill diffusion model loaded successfully",
+                    {
+                        "model_key": oil_model_key,
+                        "model_size_bytes": len(model_bytes)
+                    }
+                )
+            except Exception as e:
+                metrics.record_model_load(success=False)
+                metrics.record_minio_operation(success=False)
+                
+                log_event(
+                    "model_loading_error",
+                    "Error loading oil spill model",
+                    {
+                        "model_key": oil_model_key,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)
+                    },
+                    "error"
+                )
+                log_event(
+                    "model_fallback",
+                    "Will use physics-based model for oil spill diffusion",
+                    {"reason": "model loading failed"}
+                )
+                self.oil_spill_model = None
+            
+            # Load chemical discharge diffusion model with retry
+            chemical_model_key = "diffusion_prediction/chemical_model_v1.pkl"
+            try:
+                # Define model loading operation for retry
+                def load_chemical_model():
+                    log_event(
+                        "model_loading_attempt",
+                        f"Loading chemical discharge model",
+                        {"model_key": chemical_model_key, "bucket": "models"}
+                    )
+                    response = s3_client.get_object(Bucket="models", Key=chemical_model_key)
+                    return response['Body'].read()
+                
+                # Use retry for model loading
+                model_bytes = retry_operation(load_chemical_model)
+                self.chemical_model = pickle.loads(model_bytes)
+                
+                # Record metrics
+                metrics.record_model_load(success=True)
+                metrics.record_minio_operation(success=True)
+                
+                log_event(
+                    "model_loaded",
+                    "Chemical discharge model loaded successfully",
+                    {
+                        "model_key": chemical_model_key,
+                        "model_size_bytes": len(model_bytes)
+                    }
+                )
+            except Exception as e:
+                metrics.record_model_load(success=False)
+                metrics.record_minio_operation(success=False)
+                
+                log_event(
+                    "model_loading_error",
+                    "Error loading chemical model",
+                    {
+                        "model_key": chemical_model_key,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)
+                    },
+                    "error"
+                )
+                log_event(
+                    "model_fallback",
+                    "Will use physics-based model for chemical discharge",
+                    {"reason": "model loading failed"}
+                )
+                self.chemical_model = None
+                
+            # Load configuration with retry
+            try:
+                config_key = "ml_prediction/config.json"
+                
+                # Define config loading operation for retry
+                def load_config():
+                    log_event(
+                        "config_loading_attempt",
+                        "Loading configuration",
+                        {"config_key": config_key, "bucket": "configs"}
+                    )
+                    response = s3_client.get_object(Bucket="configs", Key=config_key)
+                    return response['Body'].read()
+                
+                # Use retry for config loading
+                config_bytes = retry_operation(load_config)
+                self.config = json.loads(config_bytes)
+                
+                # Record metrics
+                metrics.record_minio_operation(success=True)
+                
+                log_event(
+                    "config_loaded",
+                    "Configuration loaded successfully",
+                    {
+                        "config_key": config_key,
+                        "config_items": len(self.config)
+                    }
+                )
+            except Exception as e:
+                metrics.record_minio_operation(success=False)
+                
+                log_event(
+                    "config_loading_error",
+                    "Error loading configuration",
+                    {
+                        "config_key": config_key,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)
+                    },
+                    "error"
+                )
+                self.config = {}
+                
+        except Exception as e:
+            log_event(
+                "model_loading_process_error",
+                "Error in model loading process",
+                {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "traceback": traceback.format_exc()
+                },
+                "error"
+            )
+            self.oil_spill_model = None
+            self.chemical_model = None
+        
+        # Log summary of model loading process
+        loading_time_ms = int((time.time() - load_start_time) * 1000)
+        log_event(
+            "model_loading_complete",
+            "Model loading process completed",
+            {
+                "loading_time_ms": loading_time_ms,
+                "models_loaded": {
+                    "oil_spill": self.oil_spill_model is not None,
+                    "chemical": self.chemical_model is not None
+                },
+                "config_loaded": hasattr(self, 'config') and bool(self.config)
+            }
+        )
+        
+    def map(self, value):
         start_time = time.time()
         hotspot_id = "unknown"  # Initialize for logging if parsing fails
         
         try:
-            # Access broadcast state via context
-            models_state = ctx.get_broadcast_state(self.models_state_descriptor)
-            
             # Parse hotspot data
             hotspot_str = value
             
@@ -879,7 +814,7 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
                     {"hotspot_preview": hotspot_str[:100] if hotspot_str else "empty"},
                     "warning"
                 )
-                return
+                return None
             
             # Log processing start with structured data
             log_event(
@@ -888,368 +823,10 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
                 {
                     "hotspot_id": hotspot_id,
                     "pollutant_type": hotspot.get("pollutant_type", "unknown"),
-                    "severity": hotspot.get("severity", "unknown")
+                    "severity": hotspot.get("severity", "low")
                 }
             )
             
-            # Check if we need to process this hotspot
-            if not self._should_process_hotspot(hotspot):
-                log_event(
-                    "hotspot_skipped",
-                    f"Skipping hotspot {hotspot_id} based on processing rules",
-                    {
-                        "hotspot_id": hotspot_id,
-                        "is_update": hotspot.get("is_update", False),
-                        "is_significant_change": hotspot.get("is_significant_change", False)
-                    }
-                )
-                return
-            
-            # Get ML models from broadcast state
-            oil_spill_model = None
-            chemical_model = None
-            config = {}
-            
-            # Safely access the broadcast state
-            try:
-                # Get model bytes
-                oil_model_bytes = models_state.get("oil_spill_model")
-                chemical_model_bytes = models_state.get("chemical_model")
-                config_json = models_state.get("config")
-                
-                # Deserialize models if available
-                if oil_model_bytes:
-                    try:
-                        oil_spill_model = pickle.loads(oil_model_bytes)
-                        log_event(
-                            "model_loaded",
-                            "Successfully loaded oil spill model from broadcast state"
-                        )
-                    except Exception as e:
-                        log_event(
-                            "model_deserialization_error",
-                            "Error unpickling oil spill model",
-                            {
-                                "error_type": type(e).__name__,
-                                "error_message": str(e)
-                            },
-                            "error"
-                        )
-                
-                if chemical_model_bytes:
-                    try:
-                        chemical_model = pickle.loads(chemical_model_bytes)
-                        log_event(
-                            "model_loaded",
-                            "Successfully loaded chemical model from broadcast state"
-                        )
-                    except Exception as e:
-                        log_event(
-                            "model_deserialization_error",
-                            "Error unpickling chemical model",
-                            {
-                                "error_type": type(e).__name__,
-                                "error_message": str(e)
-                            },
-                            "error"
-                        )
-                
-                if config_json:
-                    try:
-                        config = json.loads(config_json)
-                        log_event(
-                            "config_loaded",
-                            "Successfully loaded config from broadcast state",
-                            {"config_items": len(config)}
-                        )
-                    except Exception as e:
-                        log_event(
-                            "config_parsing_error",
-                            "Error parsing config",
-                            {
-                                "error_type": type(e).__name__,
-                                "error_message": str(e)
-                            },
-                            "error"
-                        )
-                        config = {}
-            except Exception as e:
-                log_event(
-                    "broadcast_state_error",
-                    "Error accessing broadcast state",
-                    {
-                        "error_type": type(e).__name__,
-                        "error_message": str(e)
-                    },
-                    "error"
-                )
-            
-            # Generate prediction using the models
-            prediction = self._generate_prediction(hotspot, oil_spill_model, chemical_model, config)
-            
-            if prediction:
-                # Update cache and Redis
-                self._update_prediction_timestamp(hotspot_id)
-                
-                # Output the prediction
-                ctx.output(json.dumps(prediction))
-                
-                # Calculate processing time
-                processing_time_ms = int((time.time() - start_time) * 1000)
-                
-                # Update metrics
-                metrics.record_processed(processing_time_ms)
-                
-                # Log successful prediction generation
-                log_event(
-                    "prediction_generated",
-                    f"Generated prediction for hotspot {hotspot_id}",
-                    {
-                        "hotspot_id": hotspot_id,
-                        "prediction_set_id": prediction.get("prediction_set_id"),
-                        "processing_time_ms": processing_time_ms,
-                        "intervals_predicted": len(self.prediction_intervals)
-                    }
-                )
-            else:
-                # Update error metrics
-                metrics.record_error("prediction_generation_failed")
-                
-                # Log prediction failure
-                log_event(
-                    "prediction_generation_failed",
-                    f"Failed to generate prediction for hotspot {hotspot_id}",
-                    {
-                        "hotspot_id": hotspot_id,
-                        "processing_time_ms": int((time.time() - start_time) * 1000)
-                    },
-                    "error"
-                )
-            
-        except Exception as e:
-            # Update error metrics
-            metrics.record_error(type(e).__name__)
-            
-            # Log error with structured data
-            log_event(
-                "processing_error",
-                f"Error in pollution prediction processing for hotspot {hotspot_id}",
-                {
-                    "hotspot_id": hotspot_id,
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "traceback": traceback.format_exc(),
-                    "processing_time_ms": int((time.time() - start_time) * 1000)
-                },
-                "error"
-            )
-    
-    def _should_process_hotspot(self, hotspot):
-        """Determine if hotspot should be processed based on business rules and caching"""
-        hotspot_id = hotspot.get("hotspot_id")
-        
-        if not hotspot_id:
-            return False
-        
-        # Check cache first to avoid Redis call if possible
-        current_time = int(time.time() * 1000)
-        if hotspot_id in self.last_prediction_timestamps:
-            last_time = self.last_prediction_timestamps[hotspot_id]
-            if (current_time - last_time) < (2 * 60 * 60 * 1000):  # 2 hour threshold
-                # Updates without significant changes
-                if (hotspot.get("is_update", False) and 
-                    not hotspot.get("is_significant_change", False) and
-                    not hotspot.get("severity_changed", False)):
-                    return False
-        
-        # Check Redis if cache miss and circuit is closed
-        if self.redis_client and not self.redis_circuit_open:
-            try:
-                # Define Redis get operation for retry
-                def get_from_redis():
-                    return self.redis_client.get(hotspot_prediction_key(hotspot_id))
-                
-                # Try to get from Redis with retry
-                try:
-                    redis_timestamp = retry_operation(get_from_redis)
-                    
-                    # Update Redis metrics
-                    metrics.record_redis_operation(success=True)
-                    
-                    if redis_timestamp:
-                        # Update local cache
-                        last_time = int(redis_timestamp.decode('utf-8'))
-                        self.last_prediction_timestamps[hotspot_id] = last_time
-                        
-                        # Skip if recently processed without significant changes
-                        if (current_time - last_time) < (2 * 60 * 60 * 1000):  # 2 hour threshold
-                            if (hotspot.get("is_update", False) and 
-                                not hotspot.get("is_significant_change", False) and
-                                not hotspot.get("severity_changed", False)):
-                                
-                                log_event(
-                                    "hotspot_cache_hit",
-                                    f"Skipping hotspot {hotspot_id} due to recent processing",
-                                    {
-                                        "last_processed_ms_ago": current_time - last_time,
-                                        "cache_source": "redis"
-                                    }
-                                )
-                                return False
-                    
-                    # Reset error count on successful call
-                    self.redis_error_count = 0
-                    
-                except Exception as e:
-                    # Update Redis metrics
-                    metrics.record_redis_operation(success=False)
-                    
-                    # Increment error count
-                    self.redis_error_count += 1
-                    
-                    # Log Redis error
-                    log_event(
-                        "redis_error",
-                        f"Redis error ({self.redis_error_count})",
-                        {
-                            "operation": "get",
-                            "key": hotspot_prediction_key(hotspot_id),
-                            "error_type": type(e).__name__,
-                            "error_message": str(e)
-                        },
-                        "warning"
-                    )
-                    
-                    # Open circuit if too many errors
-                    if self.redis_error_count >= 3:
-                        self.redis_circuit_open = True
-                        self.circuit_reset_time = current_time + self.circuit_reset_interval_ms
-                        
-                        log_event(
-                            "redis_circuit_opened",
-                            "Redis circuit opened due to multiple errors",
-                            {
-                                "error_count": self.redis_error_count,
-                                "reset_interval_ms": self.circuit_reset_interval_ms,
-                                "reset_time": self.circuit_reset_time
-                            },
-                            "error"
-                        )
-                
-            except Exception as e:
-                # Log any unexpected errors during the Redis check
-                log_event(
-                    "redis_check_error",
-                    "Unexpected error during Redis check",
-                    {
-                        "error_type": type(e).__name__,
-                        "error_message": str(e)
-                    },
-                    "error"
-                )
-        
-        # Check if it's time to reset the circuit
-        if self.redis_circuit_open and current_time > self.circuit_reset_time:
-            log_event(
-                "redis_circuit_reset",
-                "Attempting to reset Redis circuit",
-                {"circuit_open_duration_ms": current_time - (self.circuit_reset_time - self.circuit_reset_interval_ms)}
-            )
-            self.redis_circuit_open = False
-            self.redis_error_count = 0
-        
-        return True
-    
-    def _update_prediction_timestamp(self, hotspot_id):
-        """Update prediction timestamp in local cache and Redis"""
-        current_time = int(time.time() * 1000)
-        
-        # Update local cache
-        self.last_prediction_timestamps[hotspot_id] = current_time
-        
-        # Update Redis if available and circuit is closed
-        if self.redis_client and not self.redis_circuit_open:
-            try:
-                # Define Redis set operation for retry
-                def set_in_redis():
-                    return self.redis_client.set(
-                        hotspot_prediction_key(hotspot_id), 
-                        str(current_time),
-                        ex=REDIS_CACHE_TTL  # Set expiration
-                    )
-                
-                # Try to set in Redis with retry
-                try:
-                    retry_operation(set_in_redis)
-                    
-                    # Update Redis metrics
-                    metrics.record_redis_operation(success=True)
-                    
-                    log_event(
-                        "redis_timestamp_updated",
-                        f"Updated timestamp in Redis for hotspot {hotspot_id}",
-                        {
-                            "key": hotspot_prediction_key(hotspot_id),
-                            "ttl_seconds": REDIS_CACHE_TTL
-                        }
-                    )
-                    
-                except Exception as e:
-                    # Update Redis metrics
-                    metrics.record_redis_operation(success=False)
-                    
-                    # Increment error count
-                    self.redis_error_count += 1
-                    
-                    # Log Redis error
-                    log_event(
-                        "redis_error",
-                        f"Redis error on update ({self.redis_error_count})",
-                        {
-                            "operation": "set",
-                            "key": hotspot_prediction_key(hotspot_id),
-                            "error_type": type(e).__name__,
-                            "error_message": str(e)
-                        },
-                        "warning"
-                    )
-                    
-                    # Open circuit if too many errors
-                    if self.redis_error_count >= 3:
-                        self.redis_circuit_open = True
-                        self.circuit_reset_time = current_time + self.circuit_reset_interval_ms
-                        
-                        log_event(
-                            "redis_circuit_opened",
-                            "Redis circuit opened due to multiple errors",
-                            {
-                                "error_count": self.redis_error_count,
-                                "reset_interval_ms": self.circuit_reset_interval_ms,
-                                "reset_time": self.circuit_reset_time
-                            },
-                            "error"
-                        )
-                
-            except Exception as e:
-                # Log any unexpected errors during the Redis update
-                log_event(
-                    "redis_update_error",
-                    "Unexpected error during Redis update",
-                    {
-                        "hotspot_id": hotspot_id,
-                        "error_type": type(e).__name__,
-                        "error_message": str(e)
-                    },
-                    "error"
-                )
-    
-    def _generate_prediction(self, hotspot, oil_spill_model, chemical_model, config):
-        """Generate predictions for a hotspot using available models"""
-        prediction_start_time = time.time()
-        
-        try:
-            # Extract key information
-            hotspot_id = hotspot.get("hotspot_id")
             location = hotspot.get("location", {})
             pollutant_type = hotspot.get("pollutant_type", "unknown")
             severity = hotspot.get("severity", "low")
@@ -1260,8 +837,27 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
             parent_hotspot_id = hotspot.get("parent_hotspot_id")
             derived_from = hotspot.get("derived_from")
             
+            # Check if this is an update to an existing hotspot
+            is_update = hotspot.get("is_update", False)
+            is_significant = hotspot.get("is_significant_change", False)
+            severity_changed = hotspot.get("severity_changed", False)
+            
+            # Skip insignificant updates with circuit breaker pattern
+            if is_update and not (is_significant or severity_changed):
+                if not self._should_process_hotspot(hotspot_id):
+                    log_event(
+                        "hotspot_skipped",
+                        f"Skipping hotspot {hotspot_id} based on processing rules",
+                        {
+                            "is_update": is_update,
+                            "is_significant_change": is_significant,
+                            "severity_changed": severity_changed
+                        }
+                    )
+                    return None
+            
             # Generate deterministic prediction set ID
-            prediction_set_id = generate_prediction_set_id(hotspot_id, int(time.time() * 1000))
+            prediction_set_id = self._generate_prediction_set_id(hotspot_id, int(time.time() * 1000))
             
             # Skip invalid hotspots
             if not location:
@@ -1287,22 +883,6 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
                 )
                 return None
             
-            # Log key hotspot details for prediction
-            log_event(
-                "prediction_parameters",
-                f"Generating prediction for hotspot {hotspot_id}",
-                {
-                    "hotspot_id": hotspot_id,
-                    "pollutant_type": pollutant_type,
-                    "severity": severity,
-                    "location": {
-                        "latitude": center_latitude,
-                        "longitude": center_longitude,
-                        "radius_km": radius_km
-                    }
-                }
-            )
-            
             # Get environmental conditions
             env_ref = hotspot.get("environmental_reference", {})
             region_id = env_ref.get("region_id", "default_region")
@@ -1314,16 +894,17 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
             # Identify local ecosystem types
             ecosystem_types = self._identify_ecosystem_types(center_latitude, center_longitude, radius_km)
             
-            # Generate predictions for each time interval
+            # Generate predictions
             predictions = []
+            
+            # Generate predictions for each time interval
             for hours in self.prediction_intervals:
                 prediction_interval_start = time.time()
                 
                 prediction = self._generate_prediction_ml(
                     center_latitude, center_longitude, radius_km, pollutant_type,
                     risk_score, current_pattern, wind_pattern,
-                    hours, timestamp, severity, ecosystem_types,
-                    oil_spill_model, chemical_model
+                    hours, timestamp, severity, ecosystem_types
                 )
                 
                 predictions.append(prediction)
@@ -1368,44 +949,236 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
                 "derived_from": derived_from
             }
             
-            # Log full prediction generation complete
+            # Update prediction timestamp in Redis
+            self._update_prediction_timestamp(hotspot_id)
+            
+            # Calculate processing time
+            processing_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Update metrics
+            metrics.record_processed(processing_time_ms)
+            
+            # Log successful prediction generation
             log_event(
-                "prediction_complete",
-                f"Completed full prediction set for hotspot {hotspot_id}",
+                "prediction_generated",
+                f"Generated prediction for hotspot {hotspot_id}",
                 {
+                    "hotspot_id": hotspot_id,
                     "prediction_set_id": prediction_set_id,
-                    "interval_count": len(predictions),
-                    "processing_time_ms": int((time.time() - prediction_start_time) * 1000)
+                    "processing_time_ms": processing_time_ms,
+                    "intervals_predicted": len(self.prediction_intervals)
                 }
             )
             
-            return output
+            return json.dumps(output)
             
         except Exception as e:
-            # Log error in prediction generation
+            # Update error metrics
+            metrics.record_error(type(e).__name__)
+            
+            # Log error with structured data
             log_event(
-                "prediction_error",
-                f"Error generating prediction",
+                "processing_error",
+                f"Error in pollution prediction processing for hotspot {hotspot_id}",
                 {
-                    "hotspot_id": hotspot.get("hotspot_id", "unknown"),
+                    "hotspot_id": hotspot_id,
                     "error_type": type(e).__name__,
                     "error_message": str(e),
                     "traceback": traceback.format_exc(),
-                    "processing_time_ms": int((time.time() - prediction_start_time) * 1000)
+                    "processing_time_ms": int((time.time() - start_time) * 1000)
                 },
                 "error"
             )
             return None
     
+    def _should_process_hotspot(self, hotspot_id):
+        """Determine if hotspot should be processed based on business rules and caching"""
+        current_time = int(time.time() * 1000)
+        
+        # Check if circuit breaker is open and needs reset
+        if self.redis_circuit_open and current_time > self.circuit_reset_time:
+            log_event(
+                "redis_circuit_reset",
+                "Attempting to reset Redis circuit",
+                {"circuit_open_duration_ms": current_time - (self.circuit_reset_time - self.circuit_reset_interval_ms)}
+            )
+            self.redis_circuit_open = False
+            self.redis_error_count = 0
+        
+        # Skip Redis check if circuit is open
+        if self.redis_circuit_open or not self.redis_client:
+            return True
+        
+        try:
+            # Define Redis get operation for retry
+            def get_from_redis():
+                return self.redis_client.get(hotspot_prediction_key(hotspot_id))
+            
+            # Try to get from Redis with retry
+            try:
+                redis_timestamp = retry_operation(get_from_redis)
+                
+                # Update Redis metrics
+                metrics.record_redis_operation(success=True)
+                
+                if redis_timestamp:
+                    # Check if recently processed
+                    last_time = int(redis_timestamp.decode('utf-8'))
+                    if (current_time - last_time) < (2 * 60 * 60 * 1000):  # 2 hour threshold
+                        log_event(
+                            "hotspot_cache_hit",
+                            f"Skipping hotspot {hotspot_id} due to recent processing",
+                            {
+                                "last_processed_ms_ago": current_time - last_time,
+                                "cache_source": "redis"
+                            }
+                        )
+                        return False
+                
+                # Reset error count on successful call
+                self.redis_error_count = 0
+                
+            except Exception as e:
+                # Update Redis metrics
+                metrics.record_redis_operation(success=False)
+                
+                # Increment error count
+                self.redis_error_count += 1
+                
+                # Log Redis error
+                log_event(
+                    "redis_error",
+                    f"Redis error ({self.redis_error_count})",
+                    {
+                        "operation": "get",
+                        "key": hotspot_prediction_key(hotspot_id),
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)
+                    },
+                    "warning"
+                )
+                
+                # Open circuit if too many errors
+                if self.redis_error_count >= 3:
+                    self.redis_circuit_open = True
+                    self.circuit_reset_time = current_time + self.circuit_reset_interval_ms
+                    
+                    log_event(
+                        "redis_circuit_opened",
+                        "Redis circuit opened due to multiple errors",
+                        {
+                            "error_count": self.redis_error_count,
+                            "reset_interval_ms": self.circuit_reset_interval_ms,
+                            "reset_time": self.circuit_reset_time
+                        },
+                        "error"
+                    )
+                
+        except Exception as e:
+            # Log any unexpected errors during the Redis check
+            log_event(
+                "redis_check_error",
+                "Unexpected error during Redis check",
+                {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e)
+                },
+                "error"
+            )
+        
+        return True
+    
+    def _update_prediction_timestamp(self, hotspot_id):
+        """Update prediction timestamp in Redis with circuit breaker"""
+        current_time = int(time.time() * 1000)
+        
+        # Skip Redis update if circuit is open or client not available
+        if self.redis_circuit_open or not self.redis_client:
+            return
+        
+        try:
+            # Define Redis set operation for retry
+            def set_in_redis():
+                return self.redis_client.set(
+                    hotspot_prediction_key(hotspot_id), 
+                    str(current_time),
+                    ex=REDIS_CACHE_TTL  # Set expiration
+                )
+            
+            # Try to set in Redis with retry
+            try:
+                retry_operation(set_in_redis)
+                
+                # Update Redis metrics
+                metrics.record_redis_operation(success=True)
+                
+                log_event(
+                    "redis_timestamp_updated",
+                    f"Updated timestamp in Redis for hotspot {hotspot_id}",
+                    {
+                        "key": hotspot_prediction_key(hotspot_id),
+                        "ttl_seconds": REDIS_CACHE_TTL
+                    }
+                )
+                
+            except Exception as e:
+                # Update Redis metrics
+                metrics.record_redis_operation(success=False)
+                
+                # Increment error count
+                self.redis_error_count += 1
+                
+                # Log Redis error
+                log_event(
+                    "redis_error",
+                    f"Redis error on update ({self.redis_error_count})",
+                    {
+                        "operation": "set",
+                        "key": hotspot_prediction_key(hotspot_id),
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)
+                    },
+                    "warning"
+                )
+                
+                # Open circuit if too many errors
+                if self.redis_error_count >= 3:
+                    self.redis_circuit_open = True
+                    self.circuit_reset_time = current_time + self.circuit_reset_interval_ms
+                    
+                    log_event(
+                        "redis_circuit_opened",
+                        "Redis circuit opened due to multiple errors",
+                        {
+                            "error_count": self.redis_error_count,
+                            "reset_interval_ms": self.circuit_reset_interval_ms,
+                            "reset_time": self.circuit_reset_time
+                        },
+                        "error"
+                    )
+                
+        except Exception as e:
+            # Log any unexpected errors during the Redis update
+            log_event(
+                "redis_update_error",
+                "Unexpected error during Redis update",
+                {
+                    "hotspot_id": hotspot_id,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e)
+                },
+                "error"
+            )
+    
     def _generate_prediction_ml(self, latitude, longitude, radius_km, pollutant_type, 
                               risk_score, current, wind, hours, timestamp, 
-                              severity, ecosystem_types, oil_spill_model, chemical_model):
+                              severity, ecosystem_types):
         """
         Generate a comprehensive prediction using ML models with physics-based fallback
         """
+        prediction_start_time = time.time()
+        
         try:
-            prediction_start_time = time.time()
-            
             # Get pollutant properties
             props = POLLUTANT_PROPERTIES.get(pollutant_type, POLLUTANT_PROPERTIES["unknown"])
             
@@ -1442,7 +1215,7 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
             ml_used = False
             prediction_method = "physics"
             
-            if pollutant_type == "oil_spill" and oil_spill_model is not None:
+            if pollutant_type == "oil_spill" and self.oil_spill_model is not None:
                 log_event(
                     "ml_model_selected",
                     "Using oil spill ML model for prediction",
@@ -1451,7 +1224,7 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
                 
                 try:
                     # Make prediction
-                    prediction = oil_spill_model.predict(features)[0]
+                    prediction = self.oil_spill_model.predict(features)[0]
                     new_latitude, new_longitude, new_radius_km = prediction
                     ml_used = True
                     prediction_method = "ml_oil"
@@ -1481,7 +1254,7 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
                         {"pollutant_type": pollutant_type}
                     )
             
-            elif pollutant_type == "chemical_discharge" and chemical_model is not None:
+            elif pollutant_type == "chemical_discharge" and self.chemical_model is not None:
                 log_event(
                     "ml_model_selected",
                     "Using chemical discharge ML model for prediction",
@@ -1490,7 +1263,7 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
                 
                 try:
                     # Make prediction
-                    prediction = chemical_model.predict(features)[0]
+                    prediction = self.chemical_model.predict(features)[0]
                     new_latitude, new_longitude, new_radius_km = prediction
                     ml_used = True
                     prediction_method = "ml_chemical"
@@ -2058,109 +1831,17 @@ class PollutionPredictionProcessor(KeyedBroadcastProcessFunction):
             "direction": direction,
             "speed": speed
         }
-
-    def process_broadcast_element(self, value, ctx):
-        """Process broadcast elements (ML models)"""
-        try:
-            # Log start of broadcast processing
-            log_event(
-                "broadcast_processing_start",
-                "Processing broadcast element (ML models)",
-                {"timestamp": value.get("timestamp", int(time.time() * 1000))}
-            )
-            
-            # Access the broadcast state via context
-            state = ctx.get_broadcast_state(self.models_state_descriptor)
-            
-            # Extract model data from broadcast element
-            models_data = value
-            
-            # Update broadcast state with models
-            if "models" in models_data:
-                for model_name, model_bytes in models_data["models"].items():
-                    if model_bytes is not None:
-                        state.put(model_name, model_bytes)
-                        log_event(
-                            "model_broadcast_updated",
-                            f"Updated broadcast state with model {model_name}",
-                            {"model_size_bytes": len(model_bytes) if model_bytes else 0}
-                        )
-                    else:
-                        log_event(
-                            "model_broadcast_skipped",
-                            f"Skipped updating broadcast state for model {model_name}",
-                            {"reason": "model bytes is None"}
-                        )
-            
-            # Update broadcast state with config
-            if "config" in models_data:
-                state.put("config", json.dumps(models_data["config"]))
-                log_event(
-                    "config_broadcast_updated",
-                    "Updated broadcast state with configuration",
-                    {"config_items": len(models_data["config"]) if models_data["config"] else 0}
-                )
-                
-            log_event(
-                "broadcast_processing_complete",
-                "Completed broadcast state update",
-                {"timestamp": models_data.get("timestamp", int(time.time() * 1000))}
-            )
-            
-        except Exception as e:
-            # Log error in broadcast processing
-            log_event(
-                "broadcast_processing_error",
-                "Error processing broadcast element",
-                {
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                    "traceback": traceback.format_exc()
-                },
-                "error"
-            )
-
-
-def generate_prediction_set_id(hotspot_id, timestamp):
-    """Generate deterministic ID for a prediction set"""
-    # Round timestamp to nearest hour
-    hour_bucket = int(timestamp / (60 * 60 * 1000)) * (60 * 60 * 1000)
-    id_base = f"{hotspot_id}_{hour_bucket}"
-    return f"pred-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
-
-
-class ModelBroadcastSource(MapFunction):
-    """Source function to periodically broadcast ML models"""
     
-    def __init__(self, model_refresh_interval_ms=60000):
-        self.model_refresh_interval_ms = model_refresh_interval_ms
-        self.last_refresh_time = 0
-    
-    def map(self, trigger):
-        """Process periodic trigger to refresh models"""
-        current_time = int(time.time() * 1000)
-        
-        # Check if it's time to refresh models
-        if current_time - self.last_refresh_time >= self.model_refresh_interval_ms:
-            self.last_refresh_time = current_time
-            
-            # Log model refresh trigger
-            log_event(
-                "model_refresh_triggered",
-                "Triggering model refresh",
-                {
-                    "interval_ms": self.model_refresh_interval_ms,
-                    "time_since_last_refresh_ms": current_time - self.last_refresh_time
-                }
-            )
-            
-            return "refresh_models"
-        
-        return None
+    def _generate_prediction_set_id(self, hotspot_id, timestamp):
+        """Generate deterministic ID for a prediction set"""
+        # Round timestamp to nearest hour
+        hour_bucket = int(timestamp / (60 * 60 * 1000)) * (60 * 60 * 1000)
+        id_base = f"{hotspot_id}_{hour_bucket}"
+        return f"pred-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
 
 
 def wait_for_services():
-    """Wait for Kafka to be available with retry logic"""
+    """Wait for Kafka, Redis, and MinIO services with enhanced monitoring"""
     log_event(
         "service_check_start",
         "Waiting for Kafka, Redis, and MinIO services",
@@ -2340,17 +2021,11 @@ def configure_checkpoints(env):
     # Set timeout for checkpoint completion
     checkpoint_config.set_checkpoint_timeout(30000)  # 30 seconds
     
-    # Set mode to EXACTLY_ONCE (default, but explicitly set for clarity)
-    # checkpoint_config.set_checkpoint_mode(CheckpointingMode.EXACTLY_ONCE)
-    
     # Set minimum pause between checkpoints
     checkpoint_config.set_min_pause_between_checkpoints(30000)  # 30 seconds
     
     # Maximum concurrent checkpoints
     checkpoint_config.set_max_concurrent_checkpoints(1)
-    
-    # Enable externalized checkpoints for recovery
-    # checkpoint_config.enable_externalized_checkpoints(ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION)
     
     log_event(
         "checkpoints_configured",
@@ -2423,34 +2098,13 @@ def main():
     
     # Define the processing pipeline
     
-    # 1. Model Loading Stream - centralizes model loading
-    # Create a periodic trigger stream for model refreshes
-    model_refresh_stream = env.from_collection(
-        collection=[1],  # Just need a single element to start
-        type_info=Types.INT()
-    )
-    
-    # Create broadcast stream for models
-    model_broadcast_stream = model_refresh_stream \
-        .map(ModelBroadcastSource(model_refresh_interval_ms=60000), output_type=Types.STRING()) \
-        .filter(lambda x: x is not None) \
-        .map(MLModelLoader(), output_type=Types.PICKLED_BYTE_ARRAY())
-    
-    # 2. Main Hotspot Processing Stream
-    # Read hotspots from Kafka
+    # 1. Read hotspots from Kafka
     hotspots_stream = env.add_source(hotspots_consumer)
     
-    # Create key selector for partitioning
-    hotspot_key_selector = HotspotKeySelector()
-    
-    # Connect the hotspots stream with the broadcast models
+    # 2. Process hotspots and generate predictions
     predictions = hotspots_stream \
-        .key_by(lambda x: hotspot_key_selector.get_key(x)) \
-        .connect(model_broadcast_stream.broadcast(ML_MODELS_STATE_DESCRIPTOR)) \
-        .process(
-            PollutionPredictionProcessor(),
-            output_type=Types.STRING()
-        ) \
+        .map(PollutionSpreadPredictor(), output_type=Types.STRING()) \
+        .filter(lambda x: x is not None) \
         .name("Generate_Pollution_Predictions")
     
     # 3. Send predictions to Kafka
