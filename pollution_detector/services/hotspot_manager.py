@@ -23,6 +23,14 @@ BACKOFF_FACTOR = 2  # secondi
 CIRCUIT_OPEN_THRESHOLD = 3  # fallimenti
 CIRCUIT_RESET_TIMEOUT = 60  # secondi
 
+# Lock configuration
+LOCK_TIMEOUT = 15  # secondi (aumentato da 10 a 15)
+LOCK_RETRY_COUNT = 5  # tentativi (aumentato da 3 a 5)
+LOCK_RETRY_DELAY = 0.2  # secondi
+
+# Callback registry for counter updates
+counter_callbacks = []
+
 class DatabaseCircuitBreaker:
     """
     Circuit breaker pattern per connessioni database
@@ -135,6 +143,9 @@ class HotspotManager:
         # Configurazione
         self.spatial_bin_size = 0.05  # Circa 5km
         
+        # Cache per verifiche di validità (prevenzione duplicazioni)
+        self.hotspot_cache = {}
+        
         # Inizializza connessioni
         self._connect_with_retry()
     
@@ -221,6 +232,20 @@ class HotspotManager:
             # Retry completo se fallisce
             self._connect_with_retry()
     
+    def register_counter_callback(self, callback):
+        """Registra una callback per aggiornamenti contatori"""
+        if callback not in counter_callbacks:
+            counter_callbacks.append(callback)
+            logger.info(f"Registrata nuova callback per aggiornamento contatori. Totale: {len(counter_callbacks)}")
+    
+    def notify_counter_update(self, hotspot_id, is_new, is_update, old_status, new_status):
+        """Notifica callback registrate di aggiornamenti contatori"""
+        for callback in counter_callbacks:
+            try:
+                callback(hotspot_id, is_new, is_update, old_status, new_status)
+            except Exception as e:
+                logger.error(f"Errore nell'esecuzione della callback per i contatori: {e}")
+    
     def find_matching_hotspot(self, latitude, longitude, radius_km, pollutant_type):
         """Trova hotspot esistente che corrisponde spazialmente"""
         try:
@@ -238,6 +263,8 @@ class HotspotManager:
             if not nearby_hotspot_ids:
                 db_hotspot = self._find_hotspot_in_database(latitude, longitude, radius_km, pollutant_type)
                 if db_hotspot:
+                    # Aggiorna cache Redis se manca
+                    self._update_redis_after_db_find(db_hotspot, latitude, longitude)
                     return db_hotspot
             
             logger.info(f"Nessun hotspot corrispondente trovato per ({latitude}, {longitude})")
@@ -288,6 +315,9 @@ class HotspotManager:
             return None
             
         try:
+            # Lista di candidati e distanze per trovare il miglior match
+            candidates = []
+            
             for hotspot_id in hotspot_ids:
                 # Ottieni dati hotspot in modo sicuro
                 def get_hotspot_data():
@@ -326,13 +356,19 @@ class HotspotManager:
                     latitude, longitude, h_lat, h_lon
                 )
                 
-                # Criterio più flessibile (120% invece di 80%)
+                # Criterio più conservativo (110% invece di 120%)
                 combined_radius = radius_km + h_radius
-                if distance <= combined_radius * 1.2:  # 20% margine di tolleranza
+                if distance <= combined_radius * 1.1:  # 10% margine di tolleranza
                     # Verifica anche tipo di inquinante
                     if self._is_same_pollutant_type(pollutant_type, h_pollutant):
-                        logger.info(f"Trovato match: hotspot {hotspot_id} a distanza {distance:.2f}km")
-                        return hotspot_id
+                        candidates.append((hotspot_id, distance))
+            
+            # Ordina per distanza e prendi il più vicino
+            if candidates:
+                candidates.sort(key=lambda x: x[1])
+                best_match = candidates[0]
+                logger.info(f"Trovato match: hotspot {best_match[0]} a distanza {best_match[1]:.2f}km")
+                return best_match[0]
             
             return None
         except Exception as e:
@@ -344,8 +380,9 @@ class HotspotManager:
         try:
             def query_database():
                 with self.timescale_conn.cursor() as cur:
+                    # Query migliorata con indice spaziale (se disponibile)
                     cur.execute("""
-                        SELECT hotspot_id, center_latitude, center_longitude, radius_km, pollutant_type
+                        SELECT hotspot_id, center_latitude, center_longitude, radius_km, pollutant_type, severity
                         FROM active_hotspots
                         WHERE 
                             center_latitude BETWEEN %s - %s AND %s + %s
@@ -359,35 +396,58 @@ class HotspotManager:
                     
                     results = []
                     for record in cur.fetchall():
-                        db_id, db_lat, db_lon, db_radius, db_pollutant = record
+                        db_id, db_lat, db_lon, db_radius, db_pollutant, db_severity = record
                         
                         # Calcola distanza
                         distance = self._haversine_distance(
                             latitude, longitude, db_lat, db_lon
                         )
                         
-                        # Verifica sovrapposizione
+                        # Verifica sovrapposizione con margine ridotto
                         combined_radius = radius_km + db_radius
-                        if distance <= combined_radius * 1.2:  # 20% margine
+                        if distance <= combined_radius * 1.1:  # 10% margine
                             if self._is_same_pollutant_type(pollutant_type, db_pollutant):
-                                results.append((db_id, distance))
+                                results.append((db_id, distance, db_lat, db_lon, db_radius, db_pollutant, db_severity))
                     
                     # Ordina per distanza
                     results.sort(key=lambda x: x[1])
-                    return results[0][0] if results else None
+                    return results[0] if results else None
             
             # Usa circuit breaker
             try:
                 result = self.timescale_circuit.execute(query_database)
                 if result:
-                    logger.info(f"Trovato match nel database: hotspot {result}")
-                return result
+                    logger.info(f"Trovato match nel database: hotspot {result[0]}")
+                    # Ritorna l'ID hotspot
+                    return result[0]
             except CircuitOpenError:
                 logger.warning("Timescale circuit open, skipping database lookup")
                 return None
         except Exception as e:
             logger.error(f"Errore nella ricerca database: {e}")
             return None
+    
+    def _update_redis_after_db_find(self, hotspot_id, latitude, longitude):
+        """Aggiorna Redis dopo aver trovato un hotspot nel database"""
+        try:
+            # Calcola bin spaziale
+            lat_bin = math.floor(latitude / self.spatial_bin_size)
+            lon_bin = math.floor(longitude / self.spatial_bin_size)
+            spatial_key = spatial_bin_key(lat_bin, lon_bin)
+            
+            # Aggiungi al bin spaziale
+            def update_spatial_bin():
+                self.redis_client.sadd(spatial_key, hotspot_id)
+                self.redis_client.expire(spatial_key, 86400)  # 24 ore
+            
+            # Usa circuit breaker
+            try:
+                self.redis_circuit.execute(update_spatial_bin)
+                logger.info(f"Aggiornato bin spaziale {spatial_key} per hotspot {hotspot_id}")
+            except CircuitOpenError:
+                logger.warning("Redis circuit open, skipping spatial bin update")
+        except Exception as e:
+            logger.error(f"Errore nell'aggiornamento di Redis dopo trovare DB: {e}")
     
     def _is_same_pollutant_type(self, type1, type2):
         """Verifica se due tipi di inquinanti sono considerati equivalenti"""
@@ -410,7 +470,7 @@ class HotspotManager:
         
         return False
     
-    def _acquire_lock(self, lock_name, timeout_seconds=10):
+    def _acquire_lock(self, lock_name, timeout_seconds=LOCK_TIMEOUT):
         """Acquista un lock distribuito usando Redis"""
         try:
             lock_key = f"locks:hotspot:{lock_name}"
@@ -418,8 +478,8 @@ class HotspotManager:
             
             # Carica configurazione
             def get_redis_config():
-                retry_count = int(self.redis_client.get("config:locks:retry_count") or 3)
-                retry_delay = int(self.redis_client.get("config:locks:retry_delay") or 100) / 1000.0
+                retry_count = int(self.redis_client.get("config:locks:retry_count") or LOCK_RETRY_COUNT)
+                retry_delay = int(self.redis_client.get("config:locks:retry_delay") or int(LOCK_RETRY_DELAY * 1000)) / 1000.0
                 return retry_count, retry_delay
                 
             # Usa circuit breaker
@@ -427,7 +487,7 @@ class HotspotManager:
                 retry_count, retry_delay = self.redis_circuit.execute(get_redis_config)
             except CircuitOpenError:
                 # Valori di default se Redis non è disponibile
-                retry_count, retry_delay = 3, 0.1
+                retry_count, retry_delay = LOCK_RETRY_COUNT, LOCK_RETRY_DELAY
             
             # Prova più volte ad acquisire il lock
             for attempt in range(retry_count):
@@ -490,8 +550,9 @@ class HotspotManager:
             
             # Crea un lock_name basato sulle coordinate e il tipo di inquinante
             # (approssima le coordinate per ridurre i conflitti non necessari)
-            lat_bin = math.floor(center_lat * 100) / 100
-            lon_bin = math.floor(center_lon * 100) / 100
+            # Usa 3 decimali invece di 2 per una maggiore precisione
+            lat_bin = math.floor(center_lat * 1000) / 1000
+            lon_bin = math.floor(center_lon * 1000) / 1000
             lock_name = f"{lat_bin}:{lon_bin}:{pollutant_type}"
             
             # Acquista il lock
@@ -505,7 +566,7 @@ class HotspotManager:
                 
                 if existing_hotspot_id:
                     # Se troviamo un match, aggiorniamolo
-                    return self._update_hotspot(existing_hotspot_id, hotspot_data)
+                    return self._update_hotspot_fallback(existing_hotspot_id, hotspot_data)
                 else:
                     # Altrimenti, restituiamo i dati originali
                     return hotspot_data
@@ -537,6 +598,21 @@ class HotspotManager:
             hotspot_id = hotspot_data["hotspot_id"]
             center_lat = hotspot_data["location"]["center_latitude"]
             center_lon = hotspot_data["location"]["center_longitude"]
+            
+            # Verifica che l'hotspot non esista già
+            def check_existing():
+                with self.timescale_conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM active_hotspots WHERE hotspot_id = %s", (hotspot_id,))
+                    return cur.fetchone()[0] > 0
+            
+            # Usa circuit breaker
+            try:
+                exists = self.timescale_circuit.execute(check_existing)
+                if exists:
+                    logger.info(f"Hotspot {hotspot_id} già esistente, aggiornamento invece di creazione")
+                    return self._update_hotspot(hotspot_id, hotspot_data)
+            except CircuitOpenError:
+                logger.warning("Timescale circuit open, skipping existence check")
             
             # Usa transaction manager per atomicità e retry
             def create_transaction(conn):
@@ -605,10 +681,31 @@ class HotspotManager:
                 logger.error("Timescale circuit open, skipping hotspot creation")
                 return hotspot_data
             
+            # Aggiungi ai bin spaziali in Redis
+            self._update_spatial_bins(hotspot_id, center_lat, center_lon)
+            
             # Aggiungi campi di relazione
             hotspot_data["is_new"] = True
             hotspot_data["parent_hotspot_id"] = None
             hotspot_data["derived_from"] = None
+            
+            # Aggiungi alla cache locale
+            self.hotspot_cache[hotspot_id] = {
+                "center_lat": center_lat,
+                "center_lon": center_lon,
+                "radius_km": hotspot_data["location"]["radius_km"],
+                "pollutant_type": hotspot_data["pollutant_type"],
+                "severity": hotspot_data["severity"]
+            }
+            
+            # Notifica contatori
+            self.notify_counter_update(
+                hotspot_id=hotspot_id,
+                is_new=True,
+                is_update=False,
+                old_status=None,
+                new_status=hotspot_data["severity"]
+            )
             
             logger.info(f"Creato nuovo hotspot: {hotspot_id}")
             return hotspot_data
@@ -752,12 +849,35 @@ class HotspotManager:
                 logger.error("Timescale circuit open, skipping hotspot update")
                 return new_data
             
+            # Aggiorna bin spaziali Redis (solo se il punto si è spostato significativamente)
+            if movement_distance > 0.1:  # 100 metri
+                self._update_spatial_bins(existing_id, center_lat, center_lon)
+            
             # Aggiungi flag per indicare tipo di update
             new_data["is_update"] = True
             new_data["severity_changed"] = severity_changed
             new_data["is_significant_change"] = is_significant
             new_data["update_count"] = update_count
             new_data["movement_distance_km"] = movement_distance
+            
+            # Aggiorna cache locale
+            self.hotspot_cache[existing_id] = {
+                "center_lat": center_lat,
+                "center_lon": center_lon,
+                "radius_km": new_data["location"]["radius_km"],
+                "pollutant_type": new_data["pollutant_type"],
+                "severity": new_severity
+            }
+            
+            # Notifica contatori - cambiamento di severità
+            if severity_changed:
+                self.notify_counter_update(
+                    hotspot_id=existing_id,
+                    is_new=False,
+                    is_update=True,
+                    old_status=old_severity,
+                    new_status=new_severity
+                )
             
             logger.info(f"Aggiornato hotspot {existing_id} (update #{update_count}, significant: {is_significant})")
             return new_data
@@ -766,6 +886,64 @@ class HotspotManager:
             logger.error(f"Errore nell'aggiornamento di hotspot: {e}")
             # Restituisci i dati originali in caso di errore
             return new_data
+    
+    def _update_hotspot_fallback(self, existing_id, new_data):
+        """Versione semplificata di update_hotspot quando il lock fallisce"""
+        try:
+            # Conserva l'ID originale
+            original_id = new_data.get("hotspot_id")
+            new_data["hotspot_id"] = existing_id
+            
+            # Aggiungi campi di relazione
+            new_data["parent_hotspot_id"] = existing_id
+            new_data["is_update"] = True
+            
+            # Se questo è un hotspot rilevato come duplicato (ha un ID originale diverso)
+            if original_id != existing_id:
+                new_data["derived_from"] = original_id
+            
+            logger.info(f"Aggiornamento fallback di hotspot {existing_id} (senza lock)")
+            return new_data
+        except Exception as e:
+            logger.error(f"Errore nell'aggiornamento fallback di hotspot: {e}")
+            return new_data
+    
+    def _update_spatial_bins(self, hotspot_id, latitude, longitude):
+        """Aggiorna i bin spaziali in Redis per un hotspot"""
+        try:
+            # Calcola il bin spaziale
+            lat_bin = math.floor(latitude / self.spatial_bin_size)
+            lon_bin = math.floor(longitude / self.spatial_bin_size)
+            
+            # Genera la chiave Redis
+            spatial_key = spatial_bin_key(lat_bin, lon_bin)
+            
+            # Definisci l'operazione Redis
+            def update_spatial_bin():
+                # Aggiungi l'hotspot al nuovo bin
+                self.redis_client.sadd(spatial_key, hotspot_id)
+                self.redis_client.expire(spatial_key, 86400)  # 24 ore TTL
+                
+                # Se abbiamo dati nella cache, rimuovi dai vecchi bin se necessario
+                if hotspot_id in self.hotspot_cache:
+                    old_data = self.hotspot_cache[hotspot_id]
+                    old_lat_bin = math.floor(old_data["center_lat"] / self.spatial_bin_size)
+                    old_lon_bin = math.floor(old_data["center_lon"] / self.spatial_bin_size)
+                    
+                    # Se il bin è cambiato
+                    if old_lat_bin != lat_bin or old_lon_bin != lon_bin:
+                        old_key = spatial_bin_key(old_lat_bin, old_lon_bin)
+                        self.redis_client.srem(old_key, hotspot_id)
+                        logger.info(f"Rimosso hotspot {hotspot_id} dal vecchio bin {old_key}")
+            
+            # Esegui con circuit breaker
+            try:
+                self.redis_circuit.execute(update_spatial_bin)
+                logger.info(f"Aggiornato bin spaziale {spatial_key} per hotspot {hotspot_id}")
+            except CircuitOpenError:
+                logger.warning("Redis circuit open, skipping spatial bin update")
+        except Exception as e:
+            logger.error(f"Errore nell'aggiornamento dei bin spaziali: {e}")
     
     def _haversine_distance(self, lat1, lon1, lat2, lon2):
         """Calcola distanza tra due punti in km"""
