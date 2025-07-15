@@ -1,0 +1,8 @@
+./image_standardizer/main.py
+./ml_prediction/main.py
+./data_processor/main.py
+./buoy_producer/main.py
+./pollution_detector/main.py
+./venv/lib/python3.12/site-packages/pip/_internal/cli/main.py
+./venv/lib/python3.12/site-packages/pip/_internal/main.py
+./sensor_analyzer/main.py

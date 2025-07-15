@@ -12,13 +12,13 @@ import boto3
 from botocore.exceptions import ClientError
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
+from prometheus_client import start_http_server, Counter
 
 # ─────────────────── PATH HACK (import Utils.* outside container) ──────────
 UTILS_DIR = pathlib.Path(__file__).resolve().parent / "utils"
 sys.path.append(str(UTILS_DIR))
 
 # ---- import utility DRCS ----------------------------------------------------
-from Utils.stream_img_utils import on_send_success, on_send_error
 from Utils.imgfetch_utils import (
     get_aoi_bbox_and_size,
     true_color_image_request_processing,
@@ -34,6 +34,18 @@ DLQ_TOPIC = os.getenv("DLQ_TOPIC", "satellite_imagery_dlq")
 POLL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", "900"))
 DAYS_LOOKBACK = int(os.getenv("SAT_DAYS_LOOKBACK", "30"))       # window for search
 CLOUD_LIMIT = float(os.getenv("SAT_MAX_CLOUD", "20"))           # %
+
+# Prometheus Metrics
+SATELLITE_MESSAGES_PRODUCED = Counter('satellite_messages_produced_total', 'Total messages produced by the satellite producer.')
+SATELLITE_PRODUCER_ERRORS = Counter('satellite_producer_errors_total', 'Total errors encountered by the satellite producer.')
+
+def on_send_success(record_metadata):
+    SATELLITE_MESSAGES_PRODUCED.inc()
+    logger.info(f"→ 🛰️  (topic: {record_metadata.topic}, partition: {record_metadata.partition}, offset: {record_metadata.offset})")
+
+def on_send_error(excp):
+    SATELLITE_PRODUCER_ERRORS.inc()
+    logger.error('Error in Kafka producer', exc_info=excp)
 
 # MinIO
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "bronze")
@@ -109,6 +121,7 @@ def create_kafka_producer():
 
 def on_delivery_error(err, msg):
     """Error callback for Kafka producer"""
+    SATELLITE_PRODUCER_ERRORS.inc()
     logger.error(f'Message delivery failed: {err}')
     # Send to DLQ if possible
     try:
@@ -137,6 +150,10 @@ def on_delivery_error(err, msg):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
+    # Start Prometheus metrics server
+    start_http_server(8080)
+    logger.info("Prometheus metrics server started on port 8080.")
+
     logger.add(lambda m: print(m, end=""), level="INFO")
     
     # Create Kafka producer

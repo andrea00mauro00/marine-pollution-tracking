@@ -7,5 +7,6 @@ numpy
 redis
 pandas
 uuid
-pyarrow 
+pyarrow
 rasterio
+prometheus_client==0.17.1

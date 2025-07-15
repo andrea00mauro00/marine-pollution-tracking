@@ -1,97 +1,46 @@
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
-  external_labels:
-    environment: 'marine_pollution_monitoring'
-    system: 'production'
 
 rule_files:
-  # - "alert_rules.yml"
+  - "alert_rules.yml"
 
 scrape_configs:
-  # Prometheus self-monitoring
-  - job_name: 'buoy-producer'
-    static_configs:
-      - targets: ['buoy_producer:8001']
-
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
-    scrape_interval: 30s
-    metrics_path: /metrics
 
-  # Marine Pollution Producers  
-  - job_name: 'buoy-producer'
+  - job_name: 'marine-services'
     static_configs:
-      - targets: ['buoy_producer:8001']
-        labels:
-          component: 'producer'
-          data_source: 'sensors'
-    scrape_interval: 15s
-    metrics_path: /metrics
-
-  - job_name: 'satellite-producer'
-    static_configs:
-      - targets: ['satellite_producer:8002']
-        labels:
-          component: 'producer'
-          data_source: 'satellite'
-    scrape_interval: 30s
-    metrics_path: /metrics
-
-  # Flink Processing Jobs
-  - job_name: 'sensor-analyzer'
-    static_configs:
-      - targets: ['sensor_analyzer:8003']
-        labels:
-          component: 'processor'
-          job_type: 'analysis'
-    scrape_interval: 15s
-    metrics_path: /metrics
-
-  - job_name: 'pollution-detector'
-    static_configs:
-      - targets: ['pollution_detector:8004']
-        labels:
-          component: 'processor'
-          job_type: 'detection'
+      - targets: 
+        - 'dashboard:8501'
+        - 'buoy_producer:8080'
+        - 'satellite_producer:8080'
+        - 'storage_consumer:8080'
+        - 'alert_manager:8080'
+    metrics_path: '/metrics'
     scrape_interval: 10s
-    metrics_path: /metrics
 
-  - job_name: 'ml-prediction'
+  - job_name: 'kafka'
     static_configs:
-      - targets: ['ml_prediction_job:8005']
-        labels:
-          component: 'processor'
-          job_type: 'prediction'
-    scrape_interval: 15s
-    metrics_path: /metrics
+      - targets: ['kafka:9092']
 
-  # Consumer Services
-  - job_name: 'storage-consumer'
+  - job_name: 'redis'
     static_configs:
-      - targets: ['storage_consumer:8006']
-        labels:
-          component: 'consumer'
-          storage_type: 'timescale'
-    scrape_interval: 15s
-    metrics_path: /metrics
+      - targets: ['redis:6379']
 
-  - job_name: 'alert-manager'
+  - job_name: 'postgres'
     static_configs:
-      - targets: ['alert_manager:8007']
-        labels:
-          component: 'consumer'
-          alert_type: 'notifications'
-    scrape_interval: 20s
-    metrics_path: /metrics
+      - targets: ['postgres:5432']
 
-  # Dashboard Service
-  - job_name: 'streamlit-dashboard'
+  - job_name: 'timescale'
     static_configs:
-      - targets: ['dashboard_streamlit:8008']
-        labels:
-          component: 'visualization'
-          service: 'streamlit'
-    scrape_interval: 30s
-    metrics_path: /metrics
+      - targets: ['timescaledb:5432']
+
+  - job_name: 'elasticsearch'
+    static_configs:
+      - targets: ['elasticsearch:9200']
+
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']

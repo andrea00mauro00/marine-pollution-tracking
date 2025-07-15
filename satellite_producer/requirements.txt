@@ -16,3 +16,4 @@ confluent-kafka==2.2.0
 fastavro==1.7.3
 kafka-python
 prometheus-client
+prometheus_client==0.17.1

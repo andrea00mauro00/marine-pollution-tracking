@@ -14,6 +14,7 @@ volumes:
   elasticsearch-data:
   prometheus-data:
 
+
 services:
   # ==================== CORE INFRASTRUCTURE ====================
   zookeeper:
@@ -64,6 +65,18 @@ services:
     ports:
       - "8081:8081"
 
+  schema-registry-ui:
+    image: landoop/schema-registry-ui:latest
+    container_name: schema-registry-ui
+    depends_on:
+      - schema-registry
+    environment:
+      SCHEMAREGISTRY_URL: http://schema-registry:8081
+    networks:
+      - marine-network
+    ports:
+      - "8000:8000"
+
   # ==================== DATABASES ====================
   postgres:
     image: postgres:14-alpine
@@ -72,6 +85,7 @@ services:
       POSTGRES_DB: marine_db
       POSTGRES_USER: marine_user
       POSTGRES_PASSWORD: marine_password
+      POSTGRES_MULTIPLE_DATABASES: "marine_db,pollution_db"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./setup_database/init_scripts/postgres:/docker-entrypoint-initdb.d
@@ -130,7 +144,7 @@ services:
       - "9000:9000"
       - "9001:9001"
 
-  # ==================== PRODUCERS (UNIQUE PORTS) ====================
+  # ==================== PRODUCERS ====================
   buoy_producer:
     build: ./buoy_producer
     container_name: buoy_producer
@@ -143,7 +157,7 @@ services:
     networks:
       - marine-network
     ports:
-      - "7001:8080"  # ✅ UNIQUE PORT
+      - "8082:8080"
     restart: unless-stopped
 
   satellite_producer:
@@ -158,10 +172,10 @@ services:
     networks:
       - marine-network
     ports:
-      - "7002:8080"  # ✅ UNIQUE PORT
+      - "8083:8080"
     restart: unless-stopped
 
-  # ==================== PROCESSING SERVICES (UNIQUE PORTS) ====================
+  # ==================== PROCESSING SERVICES ====================
   image_standardizer:
     build: ./image_standardizer
     container_name: image_standardizer
@@ -176,7 +190,7 @@ services:
     networks:
       - marine-network
     ports:
-      - "7003:8081"  # ✅ UNIQUE PORT
+      - "8082:8081"
 
   sensor_analyzer:
     build: ./sensor_analyzer
@@ -192,7 +206,7 @@ services:
     networks:
       - marine-network
     ports:
-      - "7004:8081"  # ✅ UNIQUE PORT
+      - "8085:8081"
 
   pollution_detector:
     build: ./pollution_detector
@@ -208,7 +222,7 @@ services:
     networks:
       - marine-network
     ports:
-      - "7005:8081"  # ✅ UNIQUE PORT
+      - "8083:8081"
 
   ml_prediction_job:
     build: ./ml_prediction
@@ -224,9 +238,9 @@ services:
     networks:
       - marine-network
     ports:
-      - "7006:8081"  # ✅ UNIQUE PORT
+      - "8084:8081"
 
-  # ==================== CONSUMERS (UNIQUE PORTS) ====================
+  # ==================== CONSUMERS ====================
   storage_consumer:
     build: ./storage_consumer
     container_name: storage_consumer
@@ -243,7 +257,20 @@ services:
     networks:
       - marine-network
     ports:
-      - "7007:8080"  # ✅ UNIQUE PORT
+      - "8084:8080"
+    restart: unless-stopped
+
+  dlq_consumer:
+    build: ./dlq_consumer
+    container_name: dlq_consumer
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_HOST: postgres
+    networks:
+      - marine-network
     restart: unless-stopped
 
   alert_manager:
@@ -260,10 +287,10 @@ services:
     networks:
       - marine-network
     ports:
-      - "7008:8080"  # ✅ UNIQUE PORT
+      - "8085:8080"
     restart: unless-stopped
 
-  # ==================== DASHBOARD ====================
+  # ==================== NEW MODULAR DASHBOARD ====================
   dashboard:
     build: ./dashboard
     container_name: dashboard
@@ -289,10 +316,8 @@ services:
     networks:
       - marine-network
     ports:
-      - "8501:8501"  # ✅ DASHBOARD PRINCIPALE
+      - "8501:8501"
     restart: unless-stopped
-
-  # ==================== OBSERVABILITY ====================
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.9.0
     container_name: elasticsearch
@@ -300,6 +325,7 @@ services:
       - discovery.type=single-node
       - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
       - xpack.security.enabled=false
+      - xpack.monitoring.collection.enabled=true
     volumes:
       - elasticsearch-data:/usr/share/elasticsearch/data
     networks:
@@ -312,6 +338,7 @@ services:
       timeout: 10s
       retries: 3
 
+  # Kibana for log visualization
   kibana:
     image: docker.elastic.co/kibana/kibana:8.9.0
     container_name: kibana
@@ -319,6 +346,7 @@ services:
       - elasticsearch
     environment:
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - xpack.monitoring.ui.container.elasticsearch.enabled=true
     networks:
       - marine-network
     ports:
@@ -329,6 +357,29 @@ services:
       timeout: 10s
       retries: 3
 
+  # Logstash for log processing
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.9.0
+    container_name: logstash
+    depends_on:
+      - elasticsearch
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml
+    environment:
+      - "LS_JAVA_OPTS=-Xmx1g -Xms1g"
+    networks:
+      - marine-network
+    ports:
+      - "5044:5044"
+      - "12201:12201/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9600/_node/stats || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus for metrics collection
   prometheus:
     image: prom/prometheus:v2.45.0
     container_name: prometheus
@@ -351,3 +402,17 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "8086:8080"
+    networks:
+      - marine-network
+    restart: unless-stopped

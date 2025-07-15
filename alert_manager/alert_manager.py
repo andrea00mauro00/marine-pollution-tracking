@@ -1,893 +1,560 @@
+"""
+==============================================================================
+Marine Pollution Monitoring System - Alert Manager
+==============================================================================
+This service:
+1. Consumes alerts from Kafka
+2. Applies deduplication and filtering based on severity and history
+3. Stores alerts in PostgreSQL
+4. Delivers notifications via configured channels (email, SMS, webhook)
+5. Tracks notification status and handles retries
+"""
+
 import os
+import logging
 import json
 import time
 import uuid
-import logging
-import math
-import redis
-import requests
-import psycopg2
-from psycopg2.extras import Json
-from datetime import datetime
-from kafka import KafkaConsumer
+import re
+import traceback
 import sys
-sys.path.append('/opt/flink/usrlib')
-from common.redis_keys import *  # Importa le chiavi standardizzate
+from pythonjsonlogger import jsonlogger
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional
+import psycopg2
+import redis
+from kafka import KafkaConsumer
+from prometheus_client import start_http_server, Counter
 
-# Configurazione logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(asctime)s - %(name)s - %(message)s'
+# Structured JSON Logger setup
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(name)s %(levelname)s %(message)s',
+    rename_fields={'asctime': 'timestamp', 'levelname': 'level'}
 )
-logger = logging.getLogger("alert_manager")
+logHandler.setFormatter(formatter)
 
-# Configurazione da variabili d'ambiente
-KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+logger = logging.getLogger(__name__)
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Add component to all log messages
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.component = 'alert-manager'
+    return record
+logging.setLogRecordFactory(record_factory)
+
+# Prometheus Metrics
+ALERTS_PROCESSED = Counter('alerts_processed_total', 'Total alerts processed', ['severity'])
+NOTIFICATIONS_SENT = Counter('notifications_sent_total', 'Total notifications sent', ['channel'])
+ALERT_MANAGER_ERRORS = Counter('alert_manager_errors_total', 'Total errors encountered', ['type'])
+
+# Configuration from environment variables
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092").split(",")
+ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
+
+# PostgreSQL configuration
 POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "postgres")
 POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
 POSTGRES_DB = os.environ.get("POSTGRES_DB", "marine_pollution")
 POSTGRES_USER = os.environ.get("POSTGRES_USER", "postgres")
 POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 
-# Topic Kafka
-ALERTS_TOPIC = os.environ.get("ALERTS_TOPIC", "sensor_alerts")
+# Redis configuration
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 
-# Configurazione notifiche
+# Notification configuration
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_SERVER = os.environ.get("EMAIL_SERVER", "smtp.example.com")
-EMAIL_PORT = int(os.environ.get("EMAIL_PORT", 587))
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
 EMAIL_USER = os.environ.get("EMAIL_USER", "alerts@example.com")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "password")
-HIGH_PRIORITY_RECIPIENTS = os.environ.get("HIGH_PRIORITY_RECIPIENTS", "").split(",")
-MEDIUM_PRIORITY_RECIPIENTS = os.environ.get("MEDIUM_PRIORITY_RECIPIENTS", "").split(",")
-LOW_PRIORITY_RECIPIENTS = os.environ.get("LOW_PRIORITY_RECIPIENTS", "").split(",")
 
-# Configurazione webhook
+# Recipients based on priority
+HIGH_PRIORITY_RECIPIENTS = os.environ.get("HIGH_PRIORITY_RECIPIENTS", "emergency@example.com").split(",")
+MEDIUM_PRIORITY_RECIPIENTS = os.environ.get("MEDIUM_PRIORITY_RECIPIENTS", "operations@example.com").split(",")
+LOW_PRIORITY_RECIPIENTS = os.environ.get("LOW_PRIORITY_RECIPIENTS", "monitoring@example.com").split(",")
+
+# SMS configuration
+SMS_ENABLED = os.environ.get("SMS_ENABLED", "false").lower() == "true"
+SMS_API_KEY = os.environ.get("SMS_API_KEY", "")
+
+# Webhook configuration
 WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "false").lower() == "true"
-HIGH_PRIORITY_WEBHOOK = os.environ.get("HIGH_PRIORITY_WEBHOOK", "")
-MEDIUM_PRIORITY_WEBHOOK = os.environ.get("MEDIUM_PRIORITY_WEBHOOK", "")
-LOW_PRIORITY_WEBHOOK = os.environ.get("LOW_PRIORITY_WEBHOOK", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
-def connect_postgres():
-    """Crea connessione a PostgreSQL"""
-    try:
-        conn = psycopg2.connect(
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            dbname=POSTGRES_DB,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD
-        )
-        logger.info("Connessione a PostgreSQL stabilita")
-        return conn
-    except Exception as e:
-        logger.error(f"Errore connessione a PostgreSQL: {e}")
-        raise
+# Regional configuration
+try:
+    REGIONAL_CONFIG = json.loads(os.environ.get("REGIONAL_CONFIG", "{}"))
+except json.JSONDecodeError:
+    REGIONAL_CONFIG = {}
 
-def connect_redis():
-    """Connessione a Redis"""
-    try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
-        r.ping()  # Verifica connessione
-        logger.info("Connessione a Redis stabilita")
-        return r
-    except Exception as e:
-        logger.error(f"Errore connessione a Redis: {e}")
-        raise
-
-def load_notification_config(postgres_conn):
-    """Carica configurazioni notifiche dal database"""
-    try:
-        with postgres_conn.cursor() as cur:
-            cur.execute("""
-                SELECT config_id, region_id, severity_level, pollutant_type, 
-                       notification_type, recipients, cooldown_minutes
-                FROM alert_notification_config
-                WHERE active = TRUE
-            """)
-            
-            configs = []
-            for row in cur.fetchall():
-                config_id, region_id, severity_level, pollutant_type, notification_type, recipients, cooldown = row
-                configs.append({
-                    'config_id': config_id,
-                    'region_id': region_id,
-                    'severity_level': severity_level,
-                    'pollutant_type': pollutant_type,
-                    'notification_type': notification_type,
-                    'recipients': recipients,
-                    'cooldown_minutes': cooldown
-                })
-            
-            logger.info(f"Caricate {len(configs)} configurazioni di notifica")
-            return configs
-    except Exception as e:
-        logger.error(f"Errore caricamento configurazioni notifica: {e}")
-        return []
-
-def generate_intervention_recommendations(data):
-    """Genera raccomandazioni specifiche per interventi basate sul tipo e severità dell'inquinamento"""
-    pollutant_type = data.get("pollutant_type", "unknown")
-    severity = data.get("severity", "low")
-    location = data.get("location", {})
-    risk_score = data.get("max_risk_score", 0.5)
+class AlertManager:
+    """Manages alerts and notifications"""
     
-    recommendations = {
-        "immediate_actions": [],
-        "resource_requirements": {},
-        "stakeholders_to_notify": [],
-        "regulatory_implications": [],
-        "environmental_impact_assessment": {},
-        "cleanup_methods": []
-    }
-    
-    # Raccomandazioni basate sul tipo di inquinante
-    if pollutant_type == "oil_spill":
-        recommendations["immediate_actions"] = [
-            "Deploy containment booms to prevent spreading",
-            "Activate oil spill response team",
-            "Notify coastal communities within 5km radius",
-            "Implement shoreline protection measures if near coast"
-        ]
-        recommendations["resource_requirements"] = {
-            "personnel": "15-20 trained responders",
-            "equipment": "Class B oil containment kit, 3 skimmers, absorbent materials",
-            "vessels": "2 response boats, 1 support vessel",
-            "supplies": "500m oil boom, dispersant if approved by authorities"
-        }
-        recommendations["cleanup_methods"] = ["mechanical_recovery", "dispersants_if_approved", "in_situ_burning", "shoreline_cleanup"]
+    def __init__(self):
+        self.conn = None
+        self.redis_client = None
+        self.initialize_connections()
         
-    elif pollutant_type == "chemical_discharge":
-        recommendations["immediate_actions"] = [
-            "Identify chemical composition if unknown",
-            "Establish safety perimeter based on chemical type",
-            "Deploy specialized containment equipment",
-            "Prevent water intake in affected area"
-        ]
-        recommendations["resource_requirements"] = {
-            "personnel": "10-15 hazmat-trained responders",
-            "equipment": "Chemical neutralizing agents, specialized containment",
-            "vessels": "1 response vessel with hazmat capability",
-            "supplies": "pH buffers, neutralizing agents, chemical absorbents"
-        }
-        recommendations["cleanup_methods"] = ["neutralization", "extraction", "activated_carbon", "aeration"]
-
-    elif pollutant_type == "algal_bloom":
-        recommendations["immediate_actions"] = [
-            "Test for toxin-producing species",
-            "Implement public health advisories if needed",
-            "Monitor dissolved oxygen levels",
-            "Restrict recreational activities in affected area"
-        ]
-        recommendations["resource_requirements"] = {
-            "personnel": "5-10 water quality specialists",
-            "equipment": "Water testing kits, aeration systems",
-            "vessels": "2 monitoring vessels",
-            "supplies": "Algaecide (if permitted), aeration equipment"
-        }
-        recommendations["cleanup_methods"] = ["aeration", "nutrient_management", "algaecide_if_approved", "ultrasonic_treatment"]
-
-    elif pollutant_type == "sewage":
-        recommendations["immediate_actions"] = [
-            "Issue public health warning for affected area",
-            "Test for pathogenic bacteria",
-            "Identify source of discharge",
-            "Notify drinking water authorities"
-        ]
-        recommendations["resource_requirements"] = {
-            "personnel": "8-12 water quality and public health specialists",
-            "equipment": "Disinfection equipment, bacterial testing kits",
-            "vessels": "1 sampling vessel",
-            "supplies": "Chlorine or UV disinfection equipment"
-        }
-        recommendations["cleanup_methods"] = ["disinfection", "biological_treatment", "aeration", "filtration"]
-
-    elif pollutant_type == "agricultural_runoff":
-        recommendations["immediate_actions"] = [
-            "Monitor for fertilizer and pesticide concentrations",
-            "Check for fish kill risk",
-            "Assess nutrient loading",
-            "Identify source farms"
-        ]
-        recommendations["resource_requirements"] = {
-            "personnel": "5-8 environmental specialists",
-            "equipment": "Nutrient testing kits, water samplers",
-            "vessels": "1 monitoring vessel",
-            "supplies": "Buffer zone materials, erosion control"
-        }
-        recommendations["cleanup_methods"] = ["wetland_filtration", "buffer_zones", "phytoremediation", "soil_erosion_control"]
-    
-    else:  # unknown or other
-        recommendations["immediate_actions"] = [
-            "Conduct comprehensive water quality testing",
-            "Deploy monitoring buoys around affected area",
-            "Collect water and sediment samples",
-            "Document visual observations with photos/video"
-        ]
-        recommendations["resource_requirements"] = {
-            "personnel": "5-10 environmental response specialists",
-            "equipment": "Multi-parameter testing kits, sampling equipment",
-            "vessels": "1-2 monitoring vessels",
-            "supplies": "Sample containers, documentation equipment"
-        }
-        recommendations["cleanup_methods"] = ["monitoring", "containment", "assessment", "targeted_intervention"]
-    
-    # Adatta raccomandazioni basate sulla severità
-    if severity == "high":
-        recommendations["stakeholders_to_notify"].extend([
-            "Environmental Protection Agency",
-            "Coast Guard",
-            "Local Government Emergency Response",
-            "Fisheries and Wildlife Department",
-            "Public Health Authority",
-            "Water Management Authority"
-        ])
-        recommendations["regulatory_implications"] = [
-            "Mandatory reporting to environmental authorities within 24 hours",
-            "Potential penalties under Clean Water Act",
-            "Documentation requirements for affected area and response actions",
-            "Possible long-term monitoring requirements"
-        ]
-    elif severity == "medium":
-        recommendations["stakeholders_to_notify"].extend([
-            "Local Environmental Agency",
-            "Water Management Authority",
-            "Local Government"
-        ])
-        recommendations["regulatory_implications"] = [
-            "Documentation of incident and response actions",
-            "Potential monitoring requirements",
-            "Notification to local authorities"
-        ]
-    else:  # low
-        recommendations["stakeholders_to_notify"].extend([
-            "Local Environmental Monitoring Office"
-        ])
-        recommendations["regulatory_implications"] = [
-            "Standard documentation for minor incidents",
-            "Inclusion in routine monitoring reports"
-        ]
-    
-    # Valutazione dell'impatto
-    affected_area = risk_score * 10
-    recommendations["environmental_impact_assessment"] = {
-        "estimated_area_affected": f"{affected_area:.1f} km²",
-        "expected_duration": "3-5 days" if severity == "low" else "1-2 weeks" if severity == "medium" else "2-4 weeks",
-        "sensitive_habitats_affected": ["coral_reefs", "mangroves", "seagrass_beds"] if severity == "high" else 
-                                      ["shoreline", "nearshore_waters"] if severity == "medium" else [],
-        "potential_wildlife_impact": "High - immediate intervention required" if severity == "high" else
-                                    "Moderate - monitoring required" if severity == "medium" else
-                                    "Low - standard protocols sufficient",
-        "water_quality_recovery": "1-2 months" if severity == "high" else
-                                 "2-3 weeks" if severity == "medium" else
-                                 "3-7 days"
-    }
-    
-    return recommendations
-
-def send_intervention_webhook(alert_data, recommendations):
-    """Invia dati a sistemi esterni di intervento via webhook"""
-    if not WEBHOOK_ENABLED:
-        return False
-    
-    webhook_urls = {
-        "high": HIGH_PRIORITY_WEBHOOK,
-        "medium": MEDIUM_PRIORITY_WEBHOOK,
-        "low": LOW_PRIORITY_WEBHOOK
-    }
-    
-    severity = alert_data.get("severity", "low")
-    webhook_url = webhook_urls.get(severity, "")
-    
-    if not webhook_url:
-        return False
-    
-    payload = {
-        "alert": alert_data,
-        "recommendations": recommendations,
-        "timestamp": int(time.time() * 1000),
-        "source": "marine_pollution_monitoring_system"
-    }
-    
-    try:
-        response = requests.post(webhook_url, json=payload, timeout=10)
-        logger.info(f"Webhook sent to {webhook_url}: {response.status_code}")
-        return response.status_code == 200
-    except Exception as e:
-        logger.error(f"Error sending webhook: {e}")
-        return False
-
-def send_email_notification(alert_data, recommendations, recipients):
-    """Invia notifiche email agli stakeholder"""
-    # Implementazione semplificata per esempio
-    logger.info(f"Email inviata a {len(recipients)} destinatari")
-    return True
-
-def process_alert(data, postgres_conn, redis_conn, notification_configs):
-    """Processa alert e invia notifiche"""
-    try:
-        # Aggiunto logging del tempo di elaborazione
-        start_time = time.time()
-        logger.info(f"Inizio elaborazione alert, timestamp: {start_time}")
-        
-        # Impostazione timeout per le query
-        with postgres_conn.cursor() as cur:
-            cur.execute("SET statement_timeout = '10000';")  # 10 secondi di timeout
-            postgres_conn.commit()
-        
-        # Verifica presenza di hotspot_id
-        if 'hotspot_id' not in data:
-            logger.warning("Alert senza hotspot_id ricevuto, ignorato")
-            return
+    def initialize_connections(self):
+        """Initialize database and Redis connections"""
+        try:
+            # Connect to PostgreSQL
+            self.conn = psycopg2.connect(
+                host=POSTGRES_HOST,
+                port=POSTGRES_PORT,
+                dbname=POSTGRES_DB,
+                user=POSTGRES_USER,
+                password=POSTGRES_PASSWORD
+            )
+            logger.info("Connected to PostgreSQL")
             
-        # Estrai informazioni dall'alert
-        hotspot_id = data['hotspot_id']
-        # Genera l'alert_id derivandolo dall'hotspot_id
-        alert_id = data.get('alert_id', f"alert_{hotspot_id}")
-        
-        # Log informativo
-        logger.info(f"Processando alert ID: {alert_id} da hotspot {hotspot_id}")
-        
-        severity = data.get('severity', 'medium')  # Default a medium se non specificato
-        pollutant_type = data.get('pollutant_type', 'unknown')  # Default a unknown se non specificato
-        
-        # Estrai coordinate
-        if 'location' not in data or 'center_latitude' not in data['location'] or 'center_longitude' not in data['location']:
-            logger.warning(f"Alert {alert_id} senza coordinate valide, ignorato")
-            return
+            # Connect to Redis
+            self.redis_client = redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT
+            )
+            self.redis_client.ping()  # Test connection
+            logger.info("Connected to Redis")
             
-        latitude = float(data['location']['center_latitude'])
-        longitude = float(data['location']['center_longitude'])
-        
-        # Estrai campi di relazione
-        parent_hotspot_id = data.get('parent_hotspot_id')
-        derived_from = data.get('derived_from')
-        
-        # 1. Verifica se esiste già record in database
-        with postgres_conn.cursor() as cur:
-            cur.execute("SELECT alert_id, status FROM pollution_alerts WHERE alert_id = %s", (alert_id,))
-            existing_alert = cur.fetchone()
-            if existing_alert:
-                existing_id, existing_status = existing_alert
-                if existing_status == 'superseded':
-                    logger.info(f"Alert {alert_id} già presente ma superseded, continuiamo aggiornamento")
-                else:
-                    logger.info(f"Alert {alert_id} già presente con status {existing_status}, verificheremo se aggiornare")
+            # Initialize database schema if needed
+            self._ensure_tables_exist()
             
-            # 2. Verifica se esiste un alert spazialmente vicino entro 500 metri
-            # Usa un raggio di ricerca di 0.005 gradi (circa 500 metri all'equatore)
-            spatial_threshold = 0.005
-            
-            # Funzione di Haversine per calcolare la distanza effettiva
-            def haversine(lat1, lon1, lat2, lon2):
-                # Converti in radianti
-                lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
-                
-                # Formula di Haversine
-                dlon = lon2 - lon1
-                dlat = lat2 - lat1
-                a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-                c = 2 * math.asin(math.sqrt(a))
-                r = 6371  # Raggio della Terra in km
-                
-                return c * r
-            
-            # Ottimizza la ricerca spaziale per evitare blocchi
-            # Inizializza variabili per evitare errori
-            nearby_alerts = []
-            filtered_alerts = []
-            
-            # Ottimizza la ricerca spaziale per evitare blocchi
-            try:
-                # Prima verifica se la tabella è vuota per evitare query inutili
-                cur.execute("SELECT COUNT(*) FROM pollution_alerts LIMIT 1")
-                table_has_data = cur.fetchone()[0] > 0
-                
-                # Se la tabella è vuota, salta completamente la ricerca spaziale
-                if not table_has_data:
-                    logger.info("Tabella pollution_alerts vuota, skippo la ricerca spaziale")
-                    nearby_alerts = []
-                else:
-                    # Prova la ricerca con PostGIS
-                    try:
-                        cur.execute("""
-                            SELECT EXISTS (
-                                SELECT 1 FROM information_schema.tables 
-                                WHERE table_name = 'spatial_ref_sys'
-                            )
-                        """)
-                        has_postgis = cur.fetchone()[0]
-                        
-                        if has_postgis:
-                            cur.execute("""
-                                SELECT alert_id, source_id, pollutant_type, severity, alert_time, status, latitude, longitude
-                                FROM pollution_alerts 
-                                WHERE 
-                                    ST_DWithin(
-                                        ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography,
-                                        ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
-                                        500  -- 500 metri
-                                    )
-                                    AND pollutant_type = %s
-                                    AND status = 'active'
-                                    AND alert_time > NOW() - INTERVAL '24 hours'
-                                    AND alert_id <> %s  -- Esclude l'alert stesso
-                            """, (longitude, latitude, pollutant_type, alert_id))
-                        else:
-                            raise Exception("PostGIS non disponibile")
-                    except Exception as e:
-                        logger.warning(f"Fallback a ricerca semplificata: {e}")
-                        
-                        # Ricerca semplificata che usa solo indici esistenti
-                        # e evita la query spaziale costosa
-                        cur.execute("""
-                            SELECT alert_id, source_id, pollutant_type, severity, alert_time, status, latitude, longitude
-                            FROM pollution_alerts 
-                            WHERE 
-                                pollutant_type = %s AND
-                                status = 'active' AND
-                                alert_time > NOW() - INTERVAL '24 hours' AND
-                                alert_id <> %s
-                            LIMIT 20
-                        """, (pollutant_type, alert_id))
-                    
-                    nearby_alerts = cur.fetchall()
-                    
-                    # Filtra manualmente per distanza solo se abbiamo risultati
-                    if nearby_alerts:
-                        logger.info(f"Trovati {len(nearby_alerts)} alert da filtrare per distanza")
-                        filtered_alerts = []
-                        for alert in nearby_alerts:
-                            nearby_alert_id, nearby_source_id, nearby_pollutant, nearby_severity, nearby_time, nearby_status, nearby_lat, nearby_lon = alert
-                            
-                            # Calcola distanza effettiva in km
-                            distance = haversine(latitude, longitude, nearby_lat, nearby_lon)
-                            
-                            # Se entro 500 metri, considera come candidato
-                            if distance <= 0.5:
-                                filtered_alerts.append((alert, distance))
-                        
-                        logger.info(f"Dopo filtro distanza: {len(filtered_alerts)} alert validi")
-            except Exception as e:
-                logger.error(f"Errore nella ricerca spaziale: {e}")
-                nearby_alerts = []  # In caso di errore, procedi senza alert vicini
-                filtered_alerts = []  # IMPORTANTE: Inizializza anche filtered_alerts
-            
-            superseded_alert = None
-            
-            if filtered_alerts:  # Cambiato da nearby_alerts a filtered_alerts
-                # Ordina per severità (decrescente) e distanza (crescente)
-                severity_ranks = {'high': 3, 'medium': 2, 'low': 1}
-                # FIX: x[0] è l'alert, x[0][3] è la severità dell'alert
-                filtered_alerts.sort(key=lambda x: (-severity_ranks.get(x[0][3], 0), x[1]))  # x[0][3] è la severità, x[1] è la distanza
-                
-                # Seleziona l'alert più vicino/più severo
-                nearby_alert_tuple = filtered_alerts[0]
-                nearby_alert = nearby_alert_tuple[0]  # Estrai l'alert dalla tupla
-                distance = nearby_alert_tuple[1]      # Estrai la distanza dalla tupla
-                
-                nearby_alert_id = nearby_alert[0]
-                nearby_source_id = nearby_alert[1]
-                nearby_severity = nearby_alert[3]
-                
-                logger.info(f"Trovato alert vicino {nearby_alert_id} per lo stesso inquinante {pollutant_type}")
-                
-                # Strategia di gestione:
-                # Se il nuovo alert è più severo, sostituisci il vecchio
-                # Altrimenti, skippa il nuovo
-                if severity_ranks.get(severity, 0) > severity_ranks.get(nearby_severity, 0):
-                    logger.info(f"Nuovo alert ha severità più alta ({severity} > {nearby_severity}), sostituisco {nearby_alert_id}")
-                    
-                    # Marchia il vecchio alert come sostituito
+        except Exception as e:
+            logger.error(f"Error initializing connections: {e}")
+            if self.conn:
+                self.conn.close()
+                self.conn = None
+    
+    def _ensure_tables_exist(self):
+        """Ensure necessary tables exist in the database"""
+        try:
+            with self.conn.cursor() as cur:
+                # Check if our tables exist, create if they don't
+                cur.execute("SELECT to_regclass('public.pollution_alerts')")
+                if cur.fetchone()[0] is None:
+                    logger.info("Creating pollution_alerts table")
                     cur.execute("""
-                        UPDATE pollution_alerts
-                        SET status = 'superseded', superseded_by = %s
-                        WHERE alert_id = %s
-                    """, (alert_id, nearby_alert_id))
-                    
-                    # Aggiorna anche in Redis
-                    try:
-                        # Aggiorna lo stato dell'alert in Redis
-                        redis_conn.hset(f"alert:{nearby_alert_id}", "status", "superseded")
-                        redis_conn.hset(f"alert:{nearby_alert_id}", "superseded_by", alert_id)
-                        
-                        # Rimuovi l'alert dalla lista degli attivi e aggiungilo ai superseded
-                        redis_conn.zrem("dashboard:alerts:active", nearby_alert_id)
-                        redis_conn.sadd("dashboard:alerts:superseded", nearby_alert_id)
-                        
-                        # Rimuovi dai set di severità
-                        redis_conn.srem(f"dashboard:alerts:by_severity:{nearby_severity}", nearby_alert_id)
-                        
-                        logger.info(f"Stato alert {nearby_alert_id} aggiornato a 'superseded' in Redis")
-                    except Exception as re:
-                        logger.warning(f"Errore nell'aggiornamento stato alert in Redis: {re}")
-                    
-                    # Aggiungi relazione al nuovo alert
-                    superseded_alert = nearby_alert_id
-                    data['parent_hotspot_id'] = nearby_source_id
-                    data['supersedes'] = nearby_alert_id
-                else:
-                    logger.info(f"Alert esistente ha severità uguale/maggiore ({nearby_severity} >= {severity}), skippiamo il nuovo")
-                    end_time = time.time()
-                    processing_time = end_time - start_time
-                    logger.info(f"Elaborazione alert completata in {processing_time:.2f} secondi (skippato)")
-                    return
-            
-            # 3. Verifica anche per hotspot_id (controllo originale) per retrocompatibilità
-            if not existing_alert:  # Solo se non è un aggiornamento di un alert esistente
-                cur.execute("""
-                    SELECT alert_id FROM pollution_alerts 
-                    WHERE source_id = %s AND alert_time > NOW() - INTERVAL '30 minutes'
-                    AND status = 'active'
-                    AND alert_id <> %s  -- Esclude l'alert stesso
-                """, (hotspot_id, alert_id))
-                recent_alert = cur.fetchone()
+                        CREATE TABLE pollution_alerts (
+                            alert_id TEXT PRIMARY KEY,
+                            source_id TEXT NOT NULL,
+                            source_type TEXT NOT NULL,
+                            alert_type TEXT NOT NULL,
+                            alert_time TIMESTAMPTZ NOT NULL,
+                            severity TEXT NOT NULL,
+                            latitude FLOAT NOT NULL,
+                            longitude FLOAT NOT NULL,
+                            pollutant_type TEXT NOT NULL,
+                            risk_score FLOAT NOT NULL,
+                            message TEXT NOT NULL,
+                            details JSONB,
+                            processed BOOLEAN DEFAULT FALSE,
+                            notifications_sent JSONB DEFAULT '{}',
+                            creation_time TIMESTAMPTZ DEFAULT NOW()
+                        )
+                    """)
                 
-                # Skip QUALSIASI alert se c'è un alert recente per questo hotspot
-                if recent_alert and not superseded_alert:
-                    logger.info(f"Alert recente già presente per hotspot {hotspot_id}, skippiamo")
-                    end_time = time.time()
-                    processing_time = end_time - start_time
-                    logger.info(f"Elaborazione alert completata in {processing_time:.2f} secondi (skippato)")
+                cur.execute("SELECT to_regclass('public.alert_notifications')")
+                if cur.fetchone()[0] is None:
+                    logger.info("Creating alert_notifications table")
+                    cur.execute("""
+                        CREATE TABLE alert_notifications (
+                            notification_id SERIAL PRIMARY KEY,
+                            alert_id TEXT REFERENCES pollution_alerts(alert_id),
+                            notification_type TEXT NOT NULL,
+                            recipients JSONB NOT NULL,
+                            sent_at TIMESTAMPTZ DEFAULT NOW(),
+                            status TEXT NOT NULL,
+                            response_data JSONB
+                        )
+                    """)
+                
+                self.conn.commit()
+                logger.info("Database tables verified")
+        except Exception as e:
+            logger.error(f"Error ensuring tables exist: {e}")
+            self.conn.rollback()
+    
+    def process_alert(self, alert_data: Dict[str, Any]):
+        """Process an incoming alert"""
+        severity = alert_data.get("severity", "unknown").lower()
+        ALERTS_PROCESSED.labels(severity=severity).inc()
+        try:
+            # Check if alert is an event or a hotspot
+            if "hotspot_id" in alert_data:
+                # Process hotspot alert
+                hotspot_id = alert_data["hotspot_id"]
+                severity = alert_data["severity"]
+                
+                # Verify if it's an update or a new hotspot
+                is_update = alert_data.get("is_update", False)
+                is_significant = alert_data.get("is_significant_change", False)
+                severity_changed = alert_data.get("severity_changed", False)
+                
+                # For hotspot updates, generate alert only if significant changes
+                if is_update and not (is_significant or severity_changed):
+                    logger.info(f"Skipping alert for updated hotspot {hotspot_id} without significant changes")
                     return
-        
-        # Determina regione (semplificata per questo esempio)
-        region_id = data.get('environmental_reference', {}).get('region_id', 'default')
-        
-        # Determina tipo di alert
-        alert_type = 'new'
-        if data.get('is_update'):
-            alert_type = 'update'
-        if data.get('severity_changed'):
-            alert_type = 'severity_change'
-            
-        # Timestamp alert
-        alert_time = datetime.fromtimestamp(data['detected_at'] / 1000) if 'detected_at' in data else datetime.now()
-        
-        # Crea messaggio
-        message = generate_alert_message(data, alert_type)
-        
-        # Genera raccomandazioni di intervento
-        recommendations = generate_intervention_recommendations(data)
-        
-        # Filtra configurazioni applicabili
-        applicable_configs = filter_notification_configs(notification_configs, severity, pollutant_type, region_id)
-        
-        # Raccogli destinatari per ogni tipo di notifica
-        email_recipients = set()
-        
-        for config in applicable_configs:
-            if config['notification_type'] == 'email':
-                # Aggiungi i destinatari dalla configurazione
-                recipients = config['recipients']
-                if isinstance(recipients, list):
-                    email_recipients.update(recipients)
-                elif isinstance(recipients, dict) and 'to' in recipients:
-                    if isinstance(recipients['to'], list):
-                        email_recipients.update(recipients['to'])
+                
+                # Check cooldown period in Redis
+                cooldown_key = f"alert:cooldown:hotspot:{hotspot_id}"
+                if self.redis_client.exists(cooldown_key):
+                    cooldown_ttl = self.redis_client.ttl(cooldown_key)
+                    logger.info(f"Hotspot {hotspot_id} is in cooldown period ({cooldown_ttl}s remaining), skipping alert")
+                    return
+                
+                # Set cooldown based on severity
+                if severity == "high":
+                    cooldown_seconds = 900  # 15 minutes
+                elif severity == "medium":
+                    cooldown_seconds = 1800  # 30 minutes
+                else:
+                    cooldown_seconds = 3600  # 60 minutes
+                
+                self.redis_client.setex(cooldown_key, cooldown_seconds, "1")
+                
+                # Create appropriate message based on update type
+                alert_type = "new_hotspot"
+                if is_update:
+                    if severity_changed:
+                        alert_type = "severity_change"
+                        old_severity = alert_data.get("previous_severity", "unknown")
+                        message = f"Hotspot severity changed from {old_severity} to {severity}"
+                    elif is_significant:
+                        alert_type = "significant_change"
+                        message = f"Significant changes detected in hotspot {hotspot_id}"
                     else:
-                        email_recipients.add(recipients['to'])
+                        alert_type = "update"
+                        message = f"Updated information for hotspot {hotspot_id}"
+                else:
+                    message = f"New pollution hotspot detected: {severity} {alert_data['pollutant_type']}"
+                
+                # Extract location
+                location = alert_data["location"]
+                latitude = location.get("center_latitude", location.get("center_lat"))
+                longitude = location.get("center_longitude", location.get("center_lon"))
+                
+                # Store in database
+                with self.conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO pollution_alerts (
+                            alert_id, source_id, source_type, alert_type,
+                            alert_time, severity, latitude, longitude,
+                            pollutant_type, risk_score, message, details
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        str(uuid.uuid4()),
+                        hotspot_id,
+                        "hotspot",
+                        alert_type,
+                        datetime.now(),
+                        severity,
+                        latitude,
+                        longitude,
+                        alert_data["pollutant_type"],
+                        alert_data["avg_risk_score"],
+                        message,
+                        json.dumps(alert_data)
+                    ))
+                    self.conn.commit()
+                    
+                logger.info(f"Stored hotspot alert: {hotspot_id} ({alert_type})")
+                
+                # Send notifications
+                self._send_notifications(
+                    severity, 
+                    message, 
+                    latitude, 
+                    longitude, 
+                    alert_data["pollutant_type"]
+                )
+                
+            elif "pollution_event_detection" in alert_data:
+                # Process direct event alert
+                event = alert_data["pollution_event_detection"]
+                event_id = event["event_id"]
+                severity = event["severity"]
+                
+                # Check cooldown period in Redis
+                cooldown_key = f"alert:cooldown:event:{event_id}"
+                if self.redis_client.exists(cooldown_key):
+                    cooldown_ttl = self.redis_client.ttl(cooldown_key)
+                    logger.info(f"Event {event_id} is in cooldown period ({cooldown_ttl}s remaining), skipping alert")
+                    return
+                
+                # Set cooldown (shorter for direct events)
+                cooldown_seconds = 1800  # 30 minutes for all event severities
+                self.redis_client.setex(cooldown_key, cooldown_seconds, "1")
+                
+                # Create message
+                source_type = event["detection_source"]
+                pollutant_type = event["pollutant_type"]
+                message = f"Pollution event detected from {source_type}: {severity} {pollutant_type}"
+                
+                # Extract location
+                location = event["location"]
+                latitude = location["latitude"]
+                longitude = location["longitude"]
+                
+                # Store in database
+                with self.conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO pollution_alerts (
+                            alert_id, source_id, source_type, alert_type,
+                            alert_time, severity, latitude, longitude,
+                            pollutant_type, risk_score, message, details
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        str(uuid.uuid4()),
+                        event_id,
+                        "event",
+                        "direct_detection",
+                        datetime.now(),
+                        severity,
+                        latitude,
+                        longitude,
+                        pollutant_type,
+                        event["risk_score"],
+                        message,
+                        json.dumps(event)
+                    ))
+                    self.conn.commit()
+                
+                logger.info(f"Stored direct event alert: {event_id}")
+                
+                # Send notifications
+                self._send_notifications(
+                    severity, 
+                    message, 
+                    latitude, 
+                    longitude, 
+                    pollutant_type
+                )
+            
+            else:
+                logger.warning("Alert doesn't contain hotspot_id or pollution_event_detection, skipping")
+                
+        except Exception as e:
+            logger.error(f"Error processing alert: {e}")
+            traceback.print_exc()
+            if self.conn:
+                self.conn.rollback()
+    
+    def _send_notifications(self, severity, message, latitude, longitude, pollutant_type):
+        """Send notifications based on alert severity and configuration"""
+        if not (EMAIL_ENABLED or SMS_ENABLED or WEBHOOK_ENABLED):
+            logger.info("No notification channels enabled, skipping notifications")
+            return
         
-        # Prepara dettagli dell'alert per il database
-        details = {
-            'location': data['location'],
-            'detected_at': data.get('detected_at', int(datetime.now().timestamp() * 1000)),
-            'max_risk_score': data.get('max_risk_score', 0.0),
-            'environmental_reference': data.get('environmental_reference', {}),
-            'parent_hotspot_id': parent_hotspot_id,
-            'derived_from': derived_from
+        try:
+            # Determine recipients based on severity
+            if severity == "high":
+                recipients = HIGH_PRIORITY_RECIPIENTS
+            elif severity == "medium":
+                recipients = MEDIUM_PRIORITY_RECIPIENTS
+            else:
+                recipients = LOW_PRIORITY_RECIPIENTS
+            
+            # Check for regional overrides
+            region = self._determine_region(latitude, longitude)
+            if region in REGIONAL_CONFIG:
+                regional_recipients = REGIONAL_CONFIG[region].get("email_recipients")
+                if regional_recipients:
+                    recipients = regional_recipients
+                    logger.info(f"Using regional recipients for {region}")
+            
+            # Prepare notification content
+            notification_content = self._format_notification(
+                severity, message, latitude, longitude, pollutant_type, region
+            )
+            
+            # Send email notifications
+            if EMAIL_ENABLED:
+                try:
+                    self._send_email(recipients, notification_content)
+                except Exception as e:
+                    logger.error(f"Error sending email: {e}")
+            
+            # Send SMS notifications for high severity
+            if SMS_ENABLED and severity == "high":
+                try:
+                    self._send_sms(recipients, notification_content["short_message"])
+                except Exception as e:
+                    logger.error(f"Error sending SMS: {e}")
+            
+            # Send webhook notifications
+            if WEBHOOK_ENABLED:
+                try:
+                    self._send_webhook(notification_content)
+                except Exception as e:
+                    logger.error(f"Error sending webhook: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error sending notifications: {e}")
+    
+    def _determine_region(self, latitude, longitude):
+        """Determine which region contains the coordinates"""
+        if latitude > 39.0:
+            return "upper_bay"
+        elif latitude > 38.0:
+            return "mid_bay"
+        elif latitude > 37.0:
+            if longitude < -76.2:
+                return "west_lower_bay"
+            else:
+                return "east_lower_bay"
+        else:
+            return "bay_mouth"
+    
+    def _format_notification(self, severity, message, latitude, longitude, pollutant_type, region):
+        """Format notification content for different channels"""
+        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Full HTML message for email
+        html_message = f"""
+        <html>
+        <body>
+            <h2>Marine Pollution Alert</h2>
+            <p><strong>Severity:</strong> {severity.upper()}</p>
+            <p><strong>Time:</strong> {time_str}</p>
+            <p><strong>Location:</strong> {latitude:.4f}, {longitude:.4f} ({region})</p>
+            <p><strong>Pollutant:</strong> {pollutant_type}</p>
+            <p><strong>Details:</strong> {message}</p>
+            <p><a href="https://maps.google.com/?q={latitude},{longitude}">View on Map</a></p>
+        </body>
+        </html>
+        """
+        
+        # Short message for SMS
+        short_message = f"ALERT ({severity.upper()}): {message} at {latitude:.4f}, {longitude:.4f}"
+        
+        # Complete data for webhook
+        webhook_data = {
+            "severity": severity,
+            "timestamp": time_str,
+            "latitude": latitude,
+            "longitude": longitude,
+            "pollutant_type": pollutant_type,
+            "message": message,
+            "region": region
         }
         
-        # Aggiungi campo supersedes se presente
-        if 'supersedes' in data:
-            details['supersedes'] = data['supersedes']
-        
-        # Traccia le notifiche inviate
-        notifications_sent = {}
-        
-        # Invia notifiche email
-        if EMAIL_ENABLED and email_recipients:
-            recipients_list = list(email_recipients)
-            email_sent = send_email_notification(data, recommendations, recipients_list)
-            notifications_sent["email"] = {
-                "sent": email_sent,
-                "recipients": recipients_list,
-                "time": datetime.now().isoformat()
-            }
-        
-        # Invia notifiche webhook
+        return {
+            "subject": f"Marine Pollution Alert - {severity.upper()} - {pollutant_type}",
+            "html_message": html_message,
+            "short_message": short_message,
+            "webhook_data": webhook_data
+        }
+    def _send_email(self, recipients, content):
+        """Send email notification"""
+        if EMAIL_ENABLED:
+            logger.info(f"Would send email to {recipients}: {content['subject']}")
+            NOTIFICATIONS_SENT.labels(channel='email').inc()
+            # In a real implementation, this would use smtplib to actually send emails
+            # For this example, we'll just log it
+
+            # Example implementation:
+            # import smtplib
+            # from email.mime.multipart import MIMEMultipart
+            # from email.mime.text import MIMEText
+            # 
+            # msg = MIMEMultipart('alternative')
+            # msg['Subject'] = content['subject']
+            # msg['From'] = EMAIL_USER
+            # msg['To'] = ', '.join(recipients)
+            # 
+            # msg.attach(MIMEText(content['html_message'], 'html'))
+            # 
+            # with smtplib.SMTP(EMAIL_SERVER, EMAIL_PORT) as server:
+            #     server.starttls()
+            #     server.login(EMAIL_USER, EMAIL_PASSWORD)
+            #     server.send_message(msg)
+    
+    def _send_sms(self, recipients, message):
+        """Send SMS notification"""
+        if SMS_ENABLED:
+            logger.info(f"Would send SMS to {recipients}: {message}")
+            NOTIFICATIONS_SENT.labels(channel='sms').inc()
+            # In a real implementation, this would use an SMS API
+    
+    def _send_webhook(self, content):
+        """Send webhook notification"""
         if WEBHOOK_ENABLED:
-            webhook_sent = send_intervention_webhook(data, recommendations)
-            notifications_sent["webhook"] = {
-                "sent": webhook_sent,
-                "time": datetime.now().isoformat()
-            }
-        
-        # Salva alert nel database
-        with postgres_conn.cursor() as cur:
-            
-            # Utilizziamo ON CONFLICT DO UPDATE per aggiornare record esistenti
-            cur.execute("""
-                INSERT INTO pollution_alerts (
-                    alert_id, source_id, source_type, alert_type, alert_time,
-                    severity, latitude, longitude, pollutant_type, risk_score,
-                    message, details, processed, notifications_sent, status, recommendations,
-                    supersedes, parent_hotspot_id, derived_from
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (alert_id) DO UPDATE SET
-                    alert_type = EXCLUDED.alert_type,
-                    alert_time = EXCLUDED.alert_time,
-                    severity = EXCLUDED.severity,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    risk_score = EXCLUDED.risk_score,
-                    message = EXCLUDED.message,
-                    details = EXCLUDED.details,
-                    processed = EXCLUDED.processed,
-                    notifications_sent = CASE
-                        WHEN pollution_alerts.notifications_sent IS NULL THEN EXCLUDED.notifications_sent
-                        ELSE pollution_alerts.notifications_sent || EXCLUDED.notifications_sent
-                    END,
-                    status = EXCLUDED.status,
-                    recommendations = EXCLUDED.recommendations,
-                    supersedes = EXCLUDED.supersedes,
-                    parent_hotspot_id = EXCLUDED.parent_hotspot_id,
-                    derived_from = EXCLUDED.derived_from
-            """, (
-                alert_id,
-                hotspot_id,
-                'hotspot',
-                alert_type,
-                alert_time,
-                severity,
-                latitude,
-                longitude,
-                pollutant_type,
-                data.get('max_risk_score', 0.0),
-                message,
-                Json(details),
-                False,  # processed - impostato a False per nuovo alert
-                Json(notifications_sent),
-                'active',  # status
-                Json(recommendations),  # recommendations
-                data.get('supersedes'),  # supersedes - riferimento all'alert sostituito
-                parent_hotspot_id,
-                derived_from
-            ))
-            
-            postgres_conn.commit()
-            logger.info(f"Alert {alert_id} salvato/aggiornato con raccomandazioni di intervento")
-        
-        # Salva le raccomandazioni anche in Redis per accesso rapido
-        try:
-            if redis_conn and recommendations:
-                # Salva le raccomandazioni in Redis
-                recommendations_key = f"recommendations:{alert_id}"
-                redis_conn.set(recommendations_key, json.dumps(recommendations))
-                redis_conn.expire(recommendations_key, 86400)  # TTL di 24 ore
-                
-                # Aggiorna l'hash dell'alert in Redis
-                alert_key = f"alert:{alert_id}"
-                redis_conn.hset(alert_key, "alert_id", alert_id)
-                redis_conn.hset(alert_key, "hotspot_id", hotspot_id)
-                redis_conn.hset(alert_key, "severity", severity)
-                redis_conn.hset(alert_key, "pollutant_type", pollutant_type)
-                redis_conn.hset(alert_key, "status", "active")
-                redis_conn.hset(alert_key, "message", message)
-                redis_conn.hset(alert_key, "latitude", str(latitude))
-                redis_conn.hset(alert_key, "longitude", str(longitude))
-                redis_conn.hset(alert_key, "timestamp", str(int(alert_time.timestamp() * 1000)))
-                redis_conn.hset(alert_key, "has_recommendations", "true")
-                
-                # Se questo alert ha sostituito un altro, salva anche questa informazione
-                if 'supersedes' in data:
-                    redis_conn.hset(alert_key, "supersedes", data['supersedes'])
-                
-                # Aggiungi alle strutture dati di dashboard
-                redis_conn.zadd("dashboard:alerts:active", {alert_id: int(alert_time.timestamp())})
-                redis_conn.sadd(f"dashboard:alerts:by_severity:{severity}", alert_id)
-                
-                # Imposta TTL
-                redis_conn.expire(alert_key, 3600 * 24)  # 24 ore TTL
-                redis_conn.expire(f"dashboard:alerts:by_severity:{severity}", 3600 * 6)  # 6 ore TTL
-                redis_conn.expire(recommendations_key, 3600 * 24)  # 24 ore TTL
-                
-                # Aggiorna il dashboard:summary
-                update_alert_counters(redis_conn)
-                
-                logger.info(f"Alert {alert_id} e raccomandazioni salvate in Redis")
-        except Exception as e:
-            logger.warning(f"Errore nel salvataggio delle raccomandazioni in Redis: {e}")
-        
-        # Aggiunto logging del tempo di elaborazione
-        end_time = time.time()
-        processing_time = end_time - start_time
-        logger.info(f"Elaborazione alert completata con successo in {processing_time:.2f} secondi")
-    
-    except Exception as e:
-        try:
-            postgres_conn.rollback()
-        except:
-            pass
-        logger.error(f"Errore processamento alert: {e}")
-        logger.exception(e)  # Log completo dello stack trace
-
-# Funzione helper per aggiornare i contatori degli alert in Redis
-def update_alert_counters(redis_conn):
-    try:
-        # Conteggio diretto degli alert per severità
-        high_alerts = redis_conn.scard("dashboard:alerts:by_severity:high") or 0
-        medium_alerts = redis_conn.scard("dashboard:alerts:by_severity:medium") or 0
-        low_alerts = redis_conn.scard("dashboard:alerts:by_severity:low") or 0
-        total_alerts = redis_conn.zcard("dashboard:alerts:active") or 0
-        superseded_alerts = redis_conn.scard("dashboard:alerts:superseded") or 0
-        
-        # Aggiornamento summary con dati accurati
-        severity_distribution = json.dumps({"high": high_alerts, "medium": medium_alerts, "low": low_alerts})
-        redis_conn.hset("dashboard:summary", "alerts_count", str(total_alerts))
-        redis_conn.hset("dashboard:summary", "severity_distribution", severity_distribution)
-        redis_conn.hset("dashboard:summary", "superseded_count", str(superseded_alerts))
-        redis_conn.hset("dashboard:summary", "updated_at", str(int(time.time() * 1000)))
-        
-        # Aggiorna anche il formato alternativo per retrocompatibilità
-        redis_conn.hset("dashboard:metrics", "alerts_high", str(high_alerts))
-        redis_conn.hset("dashboard:metrics", "alerts_medium", str(medium_alerts))
-        redis_conn.hset("dashboard:metrics", "alerts_low", str(low_alerts))
-        redis_conn.hset("dashboard:metrics", "alerts_total", str(total_alerts))
-        redis_conn.hset("dashboard:metrics", "alerts_superseded", str(superseded_alerts))
-        
-        # Aggiorna anche counters per retrocompatibilità
-        redis_conn.set("counters:alerts:active", str(total_alerts))
-        redis_conn.set("counters:alerts:by_severity:high", str(high_alerts))
-        redis_conn.set("counters:alerts:by_severity:medium", str(medium_alerts))
-        redis_conn.set("counters:alerts:by_severity:low", str(low_alerts))
-        
-        # Imposta TTL per il summary
-        redis_conn.expire("dashboard:summary", 300)  # 5 minuti TTL
-        redis_conn.expire("dashboard:metrics", 300)  # 5 minuti TTL
-    except Exception as e:
-        logger.warning(f"Errore nell'aggiornamento dei contatori alert: {e}")
-
-def generate_alert_message(data, alert_type):
-    """Genera messaggio di alert"""
-    severity = data['severity'].upper()
-    pollutant_type = data['pollutant_type']
-    
-    lat = data['location']['center_latitude']
-    lon = data['location']['center_longitude']
-    location = f"lat: {lat:.5f}, lon: {lon:.5f}"
-    
-    if alert_type == 'new':
-        return f"{severity} {pollutant_type} pollution detected at {location}"
-    elif alert_type == 'update':
-        return f"{severity} {pollutant_type} pollution updated at {location}"
-    elif alert_type == 'severity_change':
-        return f"{severity} {pollutant_type} pollution - severity increased at {location}"
-    else:
-        return f"{severity} {pollutant_type} pollution alert at {location}"
-
-def filter_notification_configs(configs, severity, pollutant_type, region_id):
-    """Filtra configurazioni notifica applicabili"""
-    applicable = []
-    
-    for config in configs:
-        # Verifica match di severità
-        if config['severity_level'] and config['severity_level'] != severity:
-            continue
-            
-        # Verifica match di tipo inquinante
-        if config['pollutant_type'] and config['pollutant_type'] != pollutant_type:
-            continue
-            
-        # Verifica match di regione
-        if config['region_id'] and config['region_id'] != region_id:
-            continue
-            
-        applicable.append(config)
-    
-    return applicable
-
-def get_cooldown_minutes(redis_conn, severity):
-    """Ottiene intervallo cooldown in base a severità"""
-    try:
-        if severity == 'high':
-            cooldown = redis_conn.get("config:alert:cooldown_minutes:high")
-        elif severity == 'medium':
-            cooldown = redis_conn.get("config:alert:cooldown_minutes:medium")
-        else:
-            cooldown = redis_conn.get("config:alert:cooldown_minutes:low")
-        
-        if cooldown:
-            return int(cooldown)
-        else:
-            # Valori di default
-            return 15 if severity == 'high' else 30 if severity == 'medium' else 60
-    except:
-        # Fallback
-        return 15 if severity == 'high' else 30 if severity == 'medium' else 60
-
-def deserialize_message(message):
-    """Deserializza messaggi Kafka supportando sia JSON che formati binari"""
-    try:
-        # Tenta prima la decodifica JSON standard
-        return json.loads(message.decode('utf-8'))
-    except UnicodeDecodeError:
-        # Se fallisce, potrebbe essere un formato binario (Avro/Schema Registry)
-        logger.info("Rilevato messaggio non-UTF8, utilizzo fallback binario")
-        try:
-            # Se il messaggio inizia con byte magico 0x00 (Schema Registry)
-            if message[0] == 0:
-                # Log e skip per ora
-                logger.warning("Rilevato messaggio Schema Registry, non supportato nella versione attuale")
-                return None
-            else:
-                # Altri formati binari - tenta di estrarre come binary data
-                return {"binary_data": True, "size": len(message)}
-        except Exception as e:
-            logger.error(f"Impossibile deserializzare messaggio binario: {e}")
-            return None
+            logger.info(f"Would send webhook: {content['webhook_data']}")
+            NOTIFICATIONS_SENT.labels(channel='webhook').inc()
+            # In a real implementation, this would use requests to POST to the webhook URL
+            # 
+            # Example implementation:
+            # import requests
+            # import hmac
+            # import hashlib
+            # 
+            # payload = json.dumps(content['webhook_data'])
+            # 
+            # # Add signature for security
+            # if WEBHOOK_SECRET:
+            #     signature = hmac.new(
+            #         WEBHOOK_SECRET.encode('utf-8'),
+            #         payload.encode('utf-8'),
+            #         hashlib.sha256
+            #     ).hexdigest()
+            #     headers = {'X-Signature': signature, 'Content-Type': 'application/json'}
+            # else:
+            #     headers = {'Content-Type': 'application/json'}
+            # 
+            # response = requests.post(WEBHOOK_URL, data=payload, headers=headers)
+            # response.raise_for_status()
 
 def main():
-    """Funzione principale"""
-    # Connessioni
-    postgres_conn = connect_postgres()
-    redis_conn = connect_redis()
+    """Main function to run the Alert Manager"""
+    # Start Prometheus metrics server
+    start_http_server(8080)
+    logger.info("Prometheus metrics server started on port 8080.")
+    logger.info("Starting Alert Manager")
     
-    # Carica configurazioni notifica
-    notification_configs = load_notification_config(postgres_conn)
+    # Create Alert Manager
+    alert_manager = AlertManager()
     
-    # Consumer Kafka con configurazioni ottimizzate
+    # Create Kafka consumer
     consumer = KafkaConsumer(
         ALERTS_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id='alert-manager-group',
-        auto_offset_reset='latest',
-        value_deserializer=deserialize_message,
-        enable_auto_commit=False,
-        # Configurazioni migliorate per evitare timeout
-        max_poll_interval_ms=600000,  # 10 minuti (raddoppiato)
-        max_poll_records=5,           # Ridotto da 10 a 5 per elaborare meno messaggi per batch
-        session_timeout_ms=120000,    # Aumentato a 120 secondi (2 minuti)
-        request_timeout_ms=150000     # Aumentato a 150 secondi (2.5 minuti)
+        group_id="alert_manager_group",
+        auto_offset_reset="latest",
+        value_deserializer=lambda m: json.loads(m.decode('utf-8'))
     )
     
-    logger.info("Alert Manager avviato - in attesa di messaggi...")
-    logger.info("NOTA: Alert Manager è l'UNICO responsabile della gestione degli alert")
+    logger.info(f"Connected to Kafka, listening for alerts on {ALERTS_TOPIC}")
     
+    # Process messages
     try:
         for message in consumer:
-            data = message.value
-            
-            # Skip messaggi che non possiamo deserializzare
-            if data is None:
-                consumer.commit()
-                continue
-                
-            try:
-                process_alert(data, postgres_conn, redis_conn, notification_configs)
-                
-                # Commit offset solo se elaborazione completata
-                consumer.commit()
-                
-                # Ricarica periodicamente le configurazioni (ogni 20 messaggi)
-                if message.offset % 20 == 0:
-                    notification_configs = load_notification_config(postgres_conn)
-            
-            except Exception as e:
-                logger.error(f"Errore elaborazione alert: {e}")
-                # Commit dell'offset anche in caso di errore per evitare loop infiniti
-                consumer.commit()
+            alert_data = message.value
+            logger.info(f"Received alert: {message.topic}:{message.partition}:{message.offset}")
+            alert_manager.process_alert(alert_data)
     
     except KeyboardInterrupt:
-        logger.info("Interruzione richiesta - arresto in corso...")
+        logger.info("Shutting down Alert Manager")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        traceback.print_exc()
+        ALERT_MANAGER_ERRORS.labels(type='unexpected').inc()
     
     finally:
-        if postgres_conn:
-            postgres_conn.close()
+        # Close connections
+        if alert_manager.conn:
+            alert_manager.conn.close()
+        
         consumer.close()
-        logger.info("Alert Manager arrestato")
+        logger.info("Alert Manager shutdown complete")
 
 if __name__ == "__main__":
     main()

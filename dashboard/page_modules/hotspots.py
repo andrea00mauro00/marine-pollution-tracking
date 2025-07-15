@@ -112,7 +112,7 @@ def show_hotspots_page(clients):
             with col4:
                 st.metric("Low Severity", severity_counts['low'])
             
-            # Create main layout columns for map and pie chart
+            # Create main layout columns for map and charts
             map_col, charts_col = st.columns([3, 2])
             
             with map_col:
@@ -212,14 +212,9 @@ def show_hotspots_page(clients):
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("No pollutant data available for visualization")
-            
-            # Create a new row for severity and risk score charts
-            st.markdown("<h3>Pollution Analytics</h3>", unsafe_allow_html=True)
-            severity_col, risk_col = st.columns(2)
-            
-            with severity_col:
+                
                 # Distribution by severity (bar chart)
-                st.markdown("<h4>Distribution by Severity</h4>", unsafe_allow_html=True)
+                st.markdown("<h3>Distribution by Severity</h3>", unsafe_allow_html=True)
                 
                 if severity_counts:
                     severity_df = pd.DataFrame({
@@ -251,10 +246,9 @@ def show_hotspots_page(clients):
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("No severity data available for visualization")
-            
-            with risk_col:
+                
                 # Average Risk Score by Pollutant Type (horizontal bar chart)
-                st.markdown("<h4>Avg Risk Score by Pollutant Type</h4>", unsafe_allow_html=True)
+                st.markdown("<h3>Avg Risk Score by Pollutant Type</h3>", unsafe_allow_html=True)
                 
                 risk_by_pollutant = {}
                 count_by_pollutant = {}

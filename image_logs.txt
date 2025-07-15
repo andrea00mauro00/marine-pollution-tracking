@@ -1,0 +1,15 @@
+image_standardizer  | Waiting for Kafka and MinIO...
+image_standardizer  | Starting Image Standardizer with Fallback Embeddings...
+image_standardizer  | {"name": "__main__", "message": "Starting Enhanced Image Standardizer Job with ML", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:00,792", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Waiting for services to be available...", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:00,793", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Checking service availability...", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:00,793", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "\u2705 Kafka is ready, available topics: []", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:02,628", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "\u2705 MinIO is ready, available buckets: []", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:05,458", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Creating bucket 'bronze'", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:05,464", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Creating bucket 'silver'", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:06,019", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Creating bucket 'gold'", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:06,113", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Setting up Flink environment", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:06,190", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Creating Kafka consumer for topic: satellite_imagery", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:25,540", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Creating Kafka producer for topic: processed_imagery", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:26,185", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Setting up processing pipeline", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:27,302", "level": "INFO"}
+image_standardizer  | {"name": "__main__", "message": "Executing Enhanced Image Standardizer Job with ML", "component": "image-standardizer", "timestamp": "2025-07-15 15:00:28,485", "level": "INFO"}

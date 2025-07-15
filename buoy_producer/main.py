@@ -3,6 +3,7 @@ from datetime import datetime
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
 from loguru import logger
+from prometheus_client import start_http_server, Counter
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -15,6 +16,11 @@ EVENT_PROBABILITY = 1.0
 
 # Count of events so far, used to distribute event severity evenly
 EVENT_COUNT = 0
+
+# Prometheus Metrics
+MESSAGES_SENT = Counter('buoy_messages_sent_total', 'Total messages sent by buoy producer', ['location_id'])
+ERRORS = Counter('buoy_producer_errors_total', 'Total errors encountered by buoy producer', ['error_type'])
+POLLUTION_EVENTS = Counter('buoy_pollution_events_created_total', 'Total pollution events created', ['event_type', 'severity'])
 
 # Logger setup
 logger.remove()
@@ -392,6 +398,9 @@ def process_pollution_events(location_id):
         # Halve the global probability for next event, but don't go below 0.005 (0.5%)
         EVENT_PROBABILITY = max(0.005, EVENT_PROBABILITY / 4.0)
         
+                # Increment Prometheus counter
+        POLLUTION_EVENTS.labels(event_type=event_type, severity=severity).inc()
+        
         # Log the new probability
         logger.info(f"📉 Global event probability decreased to {EVENT_PROBABILITY:.1%}")
 
@@ -543,7 +552,11 @@ def validate_sensor_data(data):
 
 # Main loop
 def main():
-    # Load location data
+    """Main loop to generate and send buoy data."""
+    # Start Prometheus metrics server
+    start_http_server(8080)
+    logger.info("Prometheus metrics server started on port 8080.")
+    logger.info("Starting buoy producer...")
     locs = yaml.safe_load(open("locations.yml"))
     
     # Create Kafka producer
@@ -579,8 +592,10 @@ def main():
             # Send data to Kafka
             try:
                 prod.send(KAFKA_TOPIC, value=buoy)
+                MESSAGES_SENT.labels(location_id=location_id).inc()
             except Exception as e:
                 logger.error(f"Error sending data for {location_id}: {e}")
+                ERRORS.labels(error_type='kafka_send').inc()
                 # Send to DLQ
                 try:
                     dlq_producer = KafkaProducer(

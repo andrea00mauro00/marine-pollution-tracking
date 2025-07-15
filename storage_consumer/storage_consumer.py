@@ -19,10 +19,30 @@ from io import BytesIO
 sys.path.append('/opt/flink/usrlib')
 from common.redis_keys import *  # Importa le chiavi standardizzate
 
+from prometheus_client import start_http_server, Counter, Histogram
+
 # Configurazione logging
 logging.basicConfig(
     level=logging.INFO,
     format='[%(levelname)s] %(asctime)s - %(name)s - %(message)s'
+)
+
+# Prometheus Metrics
+METRICS_PORT = 8080
+RECORDS_STORED_TOTAL = Counter(
+    'storage_records_stored_total',
+    'Total number of records stored',
+    ['table', 'status']
+)
+DATABASE_OPERATION_DURATION_SECONDS = Histogram(
+    'storage_database_operation_duration_seconds',
+    'Latency of database operations',
+    ['table']
+)
+STORAGE_ERRORS_TOTAL = Counter(
+    'storage_errors_total',
+    'Total number of storage errors',
+    ['type']
 )
 logger = logging.getLogger("storage_consumer")
 
@@ -492,6 +512,7 @@ def check_spatial_duplicate(lat, lon, radius_km, pollutant_type, conn, max_dista
         logger.error(f"Errore nel controllo duplicati spaziali: {e}")
         return False, None
 
+@DATABASE_OPERATION_DURATION_SECONDS.labels('sensor_measurements').time()
 def process_buoy_data(data, timescale_conn, s3_client):
     """Processa dati dalle boe"""
     try:
@@ -526,9 +547,12 @@ def process_buoy_data(data, timescale_conn, s3_client):
             
             timescale_conn.commit()
             logger.info(f"Salvati dati buoy da sensore {sensor_id}")
+            RECORDS_STORED_TOTAL.labels('sensor_measurements', 'success').inc()
     except Exception as e:
         timescale_conn.rollback()
         logger.error(f"Errore processamento dati buoy: {e}")
+        STORAGE_ERRORS_TOTAL.labels('buoy_data_processing').inc()
+        RECORDS_STORED_TOTAL.labels('sensor_measurements', 'error').inc()
 
 def process_satellite_imagery(data, s3_client):
     """Processa dati immagini satellitari"""
@@ -611,6 +635,7 @@ def process_analyzed_data(data, s3_client):
         logger.error(f"Errore processamento dati analizzati: {e}")
         return False
 
+@DATABASE_OPERATION_DURATION_SECONDS.labels('active_hotspots').time()
 def process_pollution_hotspots(data, timescale_conn, postgres_conn, s3_client):
     """Processa hotspot inquinamento"""
     timescale_modified = False
@@ -805,7 +830,8 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn, s3_client):
             timescale_conn.commit()
         if postgres_modified:
             postgres_conn.commit()
-            
+            logger.info(f"Evento per hotspot {hotspot_id} salvato in PostgreSQL")
+            RECORDS_STORED_TOTAL.labels('active_hotspots', 'success').inc()
         logger.info(f"Salvato hotspot {hotspot_id} (update: {is_update}, status: {data.get('status', 'active')})")
         
     except Exception as e:
@@ -815,8 +841,11 @@ def process_pollution_hotspots(data, timescale_conn, postgres_conn, s3_client):
         if postgres_modified:
             postgres_conn.rollback()
         logger.error(f"Errore processamento hotspot: {e}")
+        STORAGE_ERRORS_TOTAL.labels('hotspot_processing').inc()
+        RECORDS_STORED_TOTAL.labels('active_hotspots', 'error').inc()
 
-def process_pollution_predictions(data, timescale_conn, s3_client):
+@DATABASE_OPERATION_DURATION_SECONDS.labels('pollution_predictions').time()
+def process_pollution_predictions(data, postgres_conn, s3_client):
     """Processa previsioni inquinamento"""
     try:
         # Salva nel layer Gold di MinIO
@@ -831,7 +860,7 @@ def process_pollution_predictions(data, timescale_conn, s3_client):
         derived_from = data.get('derived_from')
         
         # Verifica se questo set di previsioni esiste già
-        with timescale_conn.cursor() as cur:
+        with postgres_conn.cursor() as cur:
             cur.execute("""
                 SELECT COUNT(*) FROM pollution_predictions 
                 WHERE prediction_set_id = %s
@@ -842,7 +871,7 @@ def process_pollution_predictions(data, timescale_conn, s3_client):
                 return
         
         # Processa ogni previsione nel set
-        with timescale_conn.cursor() as cur:
+        with postgres_conn.cursor() as cur:
             for prediction in data['predictions']:
                 hours_ahead = prediction['hours_ahead']
                 prediction_time = datetime.fromtimestamp(prediction['prediction_time'] / 1000)
@@ -886,47 +915,29 @@ def process_pollution_predictions(data, timescale_conn, s3_client):
                     generated_at
                 ))
             
-            timescale_conn.commit()
-            logger.info(f"Salvate {len(data['predictions'])} previsioni per hotspot {hotspot_id}")
+            postgres_conn.commit()
+            logger.info(f"Salvate previsioni con set ID {prediction_set_id}")
+            RECORDS_STORED_TOTAL.labels('pollution_predictions', 'success').inc()
     except Exception as e:
-        timescale_conn.rollback()
+        postgres_conn.rollback()
         logger.error(f"Errore processamento previsioni: {e}")
-
-def deserialize_message(message):
-    """Deserializza messaggi Kafka supportando sia JSON che formati binari"""
-    try:
-        # Tenta prima la decodifica JSON standard
-        return json.loads(message.decode('utf-8'))
-    except UnicodeDecodeError:
-        # Se fallisce, potrebbe essere un formato binario (Avro/Schema Registry)
-        logger.info("Rilevato messaggio non-UTF8, utilizzo fallback binario")
-        try:
-            # Se il messaggio inizia con byte magico 0x00 (Schema Registry)
-            if message[0] == 0:
-                logger.warning("Rilevato messaggio Schema Registry, non supportato nella versione attuale")
-                return None
-            else:
-                # Altri formati binari - tenta di estrarre come binary data
-                return {"binary_data": True, "size": len(message)}
-        except Exception as e:
-            logger.error(f"Impossibile deserializzare messaggio binario: {e}")
-            return None
+        STORAGE_ERRORS_TOTAL.labels('prediction_processing').inc()
+        RECORDS_STORED_TOTAL.labels('pollution_predictions', 'error').inc()
 
 def main():
     """Funzione principale"""
-    # Connessioni database
+    # Start Prometheus metrics server
+    start_http_server(METRICS_PORT)
+    logger.info(f"Prometheus metrics server started on port {METRICS_PORT}")
+
+    logger.info("Avvio Storage Consumer...")
+
+    # Connessioni
     timescale_conn = connect_timescaledb()
     postgres_conn = connect_postgres()
-    
-    # Connessione a MinIO (salvataggio dati)
-    try:
-        s3_client = connect_minio()
-        logger.info("MinIO disponibile, i dati verranno salvati anche in formato Parquet/JSON")
-    except Exception as e:
-        logger.warning(f"MinIO non disponibile, salvataggio solo in database: {e}")
-        s3_client = None
-    
-    # Consumer Kafka con configurazioni ottimizzate
+    s3_client = connect_minio()
+
+    # Creazione consumer Kafka
     consumer = KafkaConsumer(
         BUOY_TOPIC,
         SATELLITE_TOPIC,
@@ -936,92 +947,64 @@ def main():
         HOTSPOTS_TOPIC,
         PREDICTIONS_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        group_id='storage-consumer-group',
-        auto_offset_reset='latest',
-        value_deserializer=deserialize_message,
-        enable_auto_commit=False,
-        # Configurazioni per risolvere il timeout
-        max_poll_interval_ms=300000,  # Aumenta a 5 minuti (default 300000ms = 5min)
-        max_poll_records=100,         # Limita il numero di record per batch
-        session_timeout_ms=60000,     # Timeout della sessione a 60 secondi
-        heartbeat_interval_ms=20000   # Intervallo heartbeat a 20 secondi
+        group_id='storage_consumer_group',
+        auto_offset_reset='earliest',
+        enable_auto_commit=False,  # Disabilita auto-commit
+        value_deserializer=lambda message: deserialize_message(message)
     )
-    
-    logger.info("Storage Consumer avviato - in attesa di messaggi...")
-    logger.info("NOTA: Gli alert sono gestiti esclusivamente da alert_manager.py")
-    
+
+    logger.info(f"Sottoscritto ai topic: {[BUOY_TOPIC, SATELLITE_TOPIC, PROCESSED_IMAGERY_TOPIC, ANALYZED_SENSOR_TOPIC, ANALYZED_TOPIC, HOTSPOTS_TOPIC, PREDICTIONS_TOPIC]}")
+
     try:
-        for message in consumer:
-            topic = message.topic
-            data = message.value
-            
-            # Skip messaggi che non possiamo deserializzare
-            if data is None:
-                consumer.commit()
+        while True:
+            # Poll per nuovi messaggi
+            msg_pack = consumer.poll(timeout_ms=1000)
+
+            if not msg_pack:
+                time.sleep(1)
                 continue
-                
-            try:
-                if topic == BUOY_TOPIC:
-                    if s3_client:
+
+            for tp, messages in msg_pack.items():
+                for message in messages:
+                    topic = message.topic
+                    data = message.value
+
+                    if data is None:
+                        logger.warning(f"Messaggio nullo ricevuto su topic {topic}, skipping")
+                        consumer.commit({tp: message.offset + 1})
+                        continue
+
+                    logger.info(f"Ricevuto messaggio dal topic: {topic}")
+
+                    if topic == BUOY_TOPIC:
                         process_buoy_data(data, timescale_conn, s3_client)
-                    else:
-                        process_buoy_data(data, timescale_conn, None)
-                        
-                elif topic == SATELLITE_TOPIC:
-                    if s3_client:
+                    elif topic == SATELLITE_TOPIC:
                         process_satellite_imagery(data, s3_client)
-                    else:
-                        logger.info("Dati satellite ricevuti ma MinIO non disponibile, skip")
-                        
-                elif topic == PROCESSED_IMAGERY_TOPIC:
-                    if s3_client:
+                    elif topic == PROCESSED_IMAGERY_TOPIC:
                         process_processed_imagery(data, s3_client)
-                    else:
-                        logger.info("Immagine processata ricevuta ma MinIO non disponibile, skip")
-                        
-                elif topic == ANALYZED_SENSOR_TOPIC:
-                    if s3_client:
+                    elif topic == ANALYZED_SENSOR_TOPIC:
                         process_analyzed_sensor_data(data, timescale_conn, s3_client)
-                    else:
-                        process_analyzed_sensor_data(data, timescale_conn, None)
-                        
-                elif topic == ANALYZED_TOPIC:
-                    if s3_client:
+                    elif topic == ANALYZED_TOPIC:
                         process_analyzed_data(data, s3_client)
-                    else:
-                        logger.info("Dati analizzati ricevuti ma MinIO non disponibile, skip")
-                        
-                elif topic == HOTSPOTS_TOPIC:
-                    if s3_client:
+                    elif topic == HOTSPOTS_TOPIC:
                         process_pollution_hotspots(data, timescale_conn, postgres_conn, s3_client)
-                    else:
-                        process_pollution_hotspots(data, timescale_conn, postgres_conn, None)
-                        
-                elif topic == PREDICTIONS_TOPIC:
-                    if s3_client:
-                        process_pollution_predictions(data, timescale_conn, s3_client)
-                    else:
-                        process_pollution_predictions(data, timescale_conn, None)
-                
-                # Commit dell'offset solo se elaborazione riuscita
-                consumer.commit()
-            
-            except Exception as e:
-                logger.error(f"Errore elaborazione messaggio da {topic}: {e}")
-                # Commit dell'offset anche in caso di errore per evitare loop infiniti
-                consumer.commit()
-                
+                    elif topic == PREDICTIONS_TOPIC:
+                        process_pollution_predictions(data, postgres_conn, s3_client)
+                    
+                    # Commit dell'offset solo se elaborazione riuscita
+                    consumer.commit({tp: message.offset + 1})
+
     except KeyboardInterrupt:
-        logger.info("Interruzione richiesta - arresto in corso...")
-    
+        logger.info("Ricevuto segnale di interruzione, chiusura in corso...")
+    except Exception as e:
+        logger.error(f"Errore critico nel consumer: {e}")
+        STORAGE_ERRORS_TOTAL.labels('critical_consumer_error').inc()
+
     finally:
-        # Chiudi connessioni
-        if timescale_conn:
-            timescale_conn.close()
-        if postgres_conn:
-            postgres_conn.close()
         consumer.close()
-        logger.info("Storage Consumer arrestato")
+        timescale_conn.close()
+        postgres_conn.close()
+        logger.info("Consumer e connessioni chiuse.")
 
 if __name__ == "__main__":
     main()

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 def generate_fallback_recommendations(alert):
     """Genera raccomandazioni di fallback basate sul tipo di inquinante e la severità"""
     pollutant_type = alert.get("pollutant_type", "unknown")
-    severity = alert.get("severity", "medium")
+    severity = alert.get("severity", "low")
     risk_score = float(alert.get("risk_score", 0.5))
     
     recommendations = {
@@ -152,17 +152,28 @@ def generate_fallback_recommendations(alert):
             "Potential monitoring requirements",
             "Notification to local authorities"
         ]
+    else:  # low
+        recommendations["stakeholders_to_notify"] = [
+            "Local Environmental Monitoring Office"
+        ]
+        recommendations["regulatory_implications"] = [
+            "Standard documentation for minor incidents",
+            "Inclusion in routine monitoring reports"
+        ]
     
     # Valutazione dell'impatto
     affected_area = risk_score * 10
     recommendations["environmental_impact_assessment"] = {
         "estimated_area_affected": f"{affected_area:.1f} km²",
-        "expected_duration": "1-2 weeks" if severity == "medium" else "2-4 weeks",
+        "expected_duration": "3-5 days" if severity == "low" else "1-2 weeks" if severity == "medium" else "2-4 weeks",
         "sensitive_habitats_affected": ["coral_reefs", "mangroves", "seagrass_beds"] if severity == "high" else 
-                                      ["shoreline", "nearshore_waters"],
+                                      ["shoreline", "nearshore_waters"] if severity == "medium" else [],
         "potential_wildlife_impact": "High - immediate intervention required" if severity == "high" else
-                                    "Moderate - monitoring required",
-        "water_quality_recovery": "1-2 months" if severity == "high" else "2-3 weeks"
+                                    "Moderate - monitoring required" if severity == "medium" else
+                                    "Low - standard protocols sufficient",
+        "water_quality_recovery": "1-2 months" if severity == "high" else
+                                 "2-3 weeks" if severity == "medium" else
+                                 "3-7 days"
     }
     
     return recommendations
@@ -248,14 +259,14 @@ def show_alerts_page(clients):
         alerts = []
     
     # Calcola i conteggi per severità
-    severity_counts = {"high": 0, "medium": 0}
+    severity_counts = {"high": 0, "medium": 0, "low": 0}
     for alert in alerts:
         sev = alert.get("severity")
         if sev in severity_counts:
             severity_counts[sev] += 1
     
-    # Layout in 2 colonne per le metriche principali
-    col1, col2 = st.columns(2)
+    # Layout in 3 colonne per le metriche principali
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -269,6 +280,12 @@ def show_alerts_page(clients):
         st.markdown(f"<p class='stat-large status-medium'>{severity_counts.get('medium', 0)}</p>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
     
+    with col3:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h2 class='sub-header'>Low Severity</h2>", unsafe_allow_html=True)
+        st.markdown(f"<p class='stat-large status-low'>{severity_counts.get('low', 0)}</p>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+    
     # Sezione filtri
     st.markdown("<h2 class='sub-header'>Alert Filters</h2>", unsafe_allow_html=True)
     
@@ -277,7 +294,7 @@ def show_alerts_page(clients):
     
     with filter_col1:
         # Filtro per severità - multi-select per selezionare più valori
-        severity_options = ["high", "medium"]
+        severity_options = ["high", "medium", "low"]
         selected_severities = st.multiselect("Severity", severity_options, default=severity_options)
     
     with filter_col2:
@@ -398,6 +415,7 @@ def show_alerts_page(clients):
             severity_colors = {
                 "high": "red",
                 "medium": "orange",
+                "low": "green",
                 "unknown": "blue"
             }
             
@@ -486,6 +504,7 @@ def show_alerts_page(clients):
                 severity_colors = {
                     "high": "#F44336",
                     "medium": "#FF9800",
+                    "low": "#4CAF50",
                     "unknown": "#9E9E9E"
                 }
                 
@@ -536,13 +555,13 @@ def show_alerts_page(clients):
                 
                 filtered_alerts = sorted(filtered_alerts, key=get_timestamp, reverse=True)
             elif selected_sort == "Highest Severity":
-                severity_order = {"high": 0, "medium": 1, None: 2, "unknown": 3}
+                severity_order = {"high": 0, "medium": 1, "low": 2, None: 3, "unknown": 4}
                 filtered_alerts = sorted(filtered_alerts, 
-                                      key=lambda x: severity_order.get(x.get("severity"), 3))
+                                      key=lambda x: severity_order.get(x.get("severity"), 4))
             elif selected_sort == "Lowest Severity":
-                severity_order = {"medium": 0, "high": 1, None: 2, "unknown": 3}
+                severity_order = {"low": 0, "medium": 1, "high": 2, None: 3, "unknown": 4}
                 filtered_alerts = sorted(filtered_alerts, 
-                                      key=lambda x: severity_order.get(x.get("severity"), 3))
+                                      key=lambda x: severity_order.get(x.get("severity"), 4))
             
             # Mostra alert in formato card con raccomandazioni integrate
             for i, alert in enumerate(filtered_alerts):
@@ -721,8 +740,8 @@ def show_alerts_page(clients):
                             detail_map = folium.Map(location=[lat, lon], zoom_start=10)
                             
                             # Aggiungi marker
-                            severity = selected_alert.get("severity", "medium")
-                            color = {"high": "red", "medium": "orange"}.get(severity, "blue")
+                            severity = selected_alert.get("severity", "low")
+                            color = {"high": "red", "medium": "orange", "low": "green"}.get(severity, "blue")
                             
                             folium.Marker(
                                 location=[lat, lon],

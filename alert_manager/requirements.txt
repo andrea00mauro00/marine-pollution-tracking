@@ -7,3 +7,4 @@ loguru
 requests
 kafka-python
 prometheus-client
+prometheus_client==0.17.1
