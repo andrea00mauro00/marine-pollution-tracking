@@ -375,6 +375,11 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                 return c * r
             
             # Ottimizza la ricerca spaziale per evitare blocchi
+            # Inizializza variabili per evitare errori
+            nearby_alerts = []
+            filtered_alerts = []
+            
+            # Ottimizza la ricerca spaziale per evitare blocchi
             try:
                 # Prima verifica se la tabella è vuota per evitare query inutili
                 cur.execute("SELECT COUNT(*) FROM pollution_alerts LIMIT 1")
@@ -444,21 +449,25 @@ def process_alert(data, postgres_conn, redis_conn, notification_configs):
                             if distance <= 0.5:
                                 filtered_alerts.append((alert, distance))
                         
-                        nearby_alerts = [a[0] for a in filtered_alerts]
-                        logger.info(f"Dopo filtro distanza: {len(nearby_alerts)} alert validi")
+                        logger.info(f"Dopo filtro distanza: {len(filtered_alerts)} alert validi")
             except Exception as e:
                 logger.error(f"Errore nella ricerca spaziale: {e}")
                 nearby_alerts = []  # In caso di errore, procedi senza alert vicini
+                filtered_alerts = []  # IMPORTANTE: Inizializza anche filtered_alerts
             
             superseded_alert = None
             
-            if nearby_alerts:
+            if filtered_alerts:  # Cambiato da nearby_alerts a filtered_alerts
                 # Ordina per severità (decrescente) e distanza (crescente)
                 severity_ranks = {'high': 3, 'medium': 2, 'low': 1}
-                filtered_alerts.sort(key=lambda x: (-severity_ranks.get(x[3], 0), 0))  # x[3] è la severità
+                # FIX: x[0] è l'alert, x[0][3] è la severità dell'alert
+                filtered_alerts.sort(key=lambda x: (-severity_ranks.get(x[0][3], 0), x[1]))  # x[0][3] è la severità, x[1] è la distanza
                 
                 # Seleziona l'alert più vicino/più severo
-                nearby_alert = filtered_alerts[0]
+                nearby_alert_tuple = filtered_alerts[0]
+                nearby_alert = nearby_alert_tuple[0]  # Estrai l'alert dalla tupla
+                distance = nearby_alert_tuple[1]      # Estrai la distanza dalla tupla
+                
                 nearby_alert_id = nearby_alert[0]
                 nearby_source_id = nearby_alert[1]
                 nearby_severity = nearby_alert[3]
