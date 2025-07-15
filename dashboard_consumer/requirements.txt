@@ -4,5 +4,3 @@ boto3
 psycopg2-binary
 loguru
 requests
-python-dotenv
-python-json-logger==2.0.7

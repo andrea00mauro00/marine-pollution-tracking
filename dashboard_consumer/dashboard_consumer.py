@@ -42,8 +42,15 @@ ALERTS_TTL = 3600  # 1 hour
 PREDICTIONS_TTL = 7200  # 2 hours
 SPATIAL_BIN_SIZE = 0.05
 
-# Configurazione controllo duplicati
-DUPLICATE_SEARCH_RADIUS_KM = 5.0  # Raggio per considerare hotspot come potenziali duplicati
+# Configurazione controllo duplicati - Configurabile per tipo di inquinante
+DEFAULT_DUPLICATE_SEARCH_RADIUS_KM = 5.0  # Raggio default per ricerca duplicati
+DUPLICATE_RADIUS_BY_TYPE = {
+    "oil": 8.0,           # Gli sversamenti di petrolio si espandono molto
+    "chemical": 6.0,      # Le sostanze chimiche si diffondono rapidamente
+    "plastic": 3.0,       # I rifiuti plastici tendono a restare più localizzati
+    "algae": 10.0,        # Le fioriture algali possono coprire aree molto vaste
+    "sewage": 4.0         # Gli scarichi fognari hanno dispersione media
+}
 
 # Reconciliation intervals (in seconds)
 SUMMARY_UPDATE_INTERVAL = 60  # 1 minute
@@ -53,6 +60,9 @@ FULL_RECONCILIATION_INTERVAL = 43200  # 12 hours
 # Retry configuration
 MAX_RETRIES = 3
 BACKOFF_FACTOR = 2  # seconds
+
+# Configurazione idempotenza delle operazioni
+TRANSACTION_TTL = 86400  # 24 hours - TTL per record di transazioni elaborate
 
 def sanitize_value(value):
     """Ensures a value is safe for Redis (converts None to empty string)"""
@@ -113,12 +123,13 @@ def init_redis_counters(redis_conn):
     """Inizializza tutti i contatori Redis necessari"""
     # Contatori base
     counters = [
-        "counters:hotspots:total",
-        "counters:hotspots:active",
-        "counters:hotspots:inactive",
-        "counters:hotspots:duplicates",  # Nuovo contatore per duplicati
-        "counters:predictions:total",
-        "counters:alerts:active"
+        "counters:hotspots:total",         # Hotspot totali (inclusi duplicati)
+        "counters:hotspots:active",        # Hotspot attivi (esclusi duplicati)
+        "counters:hotspots:inactive",      # Hotspot inattivi
+        "counters:hotspots:duplicates",    # Hotspot marcati come duplicati
+        "counters:hotspots:deduplication", # Contatore operazioni di deduplicazione
+        "counters:predictions:total",      # Previsioni totali
+        "counters:alerts:active"           # Alert attivi
     ]
     
     # Usa pipeline per operazioni atomiche
@@ -188,8 +199,8 @@ def update_counter(redis_conn, counter_key, operation, amount=1, transaction_id=
         
         # Se fornito un transaction_id, segna come elaborato
         if transaction_id:
-            # Imposta con TTL di 24 ore
-            safe_redis_operation(redis_conn.setex, transaction_key, 86400, "1")
+            # Imposta con TTL configurabile
+            safe_redis_operation(redis_conn.setex, transaction_key, TRANSACTION_TTL, "1")
             
         # Registra l'operazione nel log delle modifiche ai contatori
         log_counter_update(redis_conn, counter_key, operation, amount, result)
@@ -294,53 +305,126 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     
     return km
 
+def get_duplicate_search_radius(pollutant_type):
+    """
+    Determina il raggio di ricerca appropriato per il tipo di inquinante specificato
+    Usa valori specifici per tipo o il valore default
+    """
+    if not pollutant_type:
+        return DEFAULT_DUPLICATE_SEARCH_RADIUS_KM
+        
+    pollutant_type = pollutant_type.lower()
+    
+    # Verifica i tipi principali
+    for key, radius in DUPLICATE_RADIUS_BY_TYPE.items():
+        if key in pollutant_type or pollutant_type in key:
+            return radius
+    
+    # Verifica alcuni sinonimi comuni
+    if any(word in pollutant_type for word in ["oil", "petroleum", "crude", "spill"]):
+        return DUPLICATE_RADIUS_BY_TYPE["oil"]
+    elif any(word in pollutant_type for word in ["chem", "toxic"]):
+        return DUPLICATE_RADIUS_BY_TYPE["chemical"]
+    elif any(word in pollutant_type for word in ["plast", "debris", "waste"]):
+        return DUPLICATE_RADIUS_BY_TYPE["plastic"]
+    elif any(word in pollutant_type for word in ["alga", "bloom", "tide"]):
+        return DUPLICATE_RADIUS_BY_TYPE["algae"]
+    elif any(word in pollutant_type for word in ["sew", "discharge", "waste water"]):
+        return DUPLICATE_RADIUS_BY_TYPE["sewage"]
+    
+    # Default
+    return DEFAULT_DUPLICATE_SEARCH_RADIUS_KM
+
 def is_same_pollutant_type(type1, type2):
     """Verifica se due tipi di inquinanti sono considerati equivalenti"""
     if type1 == type2:
         return True
+    
+    # Normalizza i tipi per confronto
+    type1 = type1.lower() if type1 else ""
+    type2 = type2.lower() if type2 else ""
+    
+    if not type1 or not type2:
+        return False
         
     # Mappa di sinonimi per tipi di inquinanti
     synonyms = {
-        "oil": ["oil_spill", "crude_oil", "petroleum"],
-        "chemical": ["chemical_spill", "toxic_chemicals"],
-        "sewage": ["waste_water", "sewage_discharge"],
-        "plastic": ["microplastics", "plastic_debris"],
-        "algae": ["algal_bloom", "red_tide"]
+        "oil": ["oil_spill", "crude_oil", "petroleum", "crude", "spill", "petroleum_spill"],
+        "chemical": ["chemical_spill", "toxic_chemicals", "toxics", "chemicals", "toxic_spill"],
+        "sewage": ["waste_water", "sewage_discharge", "waste", "wastewater", "discharge"],
+        "plastic": ["microplastics", "plastic_debris", "debris", "trash", "garbage", "waste"],
+        "algae": ["algal_bloom", "red_tide", "bloom", "tide", "algal"]
     }
     
-    # Controlla se sono sinonimi
+    # Controlla se sono sinonimi basandosi sulla mappa
     for category, types in synonyms.items():
-        if (type1 == category or type1 in types) and (type2 == category or type2 in types):
+        if (type1 == category or any(t in type1 for t in types)) and (type2 == category or any(t in type2 for t in types)):
             return True
+    
+    # Approccio basato sulla sovrapposizione di parole (per tipi composti)
+    words1 = set(type1.replace("_", " ").replace("-", " ").split())
+    words2 = set(type2.replace("_", " ").replace("-", " ").split())
+    
+    # Se condividono parole significative, considera come stesso tipo
+    significant_words = words1.intersection(words2) - {"unknown", "pollution", "pollutant", "type"}
+    if significant_words:
+        return True
     
     return False
 
-def find_similar_hotspot(location, pollutant_type, redis_conn):
-    """Cerca hotspot simili basandosi su posizione geografica e tipo di inquinante"""
+def find_similar_hotspot(location, pollutant_type, redis_conn, postgres_conn=None):
+    """
+    Cerca hotspot simili basandosi su posizione geografica e tipo di inquinante
+    Utilizza un approccio a due livelli: Redis per ricerca rapida, PostgreSQL per verifica
+    """
     try:
-        # Estrai coordinate
-        lat = float(location.get('center_latitude', location.get('latitude', 0)))
-        lon = float(location.get('center_longitude', location.get('longitude', 0)))
+        # Estrai coordinate con validazione
+        try:
+            lat = float(location.get('center_latitude', location.get('latitude', 0)))
+            lon = float(location.get('center_longitude', location.get('longitude', 0)))
+            
+            # Validazione basic delle coordinate
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                logger.warning(f"Coordinate non valide: lat={lat}, lon={lon}")
+                return None
+                
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Errore nell'estrazione delle coordinate: {e}")
+            return None
+        
+        # Determina raggio di ricerca appropriato per questo tipo di inquinante
+        search_radius = get_duplicate_search_radius(pollutant_type)
+        logger.info(f"Ricerca duplicati con raggio {search_radius}km per inquinante '{pollutant_type}'")
         
         # Calcola bin spaziali da controllare
         lat_bin = math.floor(lat / SPATIAL_BIN_SIZE)
         lon_bin = math.floor(lon / SPATIAL_BIN_SIZE)
         
+        # Determina quanti bin controllare basandosi sul raggio di ricerca
+        # Per un raggio grande, controlla più bin adiacenti
+        bin_range = max(1, min(3, int(search_radius / 10) + 1))
+        
         # Raccogli potenziali match dai bin vicini
         candidates = set()
-        for dlat in [-1, 0, 1]:
-            for dlon in [-1, 0, 1]:
+        for dlat in range(-bin_range, bin_range + 1):
+            for dlon in range(-bin_range, bin_range + 1):
                 bin_key = spatial_bin_key(lat_bin + dlat, lon_bin + dlon)
                 bin_members = safe_redis_operation(redis_conn.smembers, bin_key, default_value=set())
                 
                 if bin_members:
-                    # Converti da bytes se necessario
+                    # Converti da bytes a string se necessario
                     for member in bin_members:
                         h_id = member.decode('utf-8') if isinstance(member, bytes) else member
                         candidates.add(h_id)
         
-        # Nessun candidato trovato
-        if not candidates:
+        # Log del numero di candidati trovati
+        if candidates:
+            logger.info(f"Trovati {len(candidates)} candidati nei bin spaziali vicini")
+        else:
+            logger.info("Nessun candidato trovato nei bin spaziali")
+            # Se non ci sono candidati in Redis, verifica in PostgreSQL
+            if postgres_conn:
+                return find_similar_hotspot_in_postgres(lat, lon, pollutant_type, search_radius, postgres_conn)
             return None
             
         # Verifica ogni candidato
@@ -353,13 +437,37 @@ def find_similar_hotspot(location, pollutant_type, redis_conn):
             if not h_data:
                 continue
                 
-            # Converti da formato Redis hash
+            # Converti da formato Redis hash a dizionario Python
             h_data = {k.decode('utf-8') if isinstance(k, bytes) else k: 
                      v.decode('utf-8') if isinstance(v, bytes) else v 
                      for k, v in h_data.items()}
             
             # Estrai coordinate e tipo
             try:
+                # Verifica che l'hotspot non sia già marcato come duplicato
+                if h_data.get('is_duplicate') == 'true':
+                    # Traccia l'hotspot originale invece del duplicato
+                    parent_id = h_data.get('parent_hotspot_id')
+                    if parent_id:
+                        # Controlla se l'hotspot parent è valido
+                        parent_data = safe_redis_operation(redis_conn.hgetall, hotspot_key(parent_id), default_value={})
+                        if parent_data:
+                            # Usa l'hotspot parent invece del duplicato
+                            h_id = parent_id
+                            h_data = {k.decode('utf-8') if isinstance(k, bytes) else k: 
+                                     v.decode('utf-8') if isinstance(v, bytes) else v 
+                                     for k, v in parent_data.items()}
+                        else:
+                            # Il parent non esiste, salta questo duplicato
+                            continue
+                    else:
+                        # Non c'è parent_id, salta questo duplicato
+                        continue
+                    
+                # Skip hotspot inattivi o replaced
+                if h_data.get('status') in ['inactive', 'replaced']:
+                    continue
+                
                 h_lat = float(h_data.get('center_latitude', 0))
                 h_lon = float(h_data.get('center_longitude', 0))
                 h_type = h_data.get('pollutant_type', 'unknown')
@@ -368,13 +476,23 @@ def find_similar_hotspot(location, pollutant_type, redis_conn):
                 distance = calculate_distance(lat, lon, h_lat, h_lon)
                 
                 # Verifica match per distanza e tipo
-                if distance <= DUPLICATE_SEARCH_RADIUS_KM and is_same_pollutant_type(pollutant_type, h_type):
+                if distance <= search_radius and is_same_pollutant_type(pollutant_type, h_type):
                     # Tieni il più vicino
                     if distance < min_distance:
                         min_distance = distance
                         best_match = h_id
-            except (ValueError, TypeError, KeyError):
+                        logger.info(f"Trovato potenziale duplicato: {h_id} a distanza {distance:.2f}km")
+            except (ValueError, TypeError, KeyError) as e:
+                logger.warning(f"Errore nell'analisi dell'hotspot {h_id}: {e}")
                 continue
+        
+        if best_match:
+            logger.info(f"Miglior match trovato: {best_match} a distanza {min_distance:.2f}km")
+        else:
+            logger.info("Nessun match valido trovato in Redis")
+            # Se non troviamo match in Redis, prova con PostgreSQL
+            if postgres_conn:
+                return find_similar_hotspot_in_postgres(lat, lon, pollutant_type, search_radius, postgres_conn)
         
         return best_match
     
@@ -382,7 +500,96 @@ def find_similar_hotspot(location, pollutant_type, redis_conn):
         logger.error(f"Errore nella ricerca di hotspot simili: {e}")
         return None
 
-def compare_hotspot_quality(existing_id, new_data, redis_conn):
+def find_similar_hotspot_in_postgres(lat, lon, pollutant_type, search_radius, postgres_conn):
+    """
+    Cerca hotspot simili in PostgreSQL quando Redis non ha risultati
+    Utile per hotspot che potrebbero non essere più in cache Redis
+    """
+    try:
+        # Calcola bounding box per ricerca efficiente
+        # 1 grado di lat ≈ 111km
+        lat_delta = search_radius / 111.0
+        # 1 grado di lon ≈ 111km * cos(lat)
+        lon_delta = search_radius / (111.0 * math.cos(math.radians(lat)))
+        
+        with postgres_conn.cursor() as cur:
+            # Query per trovare hotspot vicini con lo stesso tipo di inquinante
+            cur.execute("""
+                SELECT 
+                    hotspot_id, 
+                    center_latitude, 
+                    center_longitude, 
+                    pollutant_type,
+                    severity,
+                    last_updated_at
+                FROM active_hotspots
+                WHERE 
+                    center_latitude BETWEEN %s AND %s
+                    AND center_longitude BETWEEN %s AND %s
+                    AND pollutant_type = %s
+                    AND last_updated_at > NOW() - INTERVAL '24 hours'
+                    AND (source_data::jsonb->>'is_duplicate')::text IS DISTINCT FROM 'true'
+                    AND status NOT IN ('inactive', 'replaced')
+                ORDER BY last_updated_at DESC
+                LIMIT 10
+            """, (
+                lat - lat_delta, lat + lat_delta,
+                lon - lon_delta, lon + lon_delta,
+                pollutant_type
+            ))
+            
+            results = cur.fetchall()
+            
+            if not results:
+                # Se non trova con tipo esatto, prova con ricerca più permissiva
+                cur.execute("""
+                    SELECT 
+                        hotspot_id, 
+                        center_latitude, 
+                        center_longitude, 
+                        pollutant_type,
+                        severity,
+                        last_updated_at
+                    FROM active_hotspots
+                    WHERE 
+                        center_latitude BETWEEN %s AND %s
+                        AND center_longitude BETWEEN %s AND %s
+                        AND last_updated_at > NOW() - INTERVAL '24 hours'
+                        AND (source_data::jsonb->>'is_duplicate')::text IS DISTINCT FROM 'true'
+                        AND status NOT IN ('inactive', 'replaced')
+                    ORDER BY last_updated_at DESC
+                    LIMIT 10
+                """, (
+                    lat - lat_delta, lat + lat_delta,
+                    lon - lon_delta, lon + lon_delta
+                ))
+                
+                results = cur.fetchall()
+            
+            # Processa i risultati
+            best_match = None
+            min_distance = float('inf')
+            
+            for result in results:
+                hotspot_id, db_lat, db_lon, db_type, db_severity, db_updated = result
+                
+                # Calcola distanza effettiva
+                distance = calculate_distance(lat, lon, db_lat, db_lon)
+                
+                # Verifica se rientra nel raggio e ha tipo compatibile
+                if distance <= search_radius and is_same_pollutant_type(pollutant_type, db_type):
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_match = hotspot_id
+                        logger.info(f"Trovato duplicato in PostgreSQL: {hotspot_id} a distanza {distance:.2f}km")
+            
+            return best_match
+            
+    except Exception as e:
+        logger.error(f"Errore nella ricerca di hotspot simili in PostgreSQL: {e}")
+        return None
+
+def compare_hotspot_quality(existing_id, new_data, redis_conn, postgres_conn=None):
     """
     Confronta un hotspot esistente con uno nuovo per decidere quale mantenere
     Restituisce True se l'originale è migliore, False se il nuovo è migliore
@@ -390,34 +597,62 @@ def compare_hotspot_quality(existing_id, new_data, redis_conn):
     try:
         # Recupera dati hotspot esistente
         existing_data = safe_redis_operation(redis_conn.hgetall, hotspot_key(existing_id), default_value={})
-        if not existing_data:
-            return False  # Se non troviamo l'esistente, mantieni il nuovo
-            
-        # Converti da formato Redis
-        existing_data = {k.decode('utf-8') if isinstance(k, bytes) else k: 
-                       v.decode('utf-8') if isinstance(v, bytes) else v 
-                       for k, v in existing_data.items()}
         
-        # Criteri di confronto
+        # Se non troviamo dati in Redis, cerca in PostgreSQL
+        if not existing_data and postgres_conn:
+            try:
+                with postgres_conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT source_data
+                        FROM active_hotspots 
+                        WHERE hotspot_id = %s
+                    """, (existing_id,))
+                    
+                    result = cur.fetchone()
+                    if result and result[0]:
+                        # Converti JSON da PostgreSQL
+                        existing_data = json.loads(result[0])
+                        logger.info(f"Dati per hotspot {existing_id} recuperati da PostgreSQL")
+            except Exception as e:
+                logger.error(f"Errore nel recupero dati da PostgreSQL per {existing_id}: {e}")
+        
+        if not existing_data:
+            logger.warning(f"Nessun dato trovato per hotspot esistente {existing_id}, mantengo il nuovo")
+            return False
+            
+        # Converti da formato Redis hash a dizionario se necessario
+        if not isinstance(existing_data, dict):
+            existing_data = {k.decode('utf-8') if isinstance(k, bytes) else k: 
+                           v.decode('utf-8') if isinstance(v, bytes) else v 
+                           for k, v in existing_data.items()}
+        
+        # CRITERI DI CONFRONTO
         
         # 1. Preferisci sempre hotspot con severità maggiore
-        severity_rank = {"high": 3, "medium": 2, "low": 1, "unknown": 0}
+        severity_rank = {"high": 3, "medium": 2, "low": 1, "unknown": 0, "none": 0}
         existing_severity = existing_data.get("severity", "unknown")
         new_severity = new_data.get("severity", "unknown")
         
-        if severity_rank.get(existing_severity, 0) > severity_rank.get(new_severity, 0):
-            return True  # Originale ha severità maggiore
-        if severity_rank.get(existing_severity, 0) < severity_rank.get(new_severity, 0):
-            return False  # Nuovo ha severità maggiore
+        existing_severity_rank = severity_rank.get(existing_severity.lower() if existing_severity else "unknown", 0)
+        new_severity_rank = severity_rank.get(new_severity.lower() if new_severity else "unknown", 0)
+        
+        if existing_severity_rank > new_severity_rank:
+            logger.info(f"Mantengo originale: severità maggiore ({existing_severity} > {new_severity})")
+            return True
+        if existing_severity_rank < new_severity_rank:
+            logger.info(f"Mantengo nuovo: severità maggiore ({new_severity} > {existing_severity})")
+            return False
         
         # 2. Preferisci hotspot con risk score maggiore
         try:
-            existing_risk = float(existing_data.get("max_risk_score", 0))
-            new_risk = float(new_data.get("max_risk_score", 0))
+            existing_risk = float(existing_data.get("max_risk_score", existing_data.get("avg_risk_score", 0)))
+            new_risk = float(new_data.get("max_risk_score", new_data.get("avg_risk_score", 0)))
             
             if existing_risk > new_risk + 0.1:  # Differenza significativa
+                logger.info(f"Mantengo originale: risk score maggiore ({existing_risk:.2f} > {new_risk:.2f})")
                 return True
             if new_risk > existing_risk + 0.1:
+                logger.info(f"Mantengo nuovo: risk score maggiore ({new_risk:.2f} > {existing_risk:.2f})")
                 return False
         except (ValueError, TypeError):
             pass
@@ -428,8 +663,10 @@ def compare_hotspot_quality(existing_id, new_data, redis_conn):
             new_points = int(new_data.get("point_count", 1))
             
             if existing_points > new_points + 2:  # Differenza significativa
+                logger.info(f"Mantengo originale: più punti ({existing_points} > {new_points})")
                 return True
             if new_points > existing_points + 2:
+                logger.info(f"Mantengo nuovo: più punti ({new_points} > {existing_points})")
                 return False
         except (ValueError, TypeError):
             pass
@@ -440,22 +677,48 @@ def compare_hotspot_quality(existing_id, new_data, redis_conn):
             new_diversity = int(new_data.get("source_diversity", 1))
             
             if existing_diversity > new_diversity:
+                logger.info(f"Mantengo originale: maggiore diversità fonti ({existing_diversity} > {new_diversity})")
                 return True
             if new_diversity > existing_diversity:
+                logger.info(f"Mantengo nuovo: maggiore diversità fonti ({new_diversity} > {existing_diversity})")
                 return False
         except (ValueError, TypeError):
             pass
         
-        # 5. In caso di pareggio, preferisci il più recente
+        # 5. In caso di parità, confronta timestamp per preferire il più recente
         try:
             existing_time = int(existing_data.get("detected_at", 0))
             new_time = int(new_data.get("detected_at", 0))
             
-            return existing_time > new_time  # True se l'originale è più recente
+            # Preferisci il più recente (con una soglia di tolleranza di 10 minuti)
+            time_diff_minutes = abs(existing_time - new_time) / (1000 * 60)
+            
+            if time_diff_minutes > 10:  # Differenza significativa
+                if existing_time > new_time:
+                    logger.info(f"Mantengo originale: più recente ({datetime.fromtimestamp(existing_time/1000).strftime('%Y-%m-%d %H:%M')})")
+                    return True
+                else:
+                    logger.info(f"Mantengo nuovo: più recente ({datetime.fromtimestamp(new_time/1000).strftime('%Y-%m-%d %H:%M')})")
+                    return False
+        except (ValueError, TypeError):
+            pass
+        
+        # 6. In caso di ulteriore parità, preferisci quello con raggio minore (più preciso)
+        try:
+            existing_radius = float(existing_data.get("radius_km", existing_data.get("location", {}).get("radius_km", 10.0)))
+            new_radius = float(new_data.get("radius_km", new_data.get("location", {}).get("radius_km", 10.0)))
+            
+            if existing_radius < new_radius * 0.8:  # Almeno 20% più piccolo
+                logger.info(f"Mantengo originale: raggio minore/più preciso ({existing_radius:.2f}km < {new_radius:.2f}km)")
+                return True
+            if new_radius < existing_radius * 0.8:
+                logger.info(f"Mantengo nuovo: raggio minore/più preciso ({new_radius:.2f}km < {existing_radius:.2f}km)")
+                return False
         except (ValueError, TypeError):
             pass
         
         # Default: mantieni l'originale per stabilità
+        logger.info("Criteri in parità, mantengo l'originale per stabilità del sistema")
         return True
         
     except Exception as e:
@@ -463,15 +726,25 @@ def compare_hotspot_quality(existing_id, new_data, redis_conn):
         return True  # In caso di errore, mantieni l'originale per sicurezza
 
 def update_original_with_duplicate_info(original_id, duplicate_id, redis_conn):
-    """Aggiorna hotspot originale con info sul duplicato trovato"""
+    """
+    Aggiorna hotspot originale con info sul duplicato trovato
+    Crea una relazione bidirezionale tra originale e duplicato
+    """
     try:
-        # Crea un set di duplicati conosciuti per l'hotspot originale
+        # 1. Aggiorna il set di duplicati conosciuti per l'hotspot originale
         duplicates_key = f"hotspot:duplicates:{original_id}"
+        
+        # 2. Imposta una chiave che mappa dal duplicato all'originale per ricerche future
+        original_for_duplicate_key = f"hotspot:original_for:{duplicate_id}"
         
         with redis_conn.pipeline() as pipe:
             # Aggiungi al set dei duplicati
             pipe.sadd(duplicates_key, duplicate_id)
             pipe.expire(duplicates_key, HOTSPOT_METADATA_TTL)
+            
+            # Imposta la chiave di mapping inversa
+            pipe.set(original_for_duplicate_key, original_id)
+            pipe.expire(original_for_duplicate_key, HOTSPOT_METADATA_TTL)
             
             # Aggiorna contatore di duplicati nell'hotspot originale
             pipe.hincrby(hotspot_key(original_id), "duplicate_count", 1)
@@ -479,18 +752,25 @@ def update_original_with_duplicate_info(original_id, duplicate_id, redis_conn):
             # Esegui atomicamente
             pipe.execute()
             
+        # 3. Aggiorna il contatore globale di deduplicazioni
+        update_counter(redis_conn, "counters:hotspots:deduplication", "incr", 1)
+            
         logger.info(f"Aggiornato hotspot {original_id} con informazioni sul duplicato {duplicate_id}")
     except Exception as e:
         logger.error(f"Errore nell'aggiornamento info duplicati: {e}")
 
 def mark_hotspot_replaced(old_id, new_id, redis_conn):
-    """Marca un hotspot come sostituito da uno nuovo"""
+    """
+    Marca un hotspot come sostituito da uno nuovo
+    Mantiene riferimenti per tracciabilità
+    """
     try:
         # Aggiorna stato dell'hotspot vecchio
         with redis_conn.pipeline() as pipe:
             # Aggiorna stato a "replaced"
             pipe.hset(hotspot_key(old_id), "status", "replaced")
             pipe.hset(hotspot_key(old_id), "replaced_by", new_id)
+            pipe.hset(hotspot_key(old_id), "replaced_at", int(time.time() * 1000))
             
             # Rimuovi dai set di hotspot attivi
             pipe.srem("dashboard:hotspots:active", old_id)
@@ -499,12 +779,65 @@ def mark_hotspot_replaced(old_id, new_id, redis_conn):
             # Rimuovi dal set di hotspot prioritari
             pipe.zrem("dashboard:hotspots:top10", old_id)
             
+            # Aggiorna il nuovo hotspot con riferimento al vecchio
+            pipe.hset(hotspot_key(new_id), "replaces", old_id)
+            
             # Esegui atomicamente
             pipe.execute()
+            
+        # Aggiorna il contatore globale di deduplicazioni
+        update_counter(redis_conn, "counters:hotspots:deduplication", "incr", 1)
             
         logger.info(f"Hotspot {old_id} marcato come sostituito da {new_id}")
     except Exception as e:
         logger.error(f"Errore nel marcare hotspot sostituito: {e}")
+
+def acquire_lock(redis_conn, lock_name, timeout=30, retry_count=5, retry_delay=0.2):
+    """
+    Acquisisce un lock distribuito con retry
+    Utile per prevenire race condition durante il controllo duplicati
+    """
+    lock_key = f"locks:duplicate_check:{lock_name}"
+    lock_value = str(uuid.uuid4())
+    
+    for attempt in range(retry_count):
+        try:
+            # Tenta di acquisire il lock
+            acquired = redis_conn.set(lock_key, lock_value, nx=True, ex=timeout)
+            if acquired:
+                return lock_value
+                
+            # Aggiunge jitter al delay per evitare thundering herd
+            jitter = (0.5 + random.random()) * retry_delay
+            time.sleep(jitter * (attempt + 1))  # Backoff esponenziale
+            
+        except Exception as e:
+            logger.warning(f"Errore nell'acquisizione del lock {lock_name}: {e}")
+            time.sleep(retry_delay)
+    
+    logger.warning(f"Impossibile acquisire lock {lock_name} dopo {retry_count} tentativi")
+    return None
+
+def release_lock(redis_conn, lock_name, lock_value):
+    """Rilascia un lock distribuito in modo sicuro"""
+    lock_key = f"locks:duplicate_check:{lock_name}"
+    
+    try:
+        # Script Lua per rilascio sicuro (rilascia solo se il valore corrisponde)
+        release_script = """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('del', KEYS[1])
+        else
+            return 0
+        end
+        """
+        
+        # Registra ed esegui lo script
+        script = redis_conn.register_script(release_script)
+        script(keys=[lock_key], args=[lock_value])
+        
+    except Exception as e:
+        logger.error(f"Errore nel rilascio del lock {lock_name}: {e}")
 
 def process_sensor_data(data, redis_conn):
     """Processa dati dai sensori per dashboard"""
@@ -593,8 +926,11 @@ def process_analyzed_sensor_data(data, redis_conn):
     except Exception as e:
         logger.error(f"Errore processamento dati analisi sensore: {e}")
 
-def process_hotspot(data, redis_conn):
-    """Processa hotspot per dashboard con controllo duplicati integrato"""
+def process_hotspot(data, redis_conn, postgres_conn=None):
+    """
+    Processa hotspot per dashboard con controllo duplicati integrato
+    Implementa un sistema robusto di deduplicazione con lock distribuito
+    """
     try:
         # Assicurati che i contatori esistano
         init_redis_counters(redis_conn)
@@ -609,6 +945,14 @@ def process_hotspot(data, redis_conn):
         # Genera ID transazione univoco per operazioni idempotenti
         transaction_id = f"{hotspot_id}_{int(time.time() * 1000)}"
         
+        # Verifica se questo hotspot è già stato elaborato recentemente
+        already_processed_key = f"transactions:hotspot:{hotspot_id}"
+        already_processed = safe_redis_operation(redis_conn.exists, already_processed_key, default_value=False)
+        
+        if already_processed and not is_update:
+            logger.info(f"Hotspot {hotspot_id} già elaborato recentemente, ignoro per evitare duplicazioni")
+            return
+        
         # Ottieni lo status dell'hotspot, default a 'active'
         status = sanitize_value(data.get('status', 'active'))
         
@@ -622,34 +966,67 @@ def process_hotspot(data, redis_conn):
             logger.warning(f"Hotspot {hotspot_id} con location incompleta, saltato")
             return
         
-        # *** INIZIO CONTROLLO DUPLICATI ***
+        # *** CONTROLLO DUPLICATI ***
         # Solo per nuovi hotspot, non per aggiornamenti
         is_duplicate = False
-        if not is_update:
+        duplicate_of = None
+        
+        # Verifica se è già marcato come duplicato
+        if parent_hotspot_id or derived_from:
+            is_duplicate = True
+            duplicate_of = parent_hotspot_id or derived_from
+            logger.info(f"Hotspot {hotspot_id} già marcato come duplicato di {duplicate_of}")
+        elif not is_update:
             pollutant_type = data.get('pollutant_type', 'unknown')
-            similar_hotspot = find_similar_hotspot(location, pollutant_type, redis_conn)
             
-            if similar_hotspot and similar_hotspot != hotspot_id:
-                logger.info(f"[DUPLICATE CHECK] Hotspot duplicato rilevato: {hotspot_id} simile a {similar_hotspot}")
+            # Crea un lock name basato sulla posizione approssimativa per prevenire race condition
+            lat = float(location['center_latitude'])
+            lon = float(location['center_longitude'])
+            lat_bin = math.floor(lat * 10) / 10  # Arrotonda a 0.1 gradi (circa 11km)
+            lon_bin = math.floor(lon * 10) / 10
+            lock_name = f"{lat_bin}_{lon_bin}_{pollutant_type}"
+            
+            # Acquisisci lock per prevenire race condition
+            lock_value = None
+            try:
+                import random  # Solo per il jitter
+                lock_value = acquire_lock(redis_conn, lock_name)
+            except:
+                # Se fallisce l'importazione o l'acquisizione, continua senza lock
+                pass
+            
+            try:
+                # Cerca hotspot simile
+                similar_hotspot = find_similar_hotspot(location, pollutant_type, redis_conn, postgres_conn)
                 
-                # Decidi quale hotspot mantenere
-                keep_original = compare_hotspot_quality(similar_hotspot, data, redis_conn)
-                
-                if keep_original:
-                    # Mantieni l'hotspot originale, marca questo come derivato
-                    data["derived_from"] = similar_hotspot
-                    data["parent_hotspot_id"] = similar_hotspot
-                    is_duplicate = True
+                if similar_hotspot and similar_hotspot != hotspot_id:
+                    logger.info(f"[DUPLICATE CHECK] Hotspot duplicato rilevato: {hotspot_id} simile a {similar_hotspot}")
                     
-                    # Aggiungi al campo source_data dell'hotspot originale il riferimento a questo duplicato
-                    update_original_with_duplicate_info(similar_hotspot, hotspot_id, redis_conn)
+                    # Decidi quale hotspot mantenere
+                    keep_original = compare_hotspot_quality(similar_hotspot, data, redis_conn, postgres_conn)
                     
-                    logger.info(f"[DUPLICATE CHECK] Mantenuto hotspot originale {similar_hotspot}, marcato {hotspot_id} come derivato")
-                else:
-                    # Il nuovo è migliore, sostituisci l'originale
-                    mark_hotspot_replaced(similar_hotspot, hotspot_id, redis_conn)
-                    logger.info(f"[DUPLICATE CHECK] Sostituito hotspot {similar_hotspot} con {hotspot_id}")
-        # *** FINE CONTROLLO DUPLICATI ***
+                    if keep_original:
+                        # Mantieni l'hotspot originale, marca questo come derivato
+                        data["derived_from"] = similar_hotspot
+                        data["parent_hotspot_id"] = similar_hotspot
+                        is_duplicate = True
+                        duplicate_of = similar_hotspot
+                        
+                        # Aggiungi al campo source_data dell'hotspot originale il riferimento a questo duplicato
+                        update_original_with_duplicate_info(similar_hotspot, hotspot_id, redis_conn)
+                        
+                        logger.info(f"[DUPLICATE CHECK] Mantenuto hotspot originale {similar_hotspot}, marcato {hotspot_id} come derivato")
+                    else:
+                        # Il nuovo è migliore, sostituisci l'originale
+                        mark_hotspot_replaced(similar_hotspot, hotspot_id, redis_conn)
+                        logger.info(f"[DUPLICATE CHECK] Sostituito hotspot {similar_hotspot} con {hotspot_id}")
+            finally:
+                # Rilascia il lock se acquisito
+                if lock_value:
+                    release_lock(redis_conn, lock_name, lock_value)
+        
+        # Marca questo hotspot come elaborato per evitare duplicazioni
+        safe_redis_operation(redis_conn.setex, already_processed_key, TRANSACTION_TTL, "1")
         
         # Preparazione dati hotspot
         hotspot_data = {
@@ -664,7 +1041,8 @@ def process_hotspot(data, redis_conn):
             'max_risk_score': str(sanitize_value(data.get('max_risk_score', 0.0))),
             'point_count': str(sanitize_value(data.get('point_count', 1))),
             'is_update': 'true' if is_update else 'false',
-            'is_duplicate': 'true' if is_duplicate else 'false',  # Nuovo campo
+            'is_duplicate': 'true' if is_duplicate else 'false',
+            'duplicate_of': duplicate_of if duplicate_of else '',
             'original_id': sanitize_value(data.get('original_hotspot_id', '')),
             'parent_hotspot_id': parent_hotspot_id,
             'derived_from': derived_from,
@@ -692,6 +1070,15 @@ def process_hotspot(data, redis_conn):
             logger.warning(f"Errore nella verifica dell'esistenza dell'hotspot: {e}")
             # Assumiamo che sia nuovo in caso di errore
             is_new_entry = True
+        
+        # Verifica se era già un duplicato prima
+        was_duplicate = False
+        if not is_new_entry:
+            try:
+                is_duplicate_bytes = safe_redis_operation(redis_conn.hget, hkey, "is_duplicate")
+                was_duplicate = is_duplicate_bytes == b'true' or is_duplicate_bytes == 'true'
+            except Exception as e:
+                logger.warning(f"Errore nella verifica status duplicato: {e}")
         
         # Usa pipeline per operazioni atomiche
         with redis_conn.pipeline() as pipe:
@@ -726,7 +1113,7 @@ def process_hotspot(data, redis_conn):
             if old_status and old_status != status:
                 pipe.srem(f"dashboard:hotspots:by_status:{old_status}", hotspot_id)
             
-            # Set di duplicati (nuovo)
+            # Set di duplicati
             if is_duplicate:
                 pipe.sadd("dashboard:hotspots:duplicates", hotspot_id)
             else:
@@ -763,32 +1150,49 @@ def process_hotspot(data, redis_conn):
         # Aggiorna contatori (fuori dalla pipeline per gestire logica condizionale)
         try:
             # Utilizziamo l'operazione idempotente con transaction_id
-            # Non incrementare contatori per duplicati
-            if is_new_entry and not is_update and not is_duplicate:
-                # Nuovo hotspot (non update, non duplicato)
+            if is_new_entry and not is_update:
+                # Incrementa sempre il totale per nuovo hotspot
                 update_counter(redis_conn, "counters:hotspots:total", "incr", 1, transaction_id)
                 
-                if status == 'active':
-                    update_counter(redis_conn, "counters:hotspots:active", "incr", 1, transaction_id)
-                else:
-                    update_counter(redis_conn, "counters:hotspots:inactive", "incr", 1, transaction_id)
-                    
-                # Aggiorna contatore dei duplicati se necessario
+                # Incrementa attivi/inattivi in base allo stato, ma solo se non è un duplicato
+                if not is_duplicate:
+                    if status == 'active':
+                        update_counter(redis_conn, "counters:hotspots:active", "incr", 1, transaction_id)
+                    else:
+                        update_counter(redis_conn, "counters:hotspots:inactive", "incr", 1, transaction_id)
+                
+                # Incrementa contatore duplicati se è un duplicato
                 if is_duplicate:
                     update_counter(redis_conn, "counters:hotspots:duplicates", "incr", 1, transaction_id)
+                    
             elif old_status and old_status != status:
-                # Cambio di stato - aggiorna contatori relativi
-                if status == 'active':
-                    update_counter(redis_conn, "counters:hotspots:active", "incr", 1, transaction_id)
-                    update_counter(redis_conn, "counters:hotspots:inactive", "decr", 1, transaction_id)
+                # Cambio di stato - aggiorna contatori relativi, ma solo se non è un duplicato
+                if not is_duplicate and not was_duplicate:
+                    if status == 'active':
+                        update_counter(redis_conn, "counters:hotspots:active", "incr", 1, transaction_id)
+                        update_counter(redis_conn, "counters:hotspots:inactive", "decr", 1, transaction_id)
+                    else:
+                        update_counter(redis_conn, "counters:hotspots:inactive", "incr", 1, transaction_id)
+                        update_counter(redis_conn, "counters:hotspots:active", "decr", 1, transaction_id)
+            
+            # Gestione cambio status duplicato
+            if not is_new_entry and is_duplicate != was_duplicate:
+                if is_duplicate:
+                    # Diventa duplicato
+                    update_counter(redis_conn, "counters:hotspots:duplicates", "incr", 1, transaction_id)
+                    if status == 'active':
+                        # Rimuovi da attivi se era attivo
+                        update_counter(redis_conn, "counters:hotspots:active", "decr", 1, transaction_id)
                 else:
-                    update_counter(redis_conn, "counters:hotspots:inactive", "incr", 1, transaction_id)
-                    update_counter(redis_conn, "counters:hotspots:active", "decr", 1, transaction_id)
+                    # Non è più duplicato
+                    update_counter(redis_conn, "counters:hotspots:duplicates", "decr", 1, transaction_id)
+                    if status == 'active':
+                        # Aggiungi ad attivi se è attivo
+                        update_counter(redis_conn, "counters:hotspots:active", "incr", 1, transaction_id)
         except Exception as e:
             logger.warning(f"Errore aggiornamento contatori: {e}")
         
-        # Top hotspots - Mantieni solo i 10 più critici ordinati per severità e rischio
-        # Non includere duplicati nei top hotspots
+        # Top hotspots - Mantieni solo i 10 più critici, escludendo duplicati
         if not is_duplicate:
             try:
                 severity_score = {'low': 1, 'medium': 2, 'high': 3}
@@ -816,6 +1220,7 @@ def process_hotspot(data, redis_conn):
                         'detected_at': sanitize_value(data.get('detected_at', int(time.time() * 1000))),
                         'is_update': is_update,
                         'is_duplicate': is_duplicate,
+                        'duplicate_of': duplicate_of,
                         'parent_hotspot_id': parent_hotspot_id,
                         'derived_from': derived_from,
                         'status': status
@@ -823,6 +1228,16 @@ def process_hotspot(data, redis_conn):
                     safe_redis_operation(redis_conn.set, dashboard_hotspot_key(hotspot_id), hotspot_json, ex=HOTSPOT_METADATA_TTL)
             except Exception as e:
                 logger.warning(f"Errore salvataggio JSON per dashboard: {e}")
+        
+        # Rimuovi i duplicati dai top10 (per sicurezza)
+        try:
+            duplicates = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:duplicates", default_value=set())
+            if duplicates:
+                for dup_id in duplicates:
+                    dup_id_str = dup_id.decode('utf-8') if isinstance(dup_id, bytes) else dup_id
+                    safe_redis_operation(redis_conn.zrem, "dashboard:hotspots:top10", dup_id_str)
+        except Exception as e:
+            logger.warning(f"Errore nella pulizia dei duplicati da top10: {e}")
         
         logger.info(f"Aggiornato hotspot {hotspot_id} in Redis (update: {is_update}, status: {status}, new_entry: {is_new_entry}, duplicate: {is_duplicate})")
     except Exception as e:
@@ -852,14 +1267,18 @@ def process_prediction(data, redis_conn):
         is_duplicate = False
         try:
             duplicate_val = safe_redis_operation(redis_conn.hget, hotspot_key(hotspot_id), "is_duplicate")
-            is_duplicate = duplicate_val == "true" if duplicate_val else False
+            is_duplicate = duplicate_val == b"true" or duplicate_val == "true"
+            
+            # Se è un duplicato, cerca l'originale
+            if is_duplicate:
+                duplicate_of = safe_redis_operation(redis_conn.hget, hotspot_key(hotspot_id), "duplicate_of")
+                if duplicate_of:
+                    duplicate_of = duplicate_of.decode('utf-8') if isinstance(duplicate_of, bytes) else duplicate_of
+                    if duplicate_of:
+                        logger.info(f"Skip previsioni per hotspot duplicato {hotspot_id} (originale: {duplicate_of})")
+                        return
         except Exception:
             pass
-        
-        # Skip previsioni per hotspot marcati come duplicati
-        if is_duplicate:
-            logger.info(f"Skip previsioni per hotspot duplicato {hotspot_id}")
-            return
         
         # Usa pipeline per operazioni atomiche
         with redis_conn.pipeline() as pipe:
@@ -971,8 +1390,41 @@ def update_dashboard_summary(redis_conn):
         # Ottieni conteggi con gestione sicura dei valori nulli
         hotspots_active = 0
         try:
-            members = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:active", default_value=set())
-            hotspots_active = len(members)
+            # Conta gli hotspot attivi usando il contatore mantenuto
+            hotspots_active = int(safe_redis_operation(redis_conn.get, "counters:hotspots:active") or 0)
+            
+            # Verifica di sicurezza: confronta con il numero effettivo di membri del set
+            active_members = safe_redis_operation(redis_conn.scard, "dashboard:hotspots:active", default_value=0)
+            
+            # Se c'è una discrepanza significativa, esegui correzione
+            if abs(hotspots_active - active_members) > 5:
+                logger.warning(f"Discrepanza rilevata nei contatori hotspot: counter={hotspots_active}, set={active_members}")
+                
+                # Conta direttamente escludendo duplicati
+                non_duplicates = set()
+                
+                # Ottieni tutti gli hotspot attivi
+                members = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:active", default_value=set())
+                duplicates = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:duplicates", default_value=set())
+                
+                # Converti da bytes a string se necessario
+                duplicates_set = set()
+                for d in duplicates:
+                    if isinstance(d, bytes):
+                        duplicates_set.add(d.decode('utf-8'))
+                    else:
+                        duplicates_set.add(d)
+                
+                # Conta gli hotspot attivi che non sono duplicati
+                for m in members:
+                    member_str = m.decode('utf-8') if isinstance(m, bytes) else m
+                    if member_str not in duplicates_set:
+                        non_duplicates.add(member_str)
+                
+                # Aggiorna il contatore con il valore corretto
+                hotspots_active = len(non_duplicates)
+                safe_redis_operation(redis_conn.set, "counters:hotspots:active", hotspots_active)
+                logger.info(f"Contatore hotspot attivi corretto: {hotspots_active}")
         except Exception as e:
             logger.warning(f"Errore nel recupero degli hotspot attivi: {e}")
             
@@ -988,8 +1440,31 @@ def update_dashboard_summary(redis_conn):
         severity_counts = {}
         for severity in ["low", "medium", "high"]:
             try:
-                members = safe_redis_operation(redis_conn.smembers, f"dashboard:hotspots:by_severity:{severity}", default_value=set())
-                severity_counts[severity] = len(members)
+                # Ottieni membri del set di severità
+                severity_members = safe_redis_operation(redis_conn.smembers, f"dashboard:hotspots:by_severity:{severity}", default_value=set())
+                
+                # Ottieni duplicati
+                duplicates = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:duplicates", default_value=set())
+                
+                # Converti bytes a string
+                severity_set = set()
+                for m in severity_members:
+                    if isinstance(m, bytes):
+                        severity_set.add(m.decode('utf-8'))
+                    else:
+                        severity_set.add(m)
+                
+                duplicates_set = set()
+                for d in duplicates:
+                    if isinstance(d, bytes):
+                        duplicates_set.add(d.decode('utf-8'))
+                    else:
+                        duplicates_set.add(d)
+                
+                # Escludi i duplicati dal conteggio
+                non_duplicate_count = len(severity_set - duplicates_set)
+                severity_counts[severity] = non_duplicate_count
+                
             except Exception as e:
                 logger.warning(f"Errore nel recupero del conteggio per severità {severity}: {e}")
                 severity_counts[severity] = 0
@@ -997,15 +1472,32 @@ def update_dashboard_summary(redis_conn):
         # Conteggio duplicati
         duplicates_count = 0
         try:
-            duplicates_count = safe_redis_operation(redis_conn.scard, "dashboard:hotspots:duplicates", default_value=0)
+            duplicates_count = int(safe_redis_operation(redis_conn.get, "counters:hotspots:duplicates") or 0)
+            
+            # Verifica di sicurezza
+            duplicates_set = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:duplicates", default_value=set())
+            actual_count = len(duplicates_set)
+            
+            if abs(duplicates_count - actual_count) > 5:
+                logger.warning(f"Discrepanza rilevata nei contatori duplicati: counter={duplicates_count}, set={actual_count}")
+                duplicates_count = actual_count
+                safe_redis_operation(redis_conn.set, "counters:hotspots:duplicates", duplicates_count)
         except Exception as e:
             logger.warning(f"Errore nel recupero conteggio duplicati: {e}")
+        
+        # Conteggio deduplicazioni
+        deduplication_count = 0
+        try:
+            deduplication_count = int(safe_redis_operation(redis_conn.get, "counters:hotspots:deduplication") or 0)
+        except Exception as e:
+            logger.warning(f"Errore nel recupero conteggio deduplicazioni: {e}")
         
         # Crea hash summary
         summary = {
             'hotspots_count': hotspots_active,
             'alerts_count': alerts_active,
-            'duplicates_count': duplicates_count,  # Nuovo
+            'duplicates_count': duplicates_count,
+            'deduplication_count': deduplication_count,
             'severity_distribution': json.dumps(severity_counts),
             'updated_at': int(time.time() * 1000)
         }
@@ -1055,7 +1547,8 @@ def full_reconciliation(redis_conn, postgres_conn=None):
             "total": 0,
             "active": 0,
             "inactive": 0,
-            "duplicates": 0  # Nuovo contatore
+            "duplicates": 0,
+            "deduplication": 0
         }
         
         # 1.1 Conta dal database (fonte di verità)
@@ -1066,18 +1559,39 @@ def full_reconciliation(redis_conn, postgres_conn=None):
                     cur.execute("SELECT COUNT(*) FROM active_hotspots")
                     hotspot_counters["total"] = cur.fetchone()[0]
                     
-                    # Conteggio per stato
-                    cur.execute("SELECT COUNT(*) FROM active_hotspots WHERE severity != 'inactive'")
-                    hotspot_counters["active"] = cur.fetchone()[0]
-                    
-                    # Conteggio inattivi
-                    hotspot_counters["inactive"] = hotspot_counters["total"] - hotspot_counters["active"]
-                    
-                    # Conteggio duplicati (marcati in PostgreSQL)
-                    cur.execute("SELECT COUNT(*) FROM active_hotspots WHERE source_data::jsonb ? 'is_duplicate' AND source_data::jsonb->>'is_duplicate' = 'true'")
+                    # Conteggio duplicati
+                    cur.execute("""
+                        SELECT COUNT(*) FROM active_hotspots 
+                        WHERE (source_data::jsonb->>'is_duplicate')::text = 'true'
+                    """)
                     hotspot_counters["duplicates"] = cur.fetchone()[0]
                     
-                    logger.info(f"Contatori PostgreSQL: total={hotspot_counters['total']}, active={hotspot_counters['active']}, inactive={hotspot_counters['inactive']}, duplicates={hotspot_counters['duplicates']}")
+                    # Conteggio hotspot attivi non duplicati
+                    cur.execute("""
+                        SELECT COUNT(*) FROM active_hotspots 
+                        WHERE status = 'active' 
+                        AND ((source_data::jsonb->>'is_duplicate')::text IS NULL OR (source_data::jsonb->>'is_duplicate')::text != 'true')
+                    """)
+                    hotspot_counters["active"] = cur.fetchone()[0]
+                    
+                    # Conteggio inattivi (escludendo duplicati)
+                    cur.execute("""
+                        SELECT COUNT(*) FROM active_hotspots 
+                        WHERE status = 'inactive' 
+                        AND ((source_data::jsonb->>'is_duplicate')::text IS NULL OR (source_data::jsonb->>'is_duplicate')::text != 'true')
+                    """)
+                    hotspot_counters["inactive"] = cur.fetchone()[0]
+                    
+                    # Conteggio operazioni di deduplicazione
+                    cur.execute("""
+                        SELECT COUNT(*) FROM hotspot_evolution 
+                        WHERE event_type IN ('deduplication', 'merged', 'replaced')
+                    """)
+                    result = cur.fetchone()
+                    if result:
+                        hotspot_counters["deduplication"] = result[0]
+                    
+                    logger.info(f"Contatori PostgreSQL: total={hotspot_counters['total']}, active={hotspot_counters['active']}, inactive={hotspot_counters['inactive']}, duplicates={hotspot_counters['duplicates']}, deduplication={hotspot_counters['deduplication']}")
             except Exception as e:
                 logger.error(f"Errore nella query PostgreSQL per la riconciliazione: {e}")
                 # Fallback a conteggi Redis
@@ -1086,16 +1600,44 @@ def full_reconciliation(redis_conn, postgres_conn=None):
         if hotspot_counters["total"] == 0 and not postgres_conn:
             try:
                 # Conta da set Redis
-                active_members = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:active", default_value=set())
-                inactive_members = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:inactive", default_value=set())
-                duplicate_members = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:duplicates", default_value=set())
+                active_set = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:active", default_value=set())
+                inactive_set = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:inactive", default_value=set())
+                duplicates_set = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:duplicates", default_value=set())
                 
-                hotspot_counters["active"] = len(active_members)
-                hotspot_counters["inactive"] = len(inactive_members)
+                # Converti da bytes a string
+                active_members = set()
+                for m in active_set:
+                    member_str = m.decode('utf-8') if isinstance(m, bytes) else m
+                    active_members.add(member_str)
+                
+                inactive_members = set()
+                for m in inactive_set:
+                    member_str = m.decode('utf-8') if isinstance(m, bytes) else m
+                    inactive_members.add(member_str)
+                
+                duplicate_members = set()
+                for m in duplicates_set:
+                    member_str = m.decode('utf-8') if isinstance(m, bytes) else m
+                    duplicate_members.add(member_str)
+                
+                # Escludi duplicati dai conteggi attivo/inattivo
+                active_non_duplicate = active_members - duplicate_members
+                inactive_non_duplicate = inactive_members - duplicate_members
+                
+                hotspot_counters["active"] = len(active_non_duplicate)
+                hotspot_counters["inactive"] = len(inactive_non_duplicate)
                 hotspot_counters["duplicates"] = len(duplicate_members)
-                hotspot_counters["total"] = hotspot_counters["active"] + hotspot_counters["inactive"]
+                hotspot_counters["total"] = len(active_members.union(inactive_members))
                 
-                logger.info(f"Contatori Redis: total={hotspot_counters['total']}, active={hotspot_counters['active']}, inactive={hotspot_counters['inactive']}, duplicates={hotspot_counters['duplicates']}")
+                # Leggi contatore deduplicazione
+                dedup_count = safe_redis_operation(redis_conn.get, "counters:hotspots:deduplication")
+                if dedup_count:
+                    try:
+                        hotspot_counters["deduplication"] = int(dedup_count)
+                    except (ValueError, TypeError):
+                        pass
+                
+                logger.info(f"Contatori Redis: total={hotspot_counters['total']}, active={hotspot_counters['active']}, inactive={hotspot_counters['inactive']}, duplicates={hotspot_counters['duplicates']}, deduplication={hotspot_counters['deduplication']}")
             except Exception as e:
                 logger.error(f"Errore nel conteggio da Redis: {e}")
         
@@ -1105,6 +1647,7 @@ def full_reconciliation(redis_conn, postgres_conn=None):
             pipe.set("counters:hotspots:active", hotspot_counters["active"])
             pipe.set("counters:hotspots:inactive", hotspot_counters["inactive"])
             pipe.set("counters:hotspots:duplicates", hotspot_counters["duplicates"])
+            pipe.set("counters:hotspots:deduplication", hotspot_counters["deduplication"])
             pipe.execute()
         
         # 2. Riconciliazione contatori alerts
@@ -1138,6 +1681,24 @@ def full_reconciliation(redis_conn, postgres_conn=None):
         
         # Aggiorna contatore previsioni
         update_counter(redis_conn, "counters:predictions:total", "set", prediction_count)
+        
+        # 4. Verifica e correggi set Redis per rimuovere inconsistenze
+        try:
+            # Assicura che i duplicati non siano nei set attivi
+            duplicates = safe_redis_operation(redis_conn.smembers, "dashboard:hotspots:duplicates", default_value=set())
+            
+            if duplicates:
+                with redis_conn.pipeline() as pipe:
+                    for dup in duplicates:
+                        dup_str = dup.decode('utf-8') if isinstance(dup, bytes) else dup
+                        # Rimuovi dai set attivi
+                        pipe.srem("dashboard:hotspots:active", dup_str)
+                        # Rimuovi dai top10
+                        pipe.zrem("dashboard:hotspots:top10", dup_str)
+                    pipe.execute()
+                logger.info(f"Rimossi {len(duplicates)} duplicati dai set attivi")
+        except Exception as e:
+            logger.error(f"Errore nella rimozione dei duplicati dai set attivi: {e}")
         
         # Chiudi la connessione PostgreSQL se l'abbiamo creata qui
         if close_postgres and postgres_conn:
@@ -1184,7 +1745,7 @@ def main():
     # Inizializzazione di tutti i contatori Redis necessari
     init_redis_counters(redis_conn)
     
-    # Connessione PostgreSQL per riconciliazione completa
+    # Connessione PostgreSQL per riconciliazione completa e verifica duplicati
     postgres_conn = None
     try:
         postgres_conn = connect_postgres()
@@ -1232,7 +1793,7 @@ def main():
                 elif topic == ANALYZED_SENSOR_TOPIC:
                     process_analyzed_sensor_data(data, redis_conn)
                 elif topic == HOTSPOTS_TOPIC:
-                    process_hotspot(data, redis_conn)
+                    process_hotspot(data, redis_conn, postgres_conn)
                 elif topic == PREDICTIONS_TOPIC:
                     process_prediction(data, redis_conn)
                 

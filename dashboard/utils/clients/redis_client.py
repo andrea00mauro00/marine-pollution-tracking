@@ -1,117 +1,206 @@
-import os
+"""
+==============================================================================
+Marine Pollution Monitoring System - Enhanced Redis Client
+==============================================================================
+Client Redis con supporto per metriche, tracing e pattern di resilienza
+"""
+
 import logging
 import time
 import json
-import uuid
-import math
-from datetime import datetime, timedelta
-import redis
+import traceback
+from typing import Dict, Any, Optional, List, Set, Union, Callable
+
+# Aggiungi il percorso per i moduli comuni
+import sys
+sys.path.append('/opt/flink/usrlib')
+
+# Import common modules
+from common.observability_client import ObservabilityClient
+from common.resilience import retry, CircuitBreaker, safe_operation
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] %(asctime)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Inizializza client observability
+observability = ObservabilityClient(
+    service_name="redis_client",
+    enable_metrics=True,
+    enable_tracing=True,
+    enable_loki=True
+)
 
 class RedisClient:
-    """Redis data access layer for the Marine Pollution Dashboard"""
+    """Client Redis con supporto per resilienza e observability"""
     
-    def __init__(self, config=None):
-        """Initialize Redis connection with optional configuration"""
-        self.config = config or {}
-        self.host = self.config.get("REDIS_HOST", os.environ.get("REDIS_HOST", "redis"))
-        self.port = int(self.config.get("REDIS_PORT", os.environ.get("REDIS_PORT", 6379)))
-        self.db = int(self.config.get("REDIS_DB", os.environ.get("REDIS_DB", 0)))
-        self.password = self.config.get("REDIS_PASSWORD", os.environ.get("REDIS_PASSWORD", None))
+    def __init__(
+        self, 
+        host: str = 'redis', 
+        port: int = 6379, 
+        db: int = 0, 
+        password: Optional[str] = None,
+        socket_timeout: int = 5,
+        retry_on_timeout: bool = True,
+        connection_pool_size: int = 10
+    ):
+        self.host = host
+        self.port = port
+        self.db = db
+        self.password = password
+        self.socket_timeout = socket_timeout
+        self.retry_on_timeout = retry_on_timeout
+        self.connection_pool_size = connection_pool_size
         self.conn = None
-        self.max_retries = 5
-        self.retry_interval = 3  # seconds
         
-        # Default TTL values
-        self.ttl = {
-            "sensor_data": 3600,       # 1 hour
-            "hotspot_metadata": 86400,  # 24 hours
-            "alerts": 3600,            # 1 hour
-            "predictions": 7200,       # 2 hours
-            "spatial_index": 1800,     # 30 minutes
-            "dashboard_summary": 300   # 5 minutes
-        }
+        # Inizializza circuit breaker per Redis
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=30.0,
+            name="redis_connection"
+        )
         
-        # Spatial grid size
-        self.GRID_SIZE_DEG = 0.05  # ~5km at equator
-        
+        # Avvia connessione
         self.connect()
     
+    @observability.track_function_execution()
     def connect(self):
-        """Connect to Redis with retry logic"""
-        for attempt in range(self.max_retries):
-            try:
-                self.conn = redis.Redis(
-                    host=self.host,
-                    port=self.port,
-                    db=self.db,
-                    password=self.password,
-                    decode_responses=True,  # Auto-decode bytes to strings
-                    socket_timeout=5,
-                    socket_connect_timeout=5
-                )
-                self.conn.ping()
-                logging.info("Connected to Redis")
+        """Connect to Redis server"""
+        try:
+            import redis
+            
+            # Record connection attempt
+            observability.record_business_event("redis_connection_attempt")
+            
+            # Create connection pool
+            pool = redis.ConnectionPool(
+                host=self.host,
+                port=self.port,
+                db=self.db,
+                password=self.password,
+                socket_timeout=self.socket_timeout,
+                socket_connect_timeout=self.socket_timeout,
+                retry_on_timeout=self.retry_on_timeout,
+                max_connections=self.connection_pool_size,
+                decode_responses=True
+            )
+            
+            self.conn = redis.Redis(connection_pool=pool)
+            
+            # Verifica connessione
+            if self.conn.ping():
+                observability.update_component_status("redis_connection", True)
+                logger.info(f"Connected to Redis at {self.host}:{self.port} (db={self.db})")
                 return True
-            except Exception as e:
-                if attempt < self.max_retries - 1:
-                    logging.warning(f"Redis connection attempt {attempt+1}/{self.max_retries} failed: {e}")
-                    time.sleep(self.retry_interval)
-                else:
-                    logging.error(f"Failed to connect to Redis after {self.max_retries} attempts: {e}")
-                    raise
-        return False
+            else:
+                observability.update_component_status("redis_connection", False)
+                observability.record_error("redis_connection_failed", "ping_failed")
+                logger.error("Failed to connect to Redis (ping failed)")
+                return False
+                
+        except Exception as e:
+            observability.update_component_status("redis_connection", False)
+            observability.record_error("redis_connection_failed", exception=e)
+            logger.error(f"Error connecting to Redis: {e}")
+            return False
     
-    def reconnect(self):
-        """Reconnect to Redis if connection is lost"""
-        if self.conn:
-            try:
-                self.conn.close()
-            except:
-                pass
-        return self.connect()
-    
+    @observability.track_function_execution()
     def is_connected(self):
         """Check if connection to Redis is active"""
         if not self.conn:
             return False
         
         try:
-            return self.conn.ping()
+            with observability.start_span("redis_ping"):
+                return self.conn.ping()
         except Exception:
+            observability.update_component_status("redis_connection", False)
             return False
     
+    @observability.track_function_execution()
+    def reconnect(self):
+        """Reconnect to Redis if connection is lost"""
+        observability.record_business_event("redis_reconnect_attempt")
+        
+        try:
+            if self.conn:
+                self.conn.close()
+                self.conn = None
+        except:
+            pass
+        
+        return self.connect()
+    
+    @observability.track_function_execution()
     def close(self):
         """Close the Redis connection"""
         if self.conn:
-            self.conn.close()
-            self.conn = None
+            try:
+                self.conn.close()
+                self.conn = None
+                logger.info("Redis connection closed")
+            except Exception as e:
+                observability.record_error("redis_close_error", exception=e)
+                logger.warning(f"Error closing Redis connection: {e}")
     
-    def safe_operation(self, func, *args, default_value=None, log_error=True, **kwargs):
+    @observability.track_function_execution()
+    def safe_operation(
+        self, 
+        func: Callable, 
+        *args, 
+        default_value: Any = None, 
+        log_error: bool = True, 
+        operation_name: Optional[str] = None,
+        **kwargs
+    ):
         """Execute a Redis operation safely, handling exceptions"""
+        # Determina nome operazione per metriche e log
+        op_name = operation_name or func.__name__
+        
+        # Verifica connessione
         if not self.is_connected() and not self.reconnect():
             if log_error:
-                logging.error("Cannot connect to Redis")
+                logger.error("Cannot connect to Redis")
+            observability.record_error("redis_operation_error", f"connection_failed_{op_name}")
             return default_value
         
-        try:
-            # Convert None values to empty strings for Redis operations
+        # Usa il circuit breaker per proteggere l'operazione
+        @self.circuit_breaker
+        def execute_redis_operation():
+            # Converti None in stringhe vuote per Redis
             args_list = list(args)
             for i in range(len(args_list)):
                 if args_list[i] is None:
                     args_list[i] = ''
             
-            result = func(*args_list, **kwargs)
+            # Esegui operazione
+            with observability.start_span(f"redis_{op_name}") as span:
+                span.set_attribute("redis.operation", op_name)
+                span.set_attribute("redis.args_count", len(args))
+                
+                result = func(*args_list, **kwargs)
+                return result
+        
+        try:
+            # Esegui operazione con circuit breaker
+            result = execute_redis_operation()
             return result if result is not None else default_value
         except Exception as e:
             if log_error:
-                logging.warning(f"Error in Redis operation {func.__name__}: {e}")
+                logger.warning(f"Error in Redis operation {op_name}: {e}")
+            observability.record_error("redis_operation_error", f"{op_name}_failed", e)
             return default_value
     
     #
     # SENSOR DATA METHODS
     #
     
-    def get_sensor_data(self, sensor_id):
+    @observability.track_function_execution()
+    def get_sensor_data(self, sensor_id: str) -> Dict[str, Any]:
         """Get latest data for a specific sensor"""
         sensor_key = f"sensors:latest:{sensor_id}"
         data = self.safe_operation(self.conn.hgetall, sensor_key)
@@ -133,464 +222,282 @@ class RedisClient:
         
         return data
     
-    def get_active_sensors(self):
+    @observability.track_function_execution()
+    def get_active_sensors(self) -> Set[str]:
         """Get list of all active sensors"""
         return self.safe_operation(self.conn.smembers, "dashboard:sensors:active")
     
-    def get_sensors_by_pollution_level(self, level):
+    @observability.track_function_execution()
+    def get_sensors_by_pollution_level(self, level: str) -> Set[str]:
         """Get sensors with a specific pollution level"""
-        if level not in ['low', 'medium', 'high']:
-            raise ValueError("Pollution level must be one of: low, medium, high")
-        
         return self.safe_operation(self.conn.smembers, f"dashboard:sensors:by_level:{level}")
     
     #
     # HOTSPOT METHODS
     #
     
-    def get_hotspot_data(self, hotspot_id):
-        """Get data for a specific hotspot"""
-        hotspot_key = f"hotspot:{hotspot_id}"
-        data = self.safe_operation(self.conn.hgetall, hotspot_key)
+    @observability.track_function_execution()
+    def get_hotspot(self, hotspot_id: str) -> Dict[str, Any]:
+        """Get hotspot details"""
+        # Get base hotspot data
+        key = f"hotspot:{hotspot_id}"
+        hotspot_data = self.safe_operation(self.conn.hgetall, key)
         
-        # Convert numeric strings to appropriate types
-        if data:
-            for key in ['center_latitude', 'center_longitude', 'radius_km', 'avg_risk_score', 'max_risk_score', 'update_count']:
-                if key in data and data[key]:
-                    try:
-                        data[key] = float(data[key])
-                    except (ValueError, TypeError):
-                        pass
-            
-            # Convert boolean strings
-            for key in ['is_update']:
-                if key in data:
-                    data[key] = data[key].lower() == 'true'
-            
-            # Convert timestamp
-            if 'detected_at' in data and data['detected_at']:
+        if not hotspot_data:
+            return None
+        
+        # Convert numeric values
+        for field in ['center_latitude', 'center_longitude', 'radius_km', 'confidence', 'risk_score']:
+            if field in hotspot_data:
                 try:
-                    data['detected_at'] = int(data['detected_at'])
+                    hotspot_data[field] = float(hotspot_data[field])
                 except (ValueError, TypeError):
                     pass
         
-        return data
+        # Convert timestamps
+        for field in ['detected_at', 'updated_at', 'expires_at']:
+            if field in hotspot_data:
+                try:
+                    hotspot_data[field] = int(hotspot_data[field])
+                except (ValueError, TypeError):
+                    pass
+        
+        # Get metadata if available
+        metadata_key = f"hotspot:{hotspot_id}:metadata"
+        metadata = self.safe_operation(self.conn.hgetall, metadata_key)
+        if metadata:
+            hotspot_data['metadata'] = metadata
+        
+        return hotspot_data
     
-    def get_active_hotspots(self):
+    @observability.track_function_execution()
+    def get_active_hotspots(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Get all active hotspots"""
-        return self.safe_operation(self.conn.smembers, "dashboard:hotspots:active")
-    
-    def get_hotspots_by_severity(self, severity):
-        """Get hotspots with a specific severity level"""
-        if severity not in ['low', 'medium', 'high']:
-            raise ValueError("Severity must be one of: low, medium, high")
-        
-        return self.safe_operation(self.conn.smembers, f"dashboard:hotspots:by_severity:{severity}")
-    
-    def get_hotspots_by_type(self, pollutant_type):
-        """Get hotspots with a specific pollutant type"""
-        return self.safe_operation(self.conn.smembers, f"dashboard:hotspots:by_type:{pollutant_type}")
-    
-    def get_hotspots_by_status(self, status):
-        """Get hotspots with a specific status"""
-        if status not in ['active', 'inactive', 'archived']:
-            raise ValueError("Status must be one of: active, inactive, archived")
-        
-        return self.safe_operation(self.conn.smembers, f"dashboard:hotspots:by_status:{status}")
-    
-    def get_top_hotspots(self, limit=10):
-        """Get top hotspots by severity and risk score"""
-        hotspot_ids = self.safe_operation(self.conn.zrevrange, "dashboard:hotspots:top10", 0, limit-1, withscores=True)
+        # Get hotspot IDs from sorted set (newest first)
+        hotspot_ids = self.safe_operation(
+            self.conn.zrevrange, 
+            "dashboard:hotspots:active", 
+            0, 
+            limit - 1
+        )
         
         if not hotspot_ids:
             return []
         
+        # Get details for each hotspot
         hotspots = []
-        for hotspot_id, score in hotspot_ids:
-            hotspot_json = self.safe_operation(self.conn.get, f"dashboard:hotspot:{hotspot_id}")
-            if hotspot_json:
-                try:
-                    hotspot_data = json.loads(hotspot_json)
-                    hotspot_data['composite_score'] = score
-                    hotspots.append(hotspot_data)
-                except json.JSONDecodeError:
-                    logging.warning(f"Invalid JSON for hotspot {hotspot_id}")
+        for hotspot_id in hotspot_ids:
+            hotspot = self.get_hotspot(hotspot_id)
+            if hotspot:
+                hotspots.append(hotspot)
         
         return hotspots
     
-    def get_hotspots_in_area(self, min_lat, min_lon, max_lat, max_lon, status=None):
-        """Get hotspots within a geographic bounding box"""
-        # Calculate grid cells that cover the area
-        min_lat_bin = math.floor(min_lat / self.GRID_SIZE_DEG)
-        max_lat_bin = math.ceil(max_lat / self.GRID_SIZE_DEG)
-        min_lon_bin = math.floor(min_lon / self.GRID_SIZE_DEG)
-        max_lon_bin = math.ceil(max_lon / self.GRID_SIZE_DEG)
+    @observability.track_function_execution()
+    def get_hotspots_by_severity(self, severity: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get hotspots with a specific severity level"""
+        # Get hotspot IDs from set
+        hotspot_ids = self.safe_operation(
+            self.conn.srandmember, 
+            f"dashboard:hotspots:by_severity:{severity}", 
+            limit
+        )
         
-        # Set for deduplication
-        found_ids = set()
+        if not hotspot_ids:
+            return []
         
-        # Check each spatial bin
-        for lat_bin in range(min_lat_bin, max_lat_bin + 1):
-            for lon_bin in range(min_lon_bin, max_lon_bin + 1):
-                bin_key = f"spatial:{lat_bin}:{lon_bin}"
-                ids = self.safe_operation(self.conn.smembers, bin_key)
-                
-                for hotspot_id in ids:
-                    # Skip if already found
-                    if hotspot_id in found_ids:
-                        continue
-                    
-                    # Verify it's a hotspot (not an alert)
-                    if self.safe_operation(self.conn.exists, f"hotspot:{hotspot_id}"):
-                        # Filter by status if specified
-                        if status:
-                            h_status = self.safe_operation(self.conn.hget, f"hotspot:{hotspot_id}", "status")
-                            if h_status != status:
-                                continue
-                        
-                        found_ids.add(hotspot_id)
-        
-        # Get data for all found hotspots
+        # Get details for each hotspot
         hotspots = []
-        for hotspot_id in found_ids:
-            hotspot_data = self.get_hotspot_data(hotspot_id)
-            if hotspot_data:
-                hotspots.append(hotspot_data)
+        for hotspot_id in hotspot_ids:
+            hotspot = self.get_hotspot(hotspot_id)
+            if hotspot:
+                hotspots.append(hotspot)
         
         return hotspots
-    
-    #
-    # PREDICTION METHODS
-    #
-    
-    def get_prediction(self, prediction_id):
-        """Get a specific prediction"""
-        prediction_key = f"dashboard:prediction:{prediction_id}"
-        prediction_json = self.safe_operation(self.conn.get, prediction_key)
-        
-        if prediction_json:
-            try:
-                return json.loads(prediction_json)
-            except json.JSONDecodeError:
-                logging.warning(f"Invalid JSON for prediction {prediction_id}")
-        
-        return None
-    
-    def get_predictions_for_hotspot(self, hotspot_id):
-        """Get all predictions for a specific hotspot"""
-        # Get the latest prediction set ID
-        prediction_set_id = self.safe_operation(
-            self.conn.get, 
-            f"dashboard:predictions:latest_set:{hotspot_id}"
-        )
-        
-        if not prediction_set_id:
-            return []
-        
-        # Get all prediction IDs for this set
-        prediction_ids = self.safe_operation(
-            self.conn.zrange, 
-            f"dashboard:predictions:for_hotspot:{hotspot_id}", 
-            0, -1
-        )
-        
-        if not prediction_ids:
-            return []
-        
-        # Get prediction data for each ID
-        predictions = []
-        for pred_id in prediction_ids:
-            prediction_data = self.get_prediction(pred_id)
-            if prediction_data:
-                predictions.append(prediction_data)
-        
-        # Sort by hours_ahead
-        predictions.sort(key=lambda x: x.get('hours_ahead', 0))
-        
-        return predictions
-    
-    def get_risk_zones(self, hours):
-        """Get risk zones for a specific time horizon"""
-        if hours not in [6, 12, 24, 48]:
-            raise ValueError("Hours must be one of: 6, 12, 24, 48")
-        
-        zone_ids = self.safe_operation(self.conn.smembers, f"dashboard:risk_zones:{hours}h")
-        
-        if not zone_ids:
-            return []
-        
-        zones = []
-        for zone_id in zone_ids:
-            zone_data = self.safe_operation(self.conn.hgetall, f"dashboard:risk_zone:{zone_id}")
-            if zone_data:
-                # Convert numeric fields
-                for key in ['latitude', 'longitude', 'radius_km']:
-                    if key in zone_data and zone_data[key]:
-                        try:
-                            zone_data[key] = float(zone_data[key])
-                        except (ValueError, TypeError):
-                            pass
-                
-                if 'prediction_time' in zone_data and zone_data['prediction_time']:
-                    try:
-                        zone_data['prediction_time'] = int(zone_data['prediction_time'])
-                    except (ValueError, TypeError):
-                        pass
-                
-                zones.append(zone_data)
-        
-        return zones
     
     #
     # ALERT METHODS
     #
     
-    def get_alert(self, alert_id):
-        """Get a specific alert"""
-        alert_key = f"alert:{alert_id}"
-        return self.safe_operation(self.conn.hgetall, alert_key)
-    
-    def get_active_alerts(self, limit=20):
-        """Get most recent active alerts"""
-        alert_ids = self.safe_operation(self.conn.zrevrange, "dashboard:alerts:active", 0, limit-1, withscores=True)
+    @observability.track_function_execution()
+    def get_active_alerts(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get active alerts"""
+        # Get alert IDs from sorted set (newest first)
+        alert_ids = self.safe_operation(
+            self.conn.zrevrange, 
+            "dashboard:alerts:active", 
+            0, 
+            limit - 1
+        )
         
         if not alert_ids:
             return []
         
+        # Get details for each alert
         alerts = []
-        for alert_id, timestamp in alert_ids:
-            alert_data = self.get_alert(alert_id)
-            if alert_data:
-                alert_data['timestamp'] = timestamp
-                alerts.append(alert_data)
-        
-        return alerts
-    
-    def get_alerts_by_severity(self, severity, limit=20):
-        """Get alerts with a specific severity level"""
-        if severity not in ['low', 'medium', 'high']:
-            raise ValueError("Severity must be one of: low, medium, high")
-        
-        alert_ids = self.safe_operation(self.conn.smembers, f"dashboard:alerts:by_severity:{severity}")
-        
-        if not alert_ids:
-            return []
-        
-        # Get timestamps for sorting
-        alerts_with_time = []
         for alert_id in alert_ids:
-            timestamp = self.safe_operation(self.conn.zscore, "dashboard:alerts:active", alert_id)
-            if timestamp:
-                alerts_with_time.append((alert_id, timestamp))
-        
-        # Sort by timestamp (newest first) and limit
-        alerts_with_time.sort(key=lambda x: x[1], reverse=True)
-        alerts_with_time = alerts_with_time[:limit]
-        
-        # Get alert data
-        alerts = []
-        for alert_id, timestamp in alerts_with_time:
-            alert_data = self.get_alert(alert_id)
+            alert_key = f"alert:{alert_id}"
+            alert_data = self.safe_operation(self.conn.hgetall, alert_key)
+            
             if alert_data:
-                alert_data['timestamp'] = timestamp
+                # Convert numeric values
+                for field in ['severity_level', 'risk_score']:
+                    if field in alert_data:
+                        try:
+                            alert_data[field] = float(alert_data[field])
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Convert timestamps
+                for field in ['created_at', 'updated_at', 'expires_at']:
+                    if field in alert_data:
+                        try:
+                            alert_data[field] = int(alert_data[field])
+                        except (ValueError, TypeError):
+                            pass
+                
                 alerts.append(alert_data)
         
         return alerts
     
-    def get_recommendations(self, alert_id):
-        """Get recommendations for a specific alert"""
-        recommendations_key = f"recommendations:{alert_id}"
-        recommendations_json = self.safe_operation(self.conn.get, recommendations_key)
+    @observability.track_function_execution()
+    def get_recommendations(self, alert_id: str) -> Dict[str, Any]:
+        """Get recommendations for an alert"""
+        key = f"alert:{alert_id}:recommendations"
+        recommendations_json = self.safe_operation(self.conn.get, key)
         
-        if recommendations_json:
-            try:
-                return json.loads(recommendations_json)
-            except json.JSONDecodeError:
-                logging.warning(f"Invalid JSON for recommendations {alert_id}")
-        
-        # Fallback: prova a recuperare dall'hash dell'alert
-        alert_key = f"alert:{alert_id}"
-        rec_field = self.safe_operation(self.conn.hget, alert_key, "recommendations")
-        if rec_field:
-            try:
-                return json.loads(rec_field)
-            except json.JSONDecodeError:
-                pass
-        
-        return None
-    
-    def get_recent_notifications(self, limit=10):
-        """Get recent notifications for the dashboard"""
-        notifications_json = self.safe_operation(self.conn.lrange, "dashboard:notifications", 0, limit-1)
-        
-        if not notifications_json:
-            return []
-        
-        notifications = []
-        for notification_str in notifications_json:
-            try:
-                notification = json.loads(notification_str)
-                notifications.append(notification)
-            except json.JSONDecodeError:
-                logging.warning("Invalid JSON in notification")
-        
-        return notifications
-    
-    #
-    # SUMMARY AND COUNTERS
-    #
-
-    def get_dashboard_summary2(self):
-        summary = self.safe_operation(self.conn.hgetall, "dashboard:summary")
-
-        # fallback se la chiave è vuota
-        if not summary:
-            summary = self.safe_operation(self.conn.hgetall, "dashboard:metrics")
-
-            # ricostruisci 'severity_distribution' se serve
-            if summary:
-                summary["severity_distribution"] = json.dumps({
-                    "high": int(summary.get("alerts_high", 0)),
-                    "medium": int(summary.get("alerts_medium", 0)),
-                    "low": int(summary.get("alerts_low", 0)),
-                })
-        
-    
-    def get_dashboard_summary(self):
-        """Get dashboard summary information"""
-        summary = self.safe_operation(self.conn.hgetall, "dashboard:summary")
-        
-        # Convert numeric and JSON fields
-        if summary:
-            for key in ['hotspots_count', 'alerts_count', 'updated_at']:
-                if key in summary and summary[key]:
-                    try:
-                        summary[key] = int(summary[key])
-                    except (ValueError, TypeError):
-                        pass
-            
-            if 'severity_distribution' in summary and summary['severity_distribution']:
-                try:
-                    summary['severity_distribution'] = json.loads(summary['severity_distribution'])
-                except json.JSONDecodeError:
-                    summary['severity_distribution'] = {}
-        
-        return summary
-    
-    def get_counters(self):
-        """Get all system counters"""
-        counters = {}
-        
-        # Hotspot counters
-        counters['hotspots'] = {
-            'total': int(self.safe_operation(self.conn.get, "counters:hotspots:total") or 0),
-            'active': int(self.safe_operation(self.conn.get, "counters:hotspots:active") or 0),
-            'inactive': int(self.safe_operation(self.conn.get, "counters:hotspots:inactive") or 0)
-        }
-        
-        # Alert counters
-        counters['alerts'] = {
-            'total': int(self.safe_operation(self.conn.get, "counters:alerts:total") or 0),
-            'active': int(self.safe_operation(self.conn.get, "counters:alerts:active") or 0),
-            'high': int(self.safe_operation(self.conn.get, "counters:alerts:by_severity:high") or 0),
-            'medium': int(self.safe_operation(self.conn.get, "counters:alerts:by_severity:medium") or 0),
-            'low': int(self.safe_operation(self.conn.get, "counters:alerts:by_severity:low") or 0)
-        }
-        
-        # Prediction counters
-        counters['predictions'] = {
-            'total': int(self.safe_operation(self.conn.get, "counters:predictions:total") or 0)
-        }
-        
-        return counters
-    
-    #
-    # LOCK METHODS
-    #
-    
-    def acquire_lock(self, lock_name, ttl=10, retry_count=3, retry_delay=0.1):
-        """Acquire a distributed lock"""
-        # Generate unique ID for this lock
-        lock_value = str(uuid.uuid4())
-        lock_key = f"locks:hotspot:{lock_name}"
-        
-        # Try to acquire the lock
-        for attempt in range(retry_count):
-            acquired = self.safe_operation(
-                self.conn.set, 
-                lock_key, 
-                lock_value, 
-                nx=True, 
-                ex=ttl
-            )
-            
-            if acquired:
-                return lock_value
-            
-            # Wait before retrying
-            if attempt < retry_count - 1:
-                time.sleep(retry_delay)
-        
-        # Increment contention counter
-        self.safe_operation(self.conn.incr, "perf:lock_contention:hotspot")
-        
-        return None
-    
-    def release_lock(self, lock_name, lock_value):
-        """Release a distributed lock using Lua script"""
-        lock_key = f"locks:hotspot:{lock_name}"
-        
-        # Get the release lock script
-        script_str = self.safe_operation(self.conn.get, "scripts:release_lock")
-        
-        if not script_str:
-            # Fallback implementation if script not found
-            current_value = self.safe_operation(self.conn.get, lock_key)
-            if current_value == lock_value:
-                return self.safe_operation(self.conn.delete, lock_key)
-            return False
-        
-        # Register and execute the script
-        script = self.conn.register_script(script_str)
-        return script(keys=[lock_key], args=[lock_value])
-    
-    def with_lock(self, lock_name, callback, ttl=10, retry_count=3, retry_delay=0.1):
-        """Execute a function with a distributed lock"""
-        lock_value = self.acquire_lock(lock_name, ttl, retry_count, retry_delay)
-        
-        if not lock_value:
+        if not recommendations_json:
             return None
         
         try:
-            return callback()
-        finally:
-            self.release_lock(lock_name, lock_value)
+            return json.loads(recommendations_json)
+        except json.JSONDecodeError:
+            observability.record_error("json_parse_error", "recommendations")
+            return None
     
     #
-    # UTILITIES
+    # PREDICTION METHODS
     #
     
-    def calculate_distance(self, lat1, lon1, lat2, lon2):
-        """Calculate distance in km between two points using Haversine formula"""
-        # Convert to floats for safety
-        lat1, lon1, lat2, lon2 = float(lat1), float(lon1), float(lat2), float(lon2)
+    @observability.track_function_execution()
+    def get_predictions_for_hotspot(self, hotspot_id: str) -> List[Dict[str, Any]]:
+        """Get predictions for a specific hotspot"""
+        # Get prediction set IDs from sorted set (newest first)
+        prediction_set_ids = self.safe_operation(
+            self.conn.zrevrange, 
+            f"hotspot:{hotspot_id}:prediction_sets", 
+            0, 
+            5  # Get the 5 most recent prediction sets
+        )
         
-        # Earth radius in km
-        R = 6371.0
+        if not prediction_set_ids:
+            return []
         
-        # Convert to radians
-        lat1_rad = math.radians(lat1)
-        lon1_rad = math.radians(lon1)
-        lat2_rad = math.radians(lat2)
-        lon2_rad = math.radians(lon2)
+        # Get the newest prediction set
+        newest_prediction_set_id = prediction_set_ids[0]
+        prediction_key = f"prediction_set:{newest_prediction_set_id}"
         
-        # Differences
-        dlon = lon2_rad - lon1_rad
-        dlat = lat2_rad - lat1_rad
+        # Get prediction metadata
+        metadata = self.safe_operation(self.conn.hgetall, prediction_key)
+        if not metadata:
+            return []
         
-        # Haversine formula
-        a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        # Get individual predictions
+        predictions = []
+        for hours in [6, 12, 24, 48]:
+            prediction_id = f"{newest_prediction_set_id}_{hours}h"
+            prediction_data_key = f"prediction:{prediction_id}"
+            prediction_data = self.safe_operation(self.conn.hgetall, prediction_data_key)
+            
+            if prediction_data:
+                # Convert numeric values
+                for field in ['confidence', 'center_latitude', 'center_longitude', 'radius_km', 'risk_score']:
+                    if field in prediction_data:
+                        try:
+                            prediction_data[field] = float(prediction_data[field])
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Convert timestamps
+                for field in ['created_at', 'predicted_for']:
+                    if field in prediction_data:
+                        try:
+                            prediction_data[field] = int(prediction_data[field])
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Add hours ahead
+                prediction_data['hours_ahead'] = hours
+                
+                # Get remediation if available
+                remediation_key = f"prediction:{prediction_id}:remediation"
+                remediation_json = self.safe_operation(self.conn.get, remediation_key)
+                if remediation_json:
+                    prediction_data['remediation_json'] = remediation_json
+                
+                predictions.append(prediction_data)
         
-        # Distance in km
-        return R * c
+        return predictions
+    
+    #
+    # DASHBOARD METHODS
+    #
+    
+    @observability.track_function_execution()
+    def get_dashboard_summary(self) -> Dict[str, Any]:
+        """Get summary statistics for dashboard"""
+        summary = self.safe_operation(self.conn.hgetall, "dashboard:summary")
+        
+        if not summary:
+            return {
+                'hotspots_count': 0,
+                'alerts_count': 0,
+                'severity_distribution': json.dumps({'low': 0, 'medium': 0, 'high': 0}),
+                'updated_at': int(time.time() * 1000)
+            }
+        
+        # Convert numeric values
+        for field in ['hotspots_count', 'alerts_count', 'updated_at']:
+            if field in summary:
+                try:
+                    summary[field] = int(summary[field])
+                except (ValueError, TypeError):
+                    pass
+        
+        return summary
+    
+    #
+    # TRANSACTION SUPPORT
+    #
+    
+    @observability.track_function_execution()
+    def transaction(self):
+        """Get a transaction object"""
+        if not self.is_connected() and not self.reconnect():
+            observability.record_error("redis_transaction_error", "connection_failed")
+            logger.error("Cannot connect to Redis for transaction")
+            return None
+        
+        try:
+            return self.conn.pipeline(transaction=True)
+        except Exception as e:
+            observability.record_error("redis_transaction_error", "pipeline_creation_failed", e)
+            logger.error(f"Error creating Redis transaction: {e}")
+            return None
+    
+    @observability.track_function_execution()
+    def execute_transaction(self, pipeline):
+        """Execute a transaction pipeline"""
+        if not pipeline:
+            return None
+        
+        try:
+            with observability.start_span("redis_transaction") as span:
+                # Esegui la transazione
+                result = pipeline.execute()
+                span.set_attribute("redis.transaction.commands", len(result))
+                return result
+        except Exception as e:
+            observability.record_error("redis_transaction_error", "execution_failed", e)
+            logger.error(f"Error executing Redis transaction: {e}")
+            return None

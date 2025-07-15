@@ -1,0 +1,67 @@
+apiVersion: 1
+
+datasources:
+  # Prometheus
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      exemplarTraceIdDestinations:
+        - name: traceID
+          datasourceUid: tempo
+
+  # Loki
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: "traceID=(\\w+)"
+          name: TraceID
+          url: "$${__value.raw}"
+
+  # Tempo (tracing)
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      httpMethod: GET
+      tracesToLogs:
+        datasourceUid: loki
+        tags: ['job', 'instance', 'pod', 'namespace']
+        mappedTags: [{ key: 'service.name', value: 'service' }]
+        mapTagNamesEnabled: false
+
+  # PostgreSQL
+  - name: PostgreSQL
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: marine_pollution
+    user: postgres
+    secureJsonData:
+      password: postgres
+    jsonData:
+      sslmode: 'disable'
+      maxOpenConns: 100
+      maxIdleConns: 100
+      maxIdleConnsAuto: true
+      connMaxLifetime: 14400
+      postgresVersion: 1200
+      timescaledb: true
+
+  # Redis
+  - name: Redis
+    type: redis-datasource
+    access: proxy
+    url: redis://redis:6379
+    editable: false

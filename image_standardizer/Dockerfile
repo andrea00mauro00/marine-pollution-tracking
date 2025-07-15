@@ -15,8 +15,12 @@ RUN JAVA_DIR=$(dirname $(dirname $(readlink -f $(which javac)))) && \
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # 4. PyFlink and essential libraries only
-COPY requirements.txt .
-RUN pip3 install -r requirements.txt
+RUN pip3 install \
+      apache-flink==1.17.0 \
+      boto3 pandas \
+      pillow \
+      kafka-python loguru python-dotenv \
+      psutil scikit-learn==1.2.2
 
 # 5. Create directory for common code
 RUN mkdir -p /opt/flink/usrlib/common
