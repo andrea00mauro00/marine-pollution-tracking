@@ -18,7 +18,7 @@ import math
 import traceback
 import pickle
 import numpy as np
-import hashlib  # Aggiunto per ID deterministici
+import hashlib
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict, deque
@@ -26,7 +26,6 @@ from collections import defaultdict, deque
 # Aggiungi queste righe all'inizio del file
 import sys
 sys.path.append('/opt/flink/usrlib')
-
 
 # PyFlink imports
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
@@ -69,12 +68,12 @@ MIN_POINTS = 2               # Minimum points to form a cluster
 GRID_SIZE_DEG = 0.05         # Grid size for spatial indexing
 
 # Confidence estimation parameters
-CONFIDENCE_THRESHOLD = 0.05  # ABBASSATO: Minimum confidence for validated hotspots
+CONFIDENCE_THRESHOLD = 0.05  # Minimum confidence for validated hotspots
 
 # Risk thresholds
-HIGH_RISK_THRESHOLD = 0.6    # ABBASSATO: Threshold for high severity (was 0.7)
-MEDIUM_RISK_THRESHOLD = 0.3  # ABBASSATO: Threshold for medium severity (was 0.4)
-DETECTION_THRESHOLD = 0.3    # ABBASSATO: Minimum risk to consider (was 0.4)
+HIGH_RISK_THRESHOLD = 0.6    # Threshold for high severity
+MEDIUM_RISK_THRESHOLD = 0.3  # Threshold for medium severity
+DETECTION_THRESHOLD = 0.3    # Minimum risk to consider
 
 # Timer parameters
 CLUSTERING_INTERVAL_MS = 60000  # Run clustering every 1 minute
@@ -100,6 +99,95 @@ MIN_POINTS_TO_KEEP = 100         # Minimum per clustering efficace
 # Retry configuration
 MAX_RETRIES = 3
 BACKOFF_FACTOR = 2  # secondi
+
+# Configurazione generazione ID
+ID_PRECISION = 4      # Decimali per arrotondamento coordinate negli ID
+TIME_BUCKET_MINUTES = 15  # Dimensione bucket temporale per ID
+
+# Configurazione idempotenza
+MAX_CACHE_SIZE = 2000  # Dimensione massima cache per idempotenza
+CACHE_CLEANUP_SIZE = 500  # Numero di elementi da rimuovere durante la pulizia
+
+def update_redis_counter(counter_key, operation, amount=1, transaction_id=None):
+    """
+    Aggiorna un contatore in Redis in modo sicuro e idempotente
+    Utilizzato per mantenere contatori accurati di hotspot
+    """
+    try:
+        import redis
+        # Connessione a Redis
+        redis_host = os.environ.get("REDIS_HOST", "redis")
+        redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+        redis_client = redis.Redis(host=redis_host, port=redis_port)
+        
+        # Se fornito transaction_id, verifica che non sia già stato elaborato
+        if transaction_id:
+            transaction_key = f"transactions:{counter_key}:{transaction_id}"
+            if redis_client.exists(transaction_key):
+                logger.info(f"Transazione {transaction_id} già elaborata per {counter_key}")
+                return None
+        
+        # Usa pipeline per atomicità
+        with redis_client.pipeline() as pipe:
+            # Controlla se contatore esiste
+            if operation != "set":
+                pipe.exists(counter_key)
+                if not pipe.execute()[0]:
+                    pipe.set(counter_key, 0)
+                    pipe.execute()
+            
+            # Esegui operazione
+            if operation == "incr":
+                result = redis_client.incrby(counter_key, amount)
+            elif operation == "decr":
+                result = redis_client.decrby(counter_key, amount)
+            elif operation == "set":
+                result = redis_client.set(counter_key, amount)
+            
+            # Se fornito transaction_id, segna come elaborato
+            if transaction_id:
+                redis_client.setex(transaction_key, 86400, "1")  # 24 ore TTL
+            
+            return result
+    except Exception as e:
+        logger.error(f"Errore nell'aggiornamento del contatore {counter_key}: {e}")
+        return None
+
+def update_hotspot_counters(hotspot_id, is_new, is_update, old_status, new_status):
+    """
+    Callback per l'aggiornamento dei contatori quando un hotspot viene creato o aggiornato
+    """
+    try:
+        # Genera ID transazione unico
+        transaction_id = f"counter_{hotspot_id}_{int(time.time() * 1000)}"
+        
+        # Aggiorna contatori totali
+        if is_new and not is_update:
+            update_redis_counter("counters:hotspots:total", "incr", 1, transaction_id)
+            
+            # Aggiorna contatori attivi/inattivi
+            if new_status in ['low', 'medium', 'high']:
+                update_redis_counter("counters:hotspots:active", "incr", 1, transaction_id)
+            else:
+                update_redis_counter("counters:hotspots:inactive", "incr", 1, transaction_id)
+        
+        # Aggiorna contatori se cambia lo stato
+        elif old_status is not None and old_status != new_status:
+            active_statuses = ['low', 'medium', 'high']
+            
+            # Da attivo a inattivo
+            if old_status in active_statuses and new_status not in active_statuses:
+                update_redis_counter("counters:hotspots:active", "decr", 1, transaction_id)
+                update_redis_counter("counters:hotspots:inactive", "incr", 1, transaction_id)
+            
+            # Da inattivo a attivo
+            elif old_status not in active_statuses and new_status in active_statuses:
+                update_redis_counter("counters:hotspots:active", "incr", 1, transaction_id)
+                update_redis_counter("counters:hotspots:inactive", "decr", 1, transaction_id)
+        
+        logger.info(f"Aggiornati contatori per hotspot {hotspot_id}")
+    except Exception as e:
+        logger.error(f"Errore nell'aggiornamento dei contatori: {e}")
 
 class RedisCircuitBreaker:
     """
@@ -151,8 +239,9 @@ class PollutionEventDetector(MapFunction):
     Detects pollution events from sensor and imagery data
     """
     def __init__(self):
-        self.risk_threshold = DETECTION_THRESHOLD  # Lowered threshold for test
+        self.risk_threshold = DETECTION_THRESHOLD
         self.events = {}  # Track detected events
+        self.processed_events = set()  # Track processed event IDs for idempotence
         
     def map(self, value):
         try:
@@ -161,6 +250,17 @@ class PollutionEventDetector(MapFunction):
             source_type = data.get("source_type", "unknown")
             
             logger.info(f"[DEBUG] Processing data from source: {source_type}")
+            
+            # Verifica idempotenza usando ID messaggio o altre chiavi uniche
+            message_id = data.get("message_id") or data.get("id")
+            if message_id and message_id in self.processed_events:
+                logger.info(f"[DEBUG] Messaggio {message_id} già elaborato, skip")
+                return value
+            
+            # Gestione dimensione cache per idempotenza
+            if len(self.processed_events) > MAX_CACHE_SIZE:
+                # Rimuovi gli elementi più vecchi
+                self.processed_events = set(list(self.processed_events)[CACHE_CLEANUP_SIZE:])
             
             # Extract location - NORMALIZZATO per compatibilità con Image Standardizer
             location = self._extract_location(data)
@@ -181,13 +281,21 @@ class PollutionEventDetector(MapFunction):
             
             # If risk score exceeds threshold, create event data
             if risk_score >= self.risk_threshold:
-                # Genera un ID deterministico basato su caratteristiche dell'evento
-                # Rende più facile tracciare lo stesso evento tra diversi componenti
-                lat_rounded = round(location["latitude"], 3)
-                lon_rounded = round(location["longitude"], 3)
-                time_bucket = (int(time.time() * 1000) // (30 * 60 * 1000)) * (30 * 60 * 1000)
-                id_base = f"{lat_rounded}_{lon_rounded}_{pollutant_type}_{time_bucket}"
-                event_id = f"event-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
+                # Genera un ID deterministico più preciso
+                lat_rounded = round(location["latitude"], ID_PRECISION)
+                lon_rounded = round(location["longitude"], ID_PRECISION)
+                
+                # Bucket temporale più granulare
+                time_bucket = (int(time.time() * 1000) // (TIME_BUCKET_MINUTES * 60 * 1000)) * (TIME_BUCKET_MINUTES * 60 * 1000)
+                
+                # Includi sorgente e hash più lungo
+                id_base = f"{lat_rounded}_{lon_rounded}_{pollutant_type}_{source_type}_{time_bucket}"
+                event_id = f"event-{hashlib.md5(id_base.encode()).hexdigest()[:16]}"
+                
+                # Verifica se questo evento è già stato elaborato
+                if event_id in self.events:
+                    logger.info(f"[DEBUG] Event {event_id} already processed, skipping duplication")
+                    return value
                 
                 # Find environmental region
                 region_id = self._get_environmental_region(location["latitude"], location["longitude"])
@@ -212,6 +320,19 @@ class PollutionEventDetector(MapFunction):
                 # Store in event history for tracking
                 self.events[event_id] = event_data
                 
+                # Gestione dimensione cache eventi
+                if len(self.events) > MAX_CACHE_SIZE:
+                    # Strategia: mantieni solo eventi recenti
+                    events_list = list(self.events.items())
+                    events_list.sort(key=lambda x: x[1]["timestamp"], reverse=True)
+                    
+                    # Mantieni solo i più recenti
+                    self.events = dict(events_list[:MAX_CACHE_SIZE - CACHE_CLEANUP_SIZE])
+                
+                # Mark as processed if message_id available
+                if message_id:
+                    self.processed_events.add(message_id)
+                
                 # Add event info to original data
                 data["pollution_event_detection"] = event_data
                 logger.info(f"[EVENT DETECTED] {source_type} pollution event at ({location['latitude']}, {location['longitude']}): {pollutant_type}, severity: {severity}, risk: {risk_score}")
@@ -231,7 +352,7 @@ class PollutionEventDetector(MapFunction):
             return value
     
     def _extract_location(self, data):
-        """Estrae e normalizza le informazioni di location da diverse strutture possibili"""
+        """Estrai e normalizza le informazioni di location da diverse strutture possibili"""
         # Prima controlla il campo location standard dell'Image Standardizer
         if "location" in data:
             location = data["location"]
@@ -272,7 +393,7 @@ class PollutionEventDetector(MapFunction):
         return None
     
     def _extract_pollution_analysis(self, data, source_type):
-        """Estrae l'analisi dell'inquinamento dalla struttura dati"""
+        """Estrai l'analisi dell'inquinamento dalla struttura dati"""
         # Per dati satellitari, usa pollution_detection (formato Image Standardizer)
         if source_type == "satellite" and "pollution_detection" in data:
             return data["pollution_detection"]
@@ -337,6 +458,7 @@ class AlertExtractor(MapFunction):
     def __init__(self):
         self.redis_client = None
         self.circuit_breaker = RedisCircuitBreaker()
+        self.processed_alerts = set()  # Track processed alerts for idempotence
         
     def open(self, runtime_context):
         self._init_redis_with_retry()
@@ -369,6 +491,20 @@ class AlertExtractor(MapFunction):
             # Check only for hotspots
             if "hotspot_id" in data:
                 hotspot_id = data.get("hotspot_id")
+                
+                # Chiave di idempotenza per questo alert
+                alert_key = f"{hotspot_id}_{data.get('detected_at', int(time.time() * 1000))}"
+                if alert_key in self.processed_alerts:
+                    logger.info(f"[ALERT FILTERED] Alert {alert_key} già elaborato, skip")
+                    return None
+                
+                # Gestione dimensione cache
+                if len(self.processed_alerts) > MAX_CACHE_SIZE:
+                    self.processed_alerts = set(list(self.processed_alerts)[CACHE_CLEANUP_SIZE:])
+                
+                # Aggiungi alla cache
+                self.processed_alerts.add(alert_key)
+                
                 severity = data.get("severity")
                 avg_risk = data.get("avg_risk_score", 0.0)
                 pollutant_type = data.get("pollutant_type", "unknown")
@@ -426,6 +562,49 @@ class AlertExtractor(MapFunction):
                         elif is_significant:
                             alert_type = "significant_change"
                     
+                    # Aggiungi all'insieme di alert attivi in Redis
+                    if self.redis_client:
+                        def add_to_active_alerts():
+                            # ID alert univoco
+                            current_time = int(time.time() * 1000)
+                            alert_id = f"{hotspot_id}_{current_time}"
+                            
+                            # Usa pipeline per operazioni atomiche
+                            with self.redis_client.pipeline() as pipe:
+                                # Rimuovi eventuali vecchi alert per questo hotspot
+                                pipe.zrangebyscore("dashboard:alerts:active", 0, "+inf")
+                                old_alerts = pipe.execute()[0]
+                                
+                                if old_alerts:
+                                    for old_alert in old_alerts:
+                                        old_alert_str = old_alert.decode('utf-8') if isinstance(old_alert, bytes) else old_alert
+                                        if old_alert_str.startswith(f"{hotspot_id}_"):
+                                            pipe.zrem("dashboard:alerts:active", old_alert_str)
+                                
+                                # Aggiungi il nuovo alert
+                                pipe.zadd("dashboard:alerts:active", {alert_id: current_time})
+                                
+                                # Imposta TTL sul sorted set
+                                pipe.expire("dashboard:alerts:active", 86400)  # 24 ore
+                                
+                                # Aggiorna contatore alert attivi
+                                # Conta prima per vedere se cambia
+                                pipe.zcard("dashboard:alerts:active")
+                                count_before = pipe.execute()[0]
+                                
+                                # Ora aggiorna il contatore
+                                pipe.set("counters:alerts:active", pipe.zcard("dashboard:alerts:active"))
+                                pipe.execute()
+                            
+                            return alert_id
+                        
+                        try:
+                            alert_id = self.circuit_breaker.execute(add_to_active_alerts)
+                            if alert_id:
+                                logger.info(f"[ALERT ADDED] Added alert {alert_id} to active alerts")
+                        except Exception as e:
+                            logger.error(f"Error adding alert to active list: {e}")
+                    
                     logger.info(f"[ALERT GENERATED] Hotspot {alert_type} at ({latitude}, {longitude}): {pollutant_type}, severity: {severity}, avg_risk: {avg_risk}")
                     return value
                 else:
@@ -480,6 +659,9 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         
         # Initialize HotspotManager
         self.hotspot_manager = HotspotManager()
+        
+        # Registra callback per aggiornamento contatori
+        self.hotspot_manager.register_counter_callback(update_hotspot_counters)
         
         # Load ML model from MinIO with retry
         self._load_confidence_model_with_retry()
@@ -552,7 +734,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             
             logger.info(f"[DEBUG] Processing event: {event_id} from {source_type} with risk {risk_score}, severity: {severity}")
             
-            # Skip if already processed
+            # Skip if already processed - check stato
             if self.processed_events.contains(event_id):
                 logger.info(f"[DEBUG] Event {event_id} already processed, skipping")
                 return
@@ -578,10 +760,10 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
             self.points_state.put(point_key, json.dumps(point_data))
             logger.info(f"[DEBUG] Stored point: {point_key}")
             
-            # NUOVO: Controlla limiti di memoria dopo ogni inserimento
+            # Controlla limiti di memoria dopo ogni inserimento
             self._enforce_memory_limits()
             
-            # MIGLIORATO: Timer deterministico basato su time windows
+            # Timer deterministico basato su time windows
             self._schedule_deterministic_timer(ctx)
             
             # Debug: Count total points in state
@@ -839,12 +1021,16 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
     
     def _create_single_point_hotspot(self, point):
         """Create a test hotspot from a single point"""
-        # Genera ID deterministico per il singolo punto
-        lat_rounded = round(point["latitude"], 3)
-        lon_rounded = round(point["longitude"], 3)
-        time_bucket = (int(time.time() * 1000) // (30 * 60 * 1000)) * (30 * 60 * 1000)
-        id_base = f"{lat_rounded}_{lon_rounded}_{point['pollutant_type']}_{time_bucket}"
-        hotspot_id = f"hotspot-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
+        # Genera ID deterministico per il singolo punto con maggiore precisione
+        lat_rounded = round(point["latitude"], ID_PRECISION)
+        lon_rounded = round(point["longitude"], ID_PRECISION)
+        
+        # Bucket temporale più granulare
+        time_bucket = (int(time.time() * 1000) // (TIME_BUCKET_MINUTES * 60 * 1000)) * (TIME_BUCKET_MINUTES * 60 * 1000)
+        
+        # Include source type nell'ID
+        id_base = f"{lat_rounded}_{lon_rounded}_{point['pollutant_type']}_{point['source_type']}_{time_bucket}"
+        hotspot_id = f"hotspot-{hashlib.md5(id_base.encode()).hexdigest()[:16]}"
         
         hotspot = {
             "hotspot_id": hotspot_id,
@@ -941,7 +1127,6 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         
         return clusters
     
-    # Analyze cluster method con ID deterministico
     def _analyze_cluster(self, cluster_id, points):
         """Calculate cluster characteristics"""
         # Extract coordinates
@@ -987,16 +1172,21 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         # Determine severity
         severity = "high" if avg_risk > HIGH_RISK_THRESHOLD else "medium" if avg_risk > MEDIUM_RISK_THRESHOLD else "low"
         
-        # Genera ID deterministico
-        # Arrotonda coordinate e timestamp per stabilità
-        lat_rounded = round(center_latitude, 2)
-        lon_rounded = round(center_longitude, 2)
-        current_time = int(time.time() * 1000)
-        time_bucket = (current_time // (30 * 60 * 1000)) * (30 * 60 * 1000)
+        # Genera ID deterministico più preciso e meno soggetto a collisioni
+        lat_rounded = round(center_latitude, ID_PRECISION)
+        lon_rounded = round(center_longitude, ID_PRECISION)
         
-        # Crea ID base usando le caratteristiche fisiche
-        id_base = f"{lat_rounded}_{lon_rounded}_{dominant_pollutant}_{time_bucket}"
-        deterministic_id = f"hotspot-{hashlib.md5(id_base.encode()).hexdigest()[:12]}"
+        # Bucket temporale più preciso
+        current_time = int(time.time() * 1000)
+        time_bucket = (current_time // (TIME_BUCKET_MINUTES * 60 * 1000)) * (TIME_BUCKET_MINUTES * 60 * 1000)
+        
+        # Aggiunta di parametri distintivi (numero di punti e varianza geografica)
+        point_count_hash = len(points) % 100  # mod 100 per limitare l'impatto
+        geo_variance = round(radius_km * 100) % 100  # variance encoded
+        
+        # Crea ID base usando più caratteristiche fisiche
+        id_base = f"{lat_rounded}_{lon_rounded}_{dominant_pollutant}_{point_count_hash}_{geo_variance}_{time_bucket}"
+        deterministic_id = f"hotspot-{hashlib.md5(id_base.encode()).hexdigest()[:16]}"
         
         # Create hotspot data
         hotspot = {
@@ -1138,7 +1328,7 @@ class SpatialClusteringProcessor(KeyedProcessFunction):
         
         return c * r
 
-# Funzione per la chiave spaziale
+# Funzione per la chiave spaziale migliorata
 def create_spatial_key(data):
     try:
         event = json.loads(data).get("pollution_event_detection")
@@ -1148,20 +1338,22 @@ def create_spatial_key(data):
         lat = event["location"]["latitude"]
         lon = event["location"]["longitude"]
         
-        # Determina la cella principale
-        grid_lat = int(lat / 0.5)
-        grid_lon = int(lon / 0.5)
+        # Determina la cella principale con maggiore precisione
+        grid_lat = int(lat / GRID_SIZE_DEG)
+        grid_lon = int(lon / GRID_SIZE_DEG)
         
         # Calcola distanza dai bordi in gradi
-        lat_remainder = lat % 0.5
-        lon_remainder = lon % 0.5
+        lat_remainder = lat % GRID_SIZE_DEG
+        lon_remainder = lon % GRID_SIZE_DEG
         
         # Se il punto è vicino al confine (entro 5km ~ 0.05 gradi), 
-        # usa una chiave speciale che sarà sempre inviata allo stesso task
-        border_distance = 0.05
-        if (lat_remainder < border_distance or lat_remainder > (0.5 - border_distance) or
-            lon_remainder < border_distance or lon_remainder > (0.5 - border_distance)):
-            return "boundary_region"
+        # usa una chiave speciale per evitare che punti vicini siano in celle diverse
+        border_distance = 0.01  # 0.01 gradi ~ 1.1km
+        if (lat_remainder < border_distance or lat_remainder > (GRID_SIZE_DEG - border_distance) or
+            lon_remainder < border_distance or lon_remainder > (GRID_SIZE_DEG - border_distance)):
+            # Usa anche il tipo di inquinante per migliorare il binning
+            pollutant_type = event.get("pollutant_type", "unknown")
+            return f"boundary_{grid_lat}_{grid_lon}_{pollutant_type}"
             
         return f"grid_{grid_lat}_{grid_lon}"
     except Exception as e:
@@ -1169,7 +1361,7 @@ def create_spatial_key(data):
         return "default_key"
 
 def wait_for_services():
-    """Wait for Kafka to be available"""
+    """Wait for Kafka and MinIO to be available"""
     logger.info("Waiting for Kafka and MinIO...")
     
     # Check Kafka
@@ -1182,8 +1374,8 @@ def wait_for_services():
             kafka_ready = True
             logger.info("Kafka is ready")
             break
-        except Exception:
-            logger.info(f"Waiting for Kafka... ({i+1}/10)")
+        except Exception as e:
+            logger.info(f"Waiting for Kafka... ({i+1}/10): {e}")
             time.sleep(5)
     
     if not kafka_ready:
@@ -1205,8 +1397,8 @@ def wait_for_services():
             minio_ready = True
             logger.info(f"MinIO is ready, available buckets: {bucket_names}")
             break
-        except Exception:
-            logger.info(f"Waiting for MinIO... ({i+1}/10)")
+        except Exception as e:
+            logger.info(f"Waiting for MinIO... ({i+1}/10): {e}")
             time.sleep(5)
     
     if not minio_ready:
@@ -1289,22 +1481,22 @@ def main():
     # 4. Send all events to analyzed_data topic
     all_events.add_sink(analyzed_producer).name("Publish_All_Analyzed_Data")
     
-    # 7. Perform spatial clustering - MODIFICATO: usa create_spatial_key
+    # 5. Perform spatial clustering - con chiave spaziale migliorata
     hotspots = all_events \
         .key_by(create_spatial_key) \
         .process(SpatialClusteringProcessor(), output_type=Types.STRING()) \
         .name("Spatial_Clustering")
     
-    # 8. Send hotspots to hotspot topic
+    # 6. Send hotspots to hotspot topic
     hotspots.add_sink(hotspot_producer).name("Publish_Hotspots")
     
-    # 9. Extract alerts from hotspots
+    # 7. Extract alerts from hotspots
     hotspot_alerts = hotspots \
         .map(AlertExtractor(), output_type=Types.STRING()) \
         .filter(lambda x: x is not None) \
         .name("Extract_Hotspot_Alerts")
     
-    # 10. Send hotspot alerts to alert topic
+    # 8. Send hotspot alerts to alert topic
     hotspot_alerts.add_sink(alert_producer).name("Publish_Hotspot_Alerts")
     
     # Execute the job
