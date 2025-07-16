@@ -61,7 +61,6 @@ logger = logging.getLogger(__name__)
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 HOTSPOTS_TOPIC = os.environ.get("HOTSPOTS_TOPIC", "pollution_hotspots")
 PREDICTIONS_TOPIC = os.environ.get("PREDICTIONS_TOPIC", "pollution_predictions")
-PARALLELISM = int(os.environ.get("PARALLELISM", "4"))  # Default to 4 parallel tasks
 
 # Redis configuration
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
@@ -2048,7 +2047,6 @@ def main():
         "job_starting",
         "Starting ML Prediction Engine Job",
         {
-            "parallelism": PARALLELISM,
             "kafka_bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,
             "hotspots_topic": HOTSPOTS_TOPIC,
             "predictions_topic": PREDICTIONS_TOPIC
@@ -2071,7 +2069,7 @@ def main():
     env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
     
     # Set parallelism based on configuration
-    env.set_parallelism(PARALLELISM)
+    env.set_parallelism(1)  # Set parallelism to 1 for simplicity
     
     # Configure checkpointing for fault tolerance
     env = configure_checkpoints(env)
@@ -2114,8 +2112,7 @@ def main():
     # Execute the job
     log_event(
         "job_execution",
-        f"Starting ML Prediction Engine Job execution",
-        {"parallelism": PARALLELISM}
+        f"Starting ML Prediction Engine Job execution"
     )
     
     env.execute("Marine_Pollution_ML_Prediction")
@@ -2128,8 +2125,7 @@ if __name__ == "__main__":
         "ML Prediction Engine starting up",
         {
             "version": "2.0.0",
-            "environment": os.environ.get("DEPLOYMENT_ENV", "development"),
-            "parallelism": PARALLELISM
+            "environment": os.environ.get("DEPLOYMENT_ENV", "development")
         }
     )
     
