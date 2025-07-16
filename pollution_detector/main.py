@@ -6,7 +6,32 @@ This job:
 1. Consumes analyzed sensor data and processed imagery from Kafka
 2. Performs spatial clustering to identify pollution hotspots
 3. Evaluates confidence levels for detected events using ML models
-4. Publishes detected pollution events for prediction and alerting
+4. Correlates data from different sources (buoys, satellites) for event confirmation
+5. Publishes detected pollution events to Kafka for alerting and prediction
+
+POLLUTION DETECTION:
+- Supported types: oil spills, algal blooms, sediment, plastic waste
+- Multi-source correlation to reduce false positives
+- Spatial clustering algorithm to define pollution perimeters
+- Severity calculation based on concentration and affected area
+
+SPATIAL ANALYSIS:
+- Geospatial algorithms to determine pollution area and spread
+- Distance calculation from sensitive areas (coastlines, marine parks, tourist zones)
+- Classification into micro-areas for temporal evolution tracking
+- Generation of heat maps of pollutant concentration
+
+RECOMMENDATIONS:
+- Automatic generation of suggested interventions based on type and severity
+- Estimation of time and cost of intervention for different strategies
+- Prioritization based on potential environmental impact
+- Specific warnings for different stakeholders (agencies, port authorities)
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, ANALYZED_SENSOR_TOPIC, PROCESSED_IMAGERY_TOPIC, HOTSPOTS_TOPIC
+- MINIO_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+- RISK_THRESHOLD, CLUSTER_DISTANCE_METERS, CONFIDENCE_THRESHOLD
+==============================================================================
 """
 
 import os

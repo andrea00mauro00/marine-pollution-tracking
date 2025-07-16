@@ -492,8 +492,6 @@ services:
       - timescaledb
       - minio
     restart: on-failure
-
-  # Aggiungi alla fine del docker-compose.yml esistente
   portainer:
     image: portainer/portainer-ce:latest
     container_name: portainer

@@ -9,13 +9,31 @@ This job:
 4. Generates 6/12/24/48-hour forecasts with cleanup recommendations
 5. Publishes comprehensive predictions to pollution_predictions topic
 
-Optimizations:
-1. Enhanced structured logging for better observability
-2. Performance metrics tracking and reporting
-3. Improved error handling and resilience
-4. Robust retry mechanisms with exponential backoff
-5. Circuit breaker pattern for external services
-6. Comprehensive service health checks
+PREDICTIVE CAPABILITIES:
+- Diffusion models specific to pollution type (oil, chemical, algal)
+- Integration of oceanographic and meteorological data for accuracy
+- Multi-scenario forecasts with confidence levels
+- Quantification of impact on ecosystems and economic activities
+
+OPTIMIZATIONS:
+- Enhanced structured logging for better observability
+- Performance metrics tracking and reporting
+- Improved error handling and resilience
+- Robust retry mechanisms with exponential backoff
+- Circuit breaker pattern for external services
+- Dynamic configuration integration from MinIO
+
+TECHNICAL IMPROVEMENTS:
+- Optimized memory management for high-resolution predictions
+- Parallel processing pipeline for multi-scenario forecasts
+- Checkpoint configuration for fault tolerance
+- Closed-loop feedback system for continuous improvement
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, HOTSPOTS_TOPIC, PREDICTIONS_TOPIC
+- MINIO_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+- FORECAST_HORIZONS, MODEL_UPDATE_INTERVAL_MINUTES
+==============================================================================
 """
 
 import os

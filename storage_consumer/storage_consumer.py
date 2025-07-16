@@ -8,11 +8,33 @@ This service:
 3. Stores data in a multi-layer data lake (Bronze, Silver, Gold) in MinIO
 4. Persists critical information in TimescaleDB and PostgreSQL
 
-Enhanced with:
-1. Structured logging for improved observability
-2. Performance metrics tracking
-3. Resilient operations with retry and circuit breaker patterns
-4. Error handling and graceful degradation
+DATA LAKE ARCHITECTURE:
+- Bronze: Raw standardized data (buoy readings, satellite metadata)
+- Silver: Processed and analyzed data (hotspots, pollution indices)
+- Gold: Business insights (forecasts, alerts, aggregated metrics)
+
+DATABASE PERSISTENCE:
+- TimescaleDB: High-frequency time series for environmental parameters
+- PostgreSQL: Metadata, configurations, pollution events, reports
+
+TECHNICAL CAPABILITIES:
+- Intelligent data partitioning for query optimization
+- Adaptive compression to reduce storage footprint
+- Incremental storage with delta tracking
+- Automatic retention and lifecycle policy management
+
+ENHANCEMENTS:
+- Structured logging for improved observability
+- Performance metrics tracking
+- Resilient operations with retry and circuit breaker patterns
+- Error handling and graceful degradation
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, BUOY_TOPIC, SATELLITE_TOPIC, PROCESSED_IMAGERY_TOPIC, ANALYZED_SENSOR_TOPIC
+- TIMESCALE_HOST, TIMESCALE_PORT, TIMESCALE_DB, TIMESCALE_USER, TIMESCALE_PASSWORD
+- POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+- MINIO_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+==============================================================================
 """
 
 import os

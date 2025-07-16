@@ -9,11 +9,37 @@ This service:
 4. Routes notifications based on alert severity and configuration
 5. Persists alerts to PostgreSQL and Redis
 
-Enhanced with:
-1. Structured logging for improved observability
-2. Performance metrics tracking
-3. Resilient operations with retry and circuit breaker patterns
-4. Error handling and graceful degradation
+ALERT MANAGEMENT:
+- Classification by pollution type and severity
+- Intelligent deduplication with fuzzy matching
+- Enrichment with contextual metadata (impacted zones, spread estimates)
+- Automatic escalation for critical or persistent events
+
+NOTIFICATIONS:
+- Multi-channel routing (email, SMS, mobile app, webhook)
+- Customizable templates for different stakeholders
+- Intelligent aggregation to prevent alert storms
+- Acknowledgement and resolution status tracking
+
+RECOMMENDATIONS:
+- Specific intervention procedures for pollution type
+- Resource estimation (personnel, equipment, time)
+- Environmental and economic impact assessment
+- Prioritization based on sensitivity of affected areas
+
+ENHANCEMENTS:
+- Structured logging for improved observability
+- Performance metrics tracking
+- Resilient operations with retry and circuit breaker patterns
+- Error handling and graceful degradation
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, ALERTS_TOPIC
+- POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+- REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB
+- SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD
+- WEBHOOK_ENDPOINTS, SMS_GATEWAY_URL
+==============================================================================
 """
 
 import os

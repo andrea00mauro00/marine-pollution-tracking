@@ -1,3 +1,39 @@
+"""
+==============================================================================
+Marine Pollution Monitoring System - Buoy Data Simulator
+==============================================================================
+This service:
+1. Simulates realistic data from marine buoys at specific geographic locations
+2. Generates environmental parameters with seasonal and daily fluctuations
+3. Simulates pollution events with different types and intensities
+4. Produces data with realistic correlations between parameters (temperature/pH, etc.)
+5. Publishes raw data to Kafka for subsequent analysis
+
+DATA SIMULATION:
+- Environmental parameters: pH, temperature, turbidity, wave height, wind speed
+- Water quality parameters: dissolved oxygen, nutrients, microplastics, heavy metals
+- Water Quality Index (WQI) calculated from various indicators
+- Pollutants: hydrocarbons, heavy metals, nutrients, coliform bacteria
+
+POLLUTION EVENTS:
+- Types: oil spills, chemical leaks, algal blooms, industrial pollution
+- Severity levels: low, medium, high with proportional effects on parameters
+- Variable duration with effects that gradually diminish
+- Configurable probability of event occurrence
+
+RESILIENCE:
+- Automatic retries with exponential backoff
+- Dead Letter Queue (DLQ) for failed messages
+- Circuit breaker for external services
+- Structured logging for observability
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DLQ_TOPIC
+- GENERATE_INTERVAL_SECONDS, EVENT_PROBABILITY
+==============================================================================
+"""
+
+
 import time, json, random, sys, os, yaml, math
 from datetime import datetime
 from kafka import KafkaProducer

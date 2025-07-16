@@ -1,3 +1,42 @@
+"""
+==============================================================================
+Marine Pollution Monitoring System - Satellite Image Fetcher
+==============================================================================
+This service:
+1. Retrieves Sentinel-2 satellite imagery via the Copernicus API
+2. Filters scenes by cloud coverage and acquisition date
+3. Optimizes queries based on buoy positions and areas of interest
+4. Processes metadata and images for pollution analysis
+5. Stores raw data in MinIO (Bronze layer) and publishes references to Kafka
+
+DATA ACQUISITION:
+- Source: Sentinel-2 L2A (multispectral satellite imagery)
+- Filters: maximum cloud coverage (configurable), time range
+- Areas: generated from buoy positions with configurable buffer
+- Frequency: scheduled with configurable interval (default 15 minutes)
+
+OPTIMIZATION:
+- Cloud coverage filter to maximize image quality (< 20%)
+- Scene selection prioritizing most recent and least cloudy
+- Generation of optimized bboxes around buoy coordinates
+- Automatic retries to handle API limitations and connection issues
+
+PROCESSING:
+- Extraction of spectral metadata and geographic information
+- Efficient storage with structured paths by date/area
+- Format conversion to optimize storage and performance
+- Image validation for quality and usability
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, DLQ_TOPIC
+- SH_CLIENT_ID, SH_CLIENT_SECRET, SH_TOKEN_URL, SH_BASE_URL
+- MINIO_ENDPOINT, MINIO_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+- FETCH_INTERVAL_SECONDS, SAT_DAYS_LOOKBACK, SAT_MAX_CLOUD
+==============================================================================
+
+"""
+
+
 #!/usr/bin/env python
 import os
 import sys

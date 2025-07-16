@@ -2,14 +2,11 @@
 ==============================================================================
 Marine Pollution Monitoring System - Smart Image Standardizer with Safe Tiling
 ==============================================================================
-
 This module processes satellite imagery for marine pollution detection using 
 an intelligent tiling strategy that automatically adapts to image size:
-
-• Direct processing for small images (< 50MB) - typical satellite imagery
-• Sequential tiling for large images (> 50MB) - memory-efficient processing
-• NO ThreadPoolExecutor to ensure Flink compatibility and avoid gRPC conflicts
-
+- Direct processing for small images (< 50MB) - typical satellite imagery
+- Sequential tiling for large images (> 50MB) - memory-efficient processing
+- NO ThreadPoolExecutor to ensure Flink compatibility and avoid gRPC conflicts
 WORKFLOW:
 1. Consumes satellite imagery metadata from Kafka
 2. Retrieves raw images from MinIO Bronze layer
@@ -19,20 +16,17 @@ WORKFLOW:
 6. Generates spectral analysis and environmental indices
 7. Stores processed results in MinIO Silver layer
 8. Publishes enriched data to Kafka for downstream processing
-
 POLLUTION DETECTION:
 - Supports oil spills, algal blooms, sediment, and chemical discharge
 - Uses trained ML models when available, falls back to rule-based detection
 - Leverages spectral band information for enhanced accuracy
 - Creates binary masks and confidence scores
-
 TECHNICAL DETAILS:
 - Tile size: 512x512 pixels for large image processing
 - Memory threshold: 50MB for processing strategy selection
 - Retry logic: 3 attempts with exponential backoff
 - Checkpoint interval: 60 seconds for fault tolerance
 - Compatible with Apache Flink streaming execution
-
 ENVIRONMENT VARIABLES:
 - KAFKA_BOOTSTRAP_SERVERS, SATELLITE_TOPIC, PROCESSED_IMAGERY_TOPIC
 - MINIO_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY

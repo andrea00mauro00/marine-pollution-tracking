@@ -9,11 +9,30 @@ This job:
 4. Calculates risk scores and classifies pollution types
 5. Publishes analyzed sensor data to Kafka for further processing
 
-Enhanced with:
-1. Structured logging for improved observability
-2. Performance metrics tracking
-3. Resilient operations with retry and circuit breaker patterns
-4. Checkpoint configuration for fault tolerance
+ANALYTICAL CAPABILITIES:
+- Anomaly detection based on time series and threshold models
+- Pollution classification: hydrocarbons, heavy metals, nutrients, biological
+- Multi-parameter correlation analysis to detect complex patterns
+- Calculation of composite environmental indices (water quality index, toxicity index)
+
+ML INTEGRATION:
+- Pre-trained models loaded from MinIO "models" layer
+- Fallback to deterministic rules when models are not available
+- Auto-updating configurations from "configs" bucket
+- Confidence score calculation for each prediction
+
+OPTIMIZATIONS:
+- Structured logging for improved observability
+- Performance metrics tracking
+- Resilient operations with retry and circuit breaker patterns
+- Checkpoint configuration for fault tolerance
+- Exponential backoff for error handling
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, BUOY_TOPIC, ANALYZED_SENSOR_TOPIC
+- MINIO_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+- MAX_RETRIES, RETRY_BACKOFF_MS, METRICS_REPORTING_INTERVAL
+==============================================================================
 """
 
 import os

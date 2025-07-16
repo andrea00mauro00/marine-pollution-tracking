@@ -9,11 +9,30 @@ This service:
 4. Maintains counters and metrics for the dashboard
 5. Reconciles data periodically with PostgreSQL
 
-Enhanced with:
-1. Structured logging for improved observability
-2. Performance metrics tracking
-3. Resilient operations with retry and circuit breaker patterns
-4. Error handling and graceful degradation
+DASHBOARD FUNCTIONALITY:
+- Real-time statistics on water quality and pollution levels
+- Geographic visualization of hotspots with severity levels
+- Historical tracking with temporal trend graphs
+- Active alerts with impact metrics and recommendations
+
+CACHE OPTIMIZATIONS:
+- Differentiated TTL policies for data types
+- Pre-calculated aggregations for common visualizations
+- Geospatial indices for proximity queries
+- Data compression to optimize memory usage
+
+ENHANCEMENTS:
+- Structured logging for improved observability
+- Performance metrics tracking
+- Resilient operations with retry and circuit breaker patterns
+- Error handling and graceful degradation
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, BUOY_TOPIC, ANALYZED_SENSOR_TOPIC, HOTSPOTS_TOPIC, PREDICTIONS_TOPIC
+- REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB
+- POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+- CACHE_TTL_SECONDS, RECONCILIATION_INTERVAL_MINUTES
+==============================================================================
 """
 
 import os
