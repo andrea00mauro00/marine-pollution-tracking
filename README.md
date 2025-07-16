@@ -6,6 +6,8 @@
 ![Kafka](https://img.shields.io/badge/Kafka-7.5.0-red.svg)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-9cf.svg)
 
+![Logo](./data/logo.png)
+
 ## Table of Contents
 
 - [Introduction](#introduction)
@@ -78,7 +80,30 @@ The architecture enables several key capabilities:
 
 The system comprises multiple specialized microservices organized by function, as visible in the project structure:
 
-![Project Structure](./images/project_folders.png)
+```
+marine-pollution-tracking/
+├── alert_manager/                # Alert processing and notification service
+├── buoy_producer/                # Retrieves and publishes sensor data from buoys
+├── common/                       # Shared utilities and libraries
+├── create_dlq_topics/            # Sets up Dead Letter Queues for error handling
+├── dashboard/                    # Streamlit visualization interface
+├── dashboard_consumer/           # Prepares data for dashboard visualization
+├── data/                         # Data storage directory
+├── dlq_consumer/                 # Processes messages from Dead Letter Queues
+├── docker-compose.yml            # Container orchestration configuration
+├── image_standardizer/           # Processes and standardizes satellite imagery
+├── LICENSE                       # License information
+├── ml_prediction/                # Machine learning models for pollution prediction
+├── pollution_detector/           # Identifies pollution hotspots through analysis
+├── README.md                     # Project documentation
+├── satellite_producer/           # Retrieves and publishes satellite imagery
+├── schemas/                      # Data schema definitions
+├── scripts/                      # Utility scripts for setup and maintenance
+├── sensor_analyzer/              # Analyzes and classifies sensor readings
+├── setup_database/               # Database initialization and configuration
+├── setup_minio/                  # MinIO object storage configuration
+└── storage_consumer/             # Manages data persistence across storage systems
+```
 
 ### Data Producers
 
@@ -110,14 +135,6 @@ The system comprises multiple specialized microservices organized by function, a
 - **schemas**: Data schema definitions ensuring consistent data formats throughout the system
 - **scripts**: Utility scripts for setup, maintenance, and testing
 - **create_dlq_topics**: Sets up Dead Letter Queues for robust error handling
-
-### Dashboard
-
-The dashboard component provides the visualization interface with multiple specialized views:
-
-![Dashboard Structure](./images/dashboard_folders.png)
-
-The dashboard includes screens for home overview, alerts, alert details, hotspots, map views, predictions, reports, and sensor details.
 
 ## Data Processing Pipeline
 
@@ -151,8 +168,6 @@ Data flows through a series of specialized Flink jobs that perform increasingly 
 
 The system implements a comprehensive medallion architecture for data management:
 
-![Medallion Architecture](./data/medallion_architecture.png)
-
 - **Bronze Layer**: Raw data preserved exactly as received, providing the foundation for reprocessing
 - **Silver Layer**: Validated, cleansed, and standardized data ready for analysis
 - **Gold Layer**: Derived insights, analytical results, and aggregated metrics for visualization
@@ -177,7 +192,7 @@ The system provides a comprehensive visualization interface designed for environ
 
 The main dashboard provides an overview of system status and key environmental metrics:
 
-![Home Dashboard](./data/dashboard_screenshot/home.png)
+![Home Dashboard](./data/dashboard_screenshots/home.png)
 
 Key features include:
 - System metrics showing active hotspots, alerts, and sensors
@@ -190,7 +205,7 @@ Key features include:
 
 The alerts interface enables monitoring and management of pollution notifications:
 
-![Alerts Dashboard](./data/dashboard_screenshot/alerts.png)
+![Alerts Dashboard](./data/dashboard_screenshots/alerts.png)
 
 This view provides:
 - Severity-based alert filtering (high, medium, low)
@@ -203,7 +218,7 @@ This view provides:
 
 Clicking on an alert provides comprehensive information and response guidance:
 
-![Alert Details](./data/dashboard_screenshot/alert_details.png)
+![Alert Details](./data/dashboard_screenshots/alerts_details.png)
 
 The detailed view includes:
 - Complete alert metadata and status information
@@ -218,7 +233,7 @@ The detailed view includes:
 
 The map view provides specialized geospatial visualization of pollution events:
 
-![Map View](./data/dashboard_screenshot/map.png)
+![Map View](./data/dashboard_screenshots/map.png)
 
 Features include:
 - Filterable map display by pollutant type and severity
@@ -231,7 +246,7 @@ Features include:
 
 The hotspots view enables detailed analysis of pollution concentration areas:
 
-![Hotspots Dashboard](./data/dashboard_screenshot/hotspots.png)
+![Hotspots Dashboard](./data/dashboard_screenshots/hotspots.png)
 
 This specialized view offers:
 - Hotspot network status overview
@@ -244,7 +259,7 @@ This specialized view offers:
 
 The predictions interface visualizes the projected spread of pollution events:
 
-![Predictions Dashboard](.//data/dashboard_screenshot/predictions.png)
+![Predictions Dashboard](./data/dashboard_screenshots/predictions.png)
 
 This forward-looking view provides:
 - Time horizon selection for prediction visualization
@@ -257,7 +272,7 @@ This forward-looking view provides:
 
 The reports view offers in-depth analysis of pollution trends and patterns:
 
-![Reports Dashboard](./data/dashboard_screenshot/reports.png)
+![Reports Dashboard](./data/dashboard_screenshots/report.png)
 
 Advanced analytical features include:
 - Pollutant trend analysis across time periods
@@ -270,7 +285,7 @@ Advanced analytical features include:
 
 The sensor details view provides comprehensive monitoring of individual sensors:
 
-![Sensor Details](./data/dashboard_screenshot/sensor_details.png)
+![Sensor Details](./data/dashboard_screenshots/sensor_details.png)
 
 This technical view includes:
 - Current sensor readings and status
@@ -320,7 +335,7 @@ This technical view includes:
    - Dashboard: http://localhost:8501
    - MinIO Console: http://localhost:9001 (user/pass: minioadmin)
    - Kafka UI: http://localhost:8080
-   - PostgreSQL: localhost:5432 (user/pass: postgres)
+   - PostgreSQL: localhost:5432 (user: postgres, pass: postgres)
 
 ### Docker Infrastructure
 
@@ -410,20 +425,11 @@ The system employs a carefully selected technology stack, with each component ch
 | In-Memory Cache | Redis | Microsecond access to frequent queries, optimized for geospatial operations with sorted sets. Supports real-time dashboard updates and alert distribution with pub/sub capabilities. |
 | Message Broker | Kafka | Fault-tolerant data pipeline with topic partitioning for high-throughput sensor data. Persistence ensures reliable delivery of critical environmental measurements and supports event replay for analysis. |
 | Stream Processing | Apache Flink | True event-time processing with exactly-once semantics critical for temporal pollution analysis. Stateful computations enable tracking pollution evolution with sub-100ms latency. |
-
-![Technologies Table](./data/technologies_justification.png)
-
-Additional specialized technologies enhance specific system capabilities:
-
-| Component | Technology | Justification |
-|-----------|------------|---------------|
 | Main Database | PostgreSQL | ACID-compliant storage for pollution events and metadata. PostGIS extension enables critical geospatial queries for hotspot identification and intervention planning. |
 | Time-Series | TimescaleDB | PostgreSQL extension optimized for sensor time-series data, with hypertables providing efficient querying of historical measurements. Supports continuous aggregations for trend analysis. |
 | Object Storage | MinIO | Implements bronze/silver/gold medallion architecture for data quality management. S3-compatible API with versioning supports large satellite imagery storage and processing pipeline integration. |
 | Dashboard | Streamlit | Rapid development of interactive pollution maps and monitoring dashboards. Integrates with geospatial libraries to provide actionable environmental intelligence to stakeholders. |
 | Error Handling | DLQ Pattern | Implements Dead Letter Queues for each Kafka topic to ensure no data loss during processing failures. Provides robust fault tolerance with >95% reliability for mission-critical environmental monitoring. |
-
-![Technologies Table 2](./data/technologies_justification_2.png)
 
 ### Machine Learning Implementation
 
@@ -524,8 +530,6 @@ This project was developed by:
 - [@andrea00mauro00](https://github.com/andrea00mauro00)  
 - [@marcoRossi27](https://github.com/marcoRossi27)  
 - [@walterscf](https://github.com/walterscf)
-
-
 
 ## References
 
