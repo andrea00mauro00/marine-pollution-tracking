@@ -33,6 +33,8 @@ RUN mkdir -p /app/satellite_producer/utils && \
     touch /app/satellite_producer/utils/__init__.py
 
 COPY Utils/ /app/satellite_producer/utils/
+COPY credentials.json /app/credentials.json
+ENV CREDENTIALS_FILE=/app/credentials.json
 
 # Imposta variabili d'ambiente
 ENV KAFKA_BOOTSTRAP_SERVERS=kafka:9092

@@ -184,8 +184,6 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - KAFKA_TOPIC=satellite_imagery
       - FETCH_INTERVAL_SECONDS=900
-      - SH_CLIENT_ID=sh-48bf00cf-f69f-4700-ba00-c54fd436fafa
-      - SH_CLIENT_SECRET=DGTXvpdZD3B2MpCsdSz7qqZuvRtHMZ0X
       - SH_TOKEN_URL=https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token
       - SH_BASE_URL=https://sh.dataspace.copernicus.eu
       - MINIO_ENDPOINT=minio:9000
@@ -494,6 +492,21 @@ services:
       - timescaledb
       - minio
     restart: on-failure
+
+  # Aggiungi alla fine del docker-compose.yml esistente
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8080:8080"
+    networks:
+      - marine_net
 
 networks:
   marine_net:

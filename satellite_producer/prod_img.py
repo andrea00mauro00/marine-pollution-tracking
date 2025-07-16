@@ -41,6 +41,9 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
+# Configurazione credenziali
+CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json")
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Metrics for tracking performance
@@ -118,28 +121,117 @@ def retry_operation(operation, max_attempts=5, initial_delay=1):
     # Should never reach here because the last attempt raises an exception
     raise Exception(f"Operation failed after {max_attempts} attempts")
 
-def build_sh_config() -> SHConfig:
-    """Build Sentinel Hub config from environment variables"""
+def load_credentials():
+    """
+    Load Sentinel Hub credentials from external file
+    
+    The file should contain a JSON array of credential objects, such as:
+    [
+        {
+            "name": "account1",
+            "sh_client_id": "client-id-1",
+            "sh_client_secret": "client-secret-1",
+            "sh_token_url": "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token",
+            "sh_base_url": "https://sh.dataspace.copernicus.eu"
+        },
+        {
+            "name": "account2",
+            "sh_client_id": "client-id-2",
+            "sh_client_secret": "client-secret-2",
+            "sh_token_url": "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token",
+            "sh_base_url": "https://sh.dataspace.copernicus.eu"
+        }
+    ]
+    """
+    credentials_path = pathlib.Path(CREDENTIALS_FILE)
+    
+    # Check if file exists
+    if not credentials_path.exists():
+        log_event("credentials_missing", f"Credentials file not found: {CREDENTIALS_FILE}", {
+            "expected_path": str(credentials_path.absolute())
+        })
+        return []
+    
+    try:
+        with open(credentials_path, 'r') as f:
+            credentials = json.load(f)
+            
+        if not isinstance(credentials, list):
+            log_event("credentials_invalid", "Credentials file must contain a JSON array")
+            return []
+            
+        # Validate each credential object
+        valid_credentials = []
+        for i, cred in enumerate(credentials):
+            if not isinstance(cred, dict):
+                log_event("credential_invalid", f"Credential at index {i} is not a valid object")
+                continue
+                
+            # Check required fields
+            required_fields = ["sh_client_id", "sh_client_secret"]
+            missing_fields = [field for field in required_fields if field not in cred]
+            
+            if missing_fields:
+                log_event("credential_invalid", f"Credential at index {i} is missing required fields", {
+                    "missing_fields": missing_fields
+                })
+                continue
+                
+            valid_credentials.append(cred)
+            
+        log_event("credentials_loaded", f"Loaded {len(valid_credentials)} valid credentials")
+        return valid_credentials
+        
+    except Exception as e:
+        log_event("credentials_error", f"Error loading credentials: {str(e)}", {
+            "error_type": type(e).__name__,
+            "error_message": str(e)
+        })
+        return []
+
+def get_next_credential(credentials, current_index=0):
+    """Get the next credential using round-robin"""
+    if not credentials:
+        return None
+    
+    # Use modulo to cycle through credentials
+    index = current_index % len(credentials)
+    return credentials[index], index + 1
+
+def build_sh_config(credential=None) -> SHConfig:
+    """Build Sentinel Hub config from credential or environment variables"""
     cfg = SHConfig()
     
-    # Get config from toml file if available
-    toml_path = UTILS_DIR / "config" / "config.toml"
-    cfg_toml = {}
-    if toml_path.exists():
-        import tomli
-        cfg_toml = tomli.loads(toml_path.read_text()).get("default-profile", {})
+    if credential:
+        # Use provided credential
+        cfg.sh_client_id = credential.get("sh_client_id")
+        cfg.sh_client_secret = credential.get("sh_client_secret")
+        cfg.sh_token_url = credential.get("sh_token_url", "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token")
+        cfg.sh_base_url = credential.get("sh_base_url", "https://sh.dataspace.copernicus.eu")
+        
+        credential_name = credential.get("name", "unnamed")
+        log_event("using_credential", f"Using credential: {credential_name}")
+    else:
+        # Fallback to environment variables and config.toml
+        toml_path = UTILS_DIR / "config" / "config.toml"
+        cfg_toml = {}
+        if toml_path.exists():
+            import tomli
+            cfg_toml = tomli.loads(toml_path.read_text()).get("default-profile", {})
 
-    # Set configuration from environment variables with fallback to toml
-    cfg.sh_client_id = os.getenv("SH_CLIENT_ID", cfg_toml.get("sh_client_id"))
-    cfg.sh_client_secret = os.getenv("SH_CLIENT_SECRET", cfg_toml.get("sh_client_secret"))
-    cfg.sh_token_url = os.getenv("SH_TOKEN_URL", "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token")
-    cfg.sh_base_url = os.getenv("SH_BASE_URL", "https://sh.dataspace.copernicus.eu")
+        cfg.sh_client_id = os.getenv("SH_CLIENT_ID", cfg_toml.get("sh_client_id"))
+        cfg.sh_client_secret = os.getenv("SH_CLIENT_SECRET", cfg_toml.get("sh_client_secret"))
+        
+        # Add these two lines
+        cfg.sh_token_url = os.getenv("SH_TOKEN_URL", "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token")
+        cfg.sh_base_url = os.getenv("SH_BASE_URL", "https://sh.dataspace.copernicus.eu")
+        
+        log_event("using_credential", "Using credential from environment variables")
 
     if not cfg.sh_client_id or not cfg.sh_client_secret:
         log_event("credential_missing", "SH_CLIENT_ID / SH_CLIENT_SECRET missing")
-        sys.exit(1)
-    
-    log_event("sentinel_auth", "Authenticated with Sentinel Hub")
+        return None
+        
     return cfg
 
 def get_minio_client():
@@ -354,6 +446,10 @@ def main() -> None:
     
     log_event("app_start", "Starting Satellite Image Producer")
     
+    # Load credentials from file
+    credentials = load_credentials()
+    credential_index = 0
+    
     # Create Kafka producer
     producer = create_kafka_producer()
     
@@ -363,13 +459,11 @@ def main() -> None:
         log_event("app_exit", "Exiting due to MinIO connection failure")
         sys.exit(1)
     
-    # Build Sentinel Hub config
-    sh_cfg = build_sh_config()
-    
     log_event("app_config", f"Application configuration", {
         "poll_interval_sec": POLL_SECONDS,
         "cloud_limit_percent": CLOUD_LIMIT,
-        "days_lookback": DAYS_LOOKBACK
+        "days_lookback": DAYS_LOOKBACK,
+        "credential_count": len(credentials)
     })
 
     try:
@@ -378,6 +472,17 @@ def main() -> None:
             
             for buoy_id, lat, lon, radius_km in fetch_buoy_positions():
                 process_start = time.time()
+                
+                # Get next credential if we have multiple
+                credential, credential_index = get_next_credential(credentials, credential_index) if credentials else (None, 0)
+                
+                # Build Sentinel Hub config
+                sh_cfg = build_sh_config(credential)
+                if not sh_cfg:
+                    log_event("auth_error", "Unable to authenticate with Sentinel Hub, skipping buoy", {
+                        "buoy_id": buoy_id
+                    })
+                    continue
                 
                 # Create bounding box around buoy
                 bbox = bbox_around(lat, lon, radius_km)

@@ -153,10 +153,10 @@ def show_sensors_page(clients):
                     mapbox=dict(
                         style="open-street-map",
                         center=dict(lat=center_lat, lon=center_lon),
-                        zoom=5
+                        zoom=6.5
                     ),
                     margin=dict(l=0, r=0, t=0, b=0),
-                    height=400
+                    height=600
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
@@ -429,8 +429,8 @@ def show_sensors_page(clients):
                         st.markdown("<h3>Historical Measurements</h3>", unsafe_allow_html=True)
                         
                         # Create tabs for different metrics
-                        data_tabs = st.tabs(["Temperature & pH", "Turbidity & Quality", "Risk Score"])
-                        
+                        data_tabs = st.tabs(["Temperature & pH", "Turbidity & Quality"])
+
                         with data_tabs[0]:
                             # Temperature and pH chart
                             fig = go.Figure()
@@ -473,6 +473,60 @@ def show_sensors_page(clients):
                                     overlaying="y",
                                     side="right",
                                     range=[6, 9]  # pH typically 6-9
+                                ),
+                                legend=dict(
+                                    orientation="h",
+                                    yanchor="bottom",
+                                    y=1.02,
+                                    xanchor="right",
+                                    x=1
+                                )
+                            )
+                            
+                            st.plotly_chart(fig, use_container_width=True)
+
+                        # Aggiungiamo il contenuto per il tab "Turbidity & Quality"
+                        with data_tabs[1]:
+                            # Turbidity and Water Quality chart
+                            fig = go.Figure()
+                            
+                            # Add turbidity line
+                            if 'turbidity' in historical_data.columns:
+                                fig.add_trace(go.Scatter(
+                                    x=historical_data['time'],
+                                    y=historical_data['turbidity'],
+                                    mode='lines+markers',
+                                    name='Turbidity',
+                                    line=dict(color='#795548')
+                                ))
+                            
+                            # Add water quality index on secondary y-axis
+                            if 'water_quality_index' in historical_data.columns:
+                                fig.add_trace(go.Scatter(
+                                    x=historical_data['time'],
+                                    y=historical_data['water_quality_index'],
+                                    mode='lines+markers',
+                                    name='Water Quality Index',
+                                    line=dict(color='#4CAF50'),
+                                    yaxis='y2'
+                                ))
+                            
+                            # Update layout
+                            fig.update_layout(
+                                title="Turbidity and Water Quality History",
+                                xaxis_title="Time",
+                                yaxis=dict(
+                                    title="Turbidity",
+                                    titlefont=dict(color="#795548"),
+                                    tickfont=dict(color="#795548")
+                                ),
+                                yaxis2=dict(
+                                    title="Water Quality Index",
+                                    titlefont=dict(color="#4CAF50"),
+                                    tickfont=dict(color="#4CAF50"),
+                                    anchor="x",
+                                    overlaying="y",
+                                    side="right"
                                 ),
                                 legend=dict(
                                     orientation="h",
