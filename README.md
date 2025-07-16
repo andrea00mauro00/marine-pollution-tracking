@@ -455,6 +455,7 @@ This project leverages foundational research in environmental monitoring, anomal
 [6] Yao, J., Zhang, B., Li, C., Hong, D., & Chanussot, J. (2023). *Extended Vision Transformer (ExViT) for Land Use and Land Cover Classification: A Multimodal Deep Learning Framework*. IEEE Transactions on Geoscience and Remote Sensing, 61, 1–15. https://doi.org/10.1109/TGRS.2023.3284671
 
 [7] Sadaiappan, B., Balakrishnan, P., CR, V., Vijayan, N. T., Subramanian, M., & Gauns, M. U. (2023). *Applications of machine learning in chemical and biological oceanography*. ACS Omega, 8(18), 15831–15853.
+
 ---
 
 ## Team
@@ -463,8 +464,8 @@ This project was developed by:
 
 - @lorenzo-attolico
 - @00andrea00mauro
-- marcoRossi27
-- walterscf
+- @marcoRossi27
+- @walterscf
 
 
 
