@@ -226,4 +226,247 @@ This page is key for regulatory reporting and long-term planning.
 
 ![Report View](data/dashboard_screenshots/report.png)
 
+---
+
+## Installation & Quickstart
+
+Follow these steps to launch the full Marine Pollution Monitoring System locally via Docker:
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/andrea00mauro00/marine-pollution-tracking.git
+cd marine-pollution-tracking
+````
+
+### 2. Add Sentinel Hub credentials
+
+Create the file:
+
+```
+satellite_producer/credentials.json
+```
+
+With the following structure:
+
+```json
+{
+  "client_id": "<your-client-id>",
+  "client_secret": "<your-client-secret>"
+}
+```
+
+You may also use the development credentials already pre-configured in `docker-compose.yml` for local testing purposes.
+
+### 3. Start the system
+
+```bash
+docker-compose up -d
+```
+
+This command will start all services including producers, processors, databases, object storage, the alerting engine, and the visualization dashboard.
+
+### 4. Access the system
+
+* **Streamlit Dashboard**: [http://localhost:8501](http://localhost:8501)
+* **MinIO UI (Object Storage)**: [http://localhost:9001](http://localhost:9001)
+
+  * Username: `minioadmin`
+  * Password: `minioadmin`
+* **Schema Registry UI**: [http://localhost:8000](http://localhost:8000)
+* **PostgreSQL DB**: accessible via port `5432`
+* **TimescaleDB**: accessible via port `5433`
+
+All services run inside containers and are networked via the internal Docker bridge `marine_net`.
+
+---
+
+## Modules Breakdown
+
+The system is composed of independent microservices and Flink streaming jobs, each responsible for a specific step in the pipeline. Here’s a breakdown of all components:
+
+### 🛰️ Producers
+
+* **`buoy_producer/`**
+  Simulates real-time sensor readings (pH, turbidity, temperature, microplastics) and publishes them to Kafka.
+
+  * Kafka Topic: `buoy_data`
+
+* **`satellite_producer/`**
+  Periodically downloads Sentinel-2 imagery via Copernicus API and uploads them to MinIO (Bronze layer).
+
+  * Kafka Topic: `satellite_imagery`
+  * Object Storage: MinIO bucket `bronze`
+
+---
+
+### ⚙️ Flink Stream Processors
+
+* **`sensor_analyzer/`**
+  Parses and enriches sensor data, performs anomaly detection.
+
+  * Input: `buoy_data`
+  * Output: `analyzed_sensor_data`
+
+* **`image_standardizer/`**
+  Preprocesses satellite images (resizing, format conversion, metadata cleanup).
+
+  * Input: `satellite_imagery`
+  * Output: `processed_imagery`
+
+* **`pollution_detector/`**
+  Fuses satellite and sensor data to detect active pollution events.
+
+  * Inputs: `analyzed_sensor_data`, `processed_imagery`
+  * Outputs: `analyzed_data`, `pollution_hotspots`, `sensor_alerts`
+
+* **`ml_prediction/`**
+  Uses trained ML models to forecast pollution spread and environmental impact.
+
+  * Inputs: `analyzed_sensor_data`, `processed_imagery`
+  * Output: `pollution_predictions`
+
+---
+
+### 💾 Storage & Data Lake
+
+* **MinIO**
+  Serves as the object storage backend for raw and processed satellite images using a medallion architecture:
+
+  * `bronze`: raw images
+  * `silver`: standardized images
+  * `gold`: pollution masks and prediction overlays
+
+* **PostgreSQL**
+  Stores structured metadata about pollution events, alert records, and user feedback.
+
+* **TimescaleDB**
+  Optimized for storing high-frequency sensor measurements over time. Enables efficient queries, downsampling, and trend analysis.
+
+---
+
+### 📥 Consumers & Persistence
+
+* **`storage_consumer/`**
+  Consumes all processed topics and stores them into PostgreSQL, TimescaleDB, and MinIO accordingly.
+
+* **`dashboard_consumer/`**
+  Subscribes to all Kafka topics and pushes real-time updates to Redis for live dashboard rendering.
+
+---
+
+### 🚨 Alerting
+
+* **`alert_manager/`**
+  Detects high-risk events and emits tiered alerts (low/medium/high). Can be configured to:
+
+  * Send email, SMS, webhook notifications
+  * Route alerts to different recipients based on location
+  * Track alert history and resolution status
+
+---
+
+### ❌ Error Handling
+
+* **`dlq_consumer/` + `create_dlq_topics.py`**
+  Implements Dead Letter Queues (DLQs) for every Kafka topic to prevent data loss in case of serialization or processing errors.
+
+---
+
+### 📊 Dashboard
+
+* **`dashboard/`**
+  Built with Streamlit, this frontend aggregates all data layers into a single live monitoring interface. It provides:
+
+  * Navigation through multiple views (overview, map, predictions, reports)
+  * Real-time maps and trend visualizations
+  * Integration with Redis, TimescaleDB, PostgreSQL, and MinIO
+
+All components are designed to be stateless and restartable. The system is fully containerized, making it portable, reproducible, and scalable.
+
+---
+
+## Limitations
+
+While the prototype successfully demonstrates the core features of a real-time marine pollution monitoring system, several technical and architectural limitations remain:
+
+### ⚠️ Data Source Limitations
+- All data used in this implementation is **synthetic** (sensor and satellite), not real NOAA/USGS or Copernicus feeds.
+- No real-world validation of the alerting and prediction accuracy.
+
+### 📉 Machine Learning Shortcomings
+- Static ML models (Random Forests) trained on synthetic datasets.
+- No continuous learning, versioning, or performance monitoring pipeline implemented.
+- Absence of drift detection and retraining mechanisms.
+
+### 📦 System Architecture Constraints
+- Kafka is deployed in **single-broker** mode without replication or partitioning — not suitable for production scale.
+- **Fixed spatial grid** for hotspot detection may miss pollution clusters near boundaries or in highly variable density regions.
+- TimescaleDB lacks automated retention policies and advanced downsampling strategies.
+- Dashboard analytics are limited (e.g., no export, filtering, or user annotation features).
+
+### 🧠 Observability & Ops
+- No real-time system monitoring (e.g., Prometheus, Grafana, ELK).
+- Minimal observability: only structured logging and Redis pub/sub used.
+
+---
+
+## Future Improvements
+
+With additional time and resources, the following upgrades would make the system production-ready and more robust:
+
+### ✅ Data & ML Enhancements
+- Integrate **real data sources** from NOAA, USGS, and Sentinel Hub (Copernicus APIs)
+- Build a **retraining pipeline** using incoming data streams
+- Implement **drift detection** and **model performance monitoring**
+- Use modern architectures like LSTM, GRU, or Transformer-based time series models
+
+### ⚙️ Infrastructure
+- Deploy **Kafka clusters** with topic replication and custom partitioning
+- Add **Kubernetes orchestration** for dynamic autoscaling and zero-downtime rollouts
+- Move toward **cloud-native storage** with governance tools (e.g., AWS S3 + Lake Formation)
+
+### 📊 Dashboard Extensions
+- Add data export (CSV, GeoJSON), time filters, user feedback input
+- Integrate multi-layer overlays (e.g., temperature, salinity, wind)
+- Add download/export functionality for analytics and reports
+
+### 📌 Geo & Spatial Improvements
+- Use **adaptive spatial clustering** based on pollution density
+- Handle **boundary-overlapping events** and mobility of hotspots
+- Implement **spatiotemporal joins** between satellite events and sensor anomalies
+
+---
+
+## References
+
+This project leverages foundational research in environmental monitoring, anomaly detection, and satellite image analysis:
+
+[1] Sannigrahi, S., Basu, B., Basu, A. S., & Pilla, F. (2021). *Detection of marine floating plastic using Sentinel-2 imagery and machine learning models*. arXiv preprint arXiv:2106.03694.
+
+[2] Walsh, E. S., Kreakie, B. J., Cantwell, M. G., & Nacci, D. (2017). *A Random Forest approach to predict the spatial distribution of sediment pollution in an estuarine system*. PLoS One, 12(7), e0179473.
+
+[3] Li, Z., Zhu, Y., & Van Leeuwen, M. (2023). *A survey on explainable anomaly detection*. ACM Transactions on Knowledge Discovery from Data, 18(1), 1–54.
+
+[4] El-Shafeiy, E., Alsabaan, M., Ibrahem, M. I., & Elwahsh, H. (2023). *Real-time anomaly detection for water quality sensor monitoring based on multivariate deep learning technique*. Sensors, 23(20), 8613.
+
+[5] Zhou, H., Zhang, S., Peng, J., Zhang, S., Li, J., Xiong, H., & Zhang, W. (2021). *Informer: Beyond efficient transformer for long sequence time-series forecasting*. Proceedings of the AAAI Conference on Artificial Intelligence, 35(12), 11106–11115.
+
+[6] Yao, J., Zhang, B., Li, C., Hong, D., & Chanussot, J. (2023). *Extended Vision Transformer (ExViT) for Land Use and Land Cover Classification: A Multimodal Deep Learning Framework*. IEEE Transactions on Geoscience and Remote Sensing, 61, 1–15. https://doi.org/10.1109/TGRS.2023.3284671
+
+[7] Sadaiappan, B., Balakrishnan, P., CR, V., Vijayan, N. T., Subramanian, M., & Gauns, M. U. (2023). *Applications of machine learning in chemical and biological oceanography*. ACS Omega, 8(18), 15831–15853.
+---
+
+## Team
+
+This project was developed by:
+
+- @lorenzo-attolico
+- @00andrea00mauro
+- marcoRossi27
+- walterscf
+
+
+
+
 
