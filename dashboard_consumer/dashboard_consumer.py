@@ -1004,7 +1004,7 @@ def get_duplicate_search_radius(pollutant_type):
     return DEFAULT_DUPLICATE_SEARCH_RADIUS_KM
 
 def is_same_pollutant_type(type1, type2):
-    """Verifica se due tipi di inquinanti sono considerati equivalenti"""
+    """Verifica se due tipi di inquinanti sono considerati equivalenti - allineata con HotspotManager"""
     if type1 == type2:
         return True
     
@@ -1015,7 +1015,7 @@ def is_same_pollutant_type(type1, type2):
     if not type1 or not type2:
         return False
         
-    # Mappa di sinonimi per tipi di inquinanti
+    # Mappa di sinonimi per tipi di inquinanti - identica a HotspotManager
     synonyms = {
         "oil": ["oil_spill", "crude_oil", "petroleum", "crude", "spill", "petroleum_spill"],
         "chemical": ["chemical_spill", "toxic_chemicals", "toxics", "chemicals", "toxic_spill"],
@@ -1043,7 +1043,7 @@ def is_same_pollutant_type(type1, type2):
 def find_similar_hotspot(location, pollutant_type, redis_conn, postgres_conn=None, metrics=None):
     """
     Cerca hotspot simili basandosi su posizione geografica e tipo di inquinante
-    Utilizza un approccio a due livelli: Redis per ricerca rapida, PostgreSQL per verifica
+    Allineata con l'approccio di HotspotManager per la deduplicazione
     """
     start_time = time.time()
     
@@ -1079,13 +1079,13 @@ def find_similar_hotspot(location, pollutant_type, redis_conn, postgres_conn=Non
                   {"search_radius": search_radius, "pollutant_type": pollutant_type, 
                    "latitude": lat, "longitude": lon})
         
-        # Calcola bin spaziali da controllare
+        # Calcola bin spaziali da controllare - usando stesso approccio di HotspotManager
         lat_bin = math.floor(lat / SPATIAL_BIN_SIZE)
         lon_bin = math.floor(lon / SPATIAL_BIN_SIZE)
         
         # Determina quanti bin controllare basandosi sul raggio di ricerca
-        # Per un raggio grande, controlla più bin adiacenti
-        bin_range = max(1, min(3, int(search_radius / 10) + 1))
+        # Usa bin adiacenti, simile a HotspotManager (9 bin totali)
+        bin_range = 1  # Sempre 1 per 9 bin totali (3x3) come HotspotManager
         
         # Raccogli potenziali match dai bin vicini
         candidates = set()
@@ -1097,7 +1097,7 @@ def find_similar_hotspot(location, pollutant_type, redis_conn, postgres_conn=Non
                     return redis_conn.smembers(bin_key)
                 
                 try:
-                    bin_members = retry_operation(get_bin_members, circuit_breaker=redis_cb) or set()
+                    bin_members = retry_operation(get_bin_members, circuit_breaker=redis_cb)
                     if metrics:
                         metrics.record_redis_operation(True)
                     
@@ -1217,20 +1217,27 @@ def find_similar_hotspot(location, pollutant_type, redis_conn, postgres_conn=Non
                 
                 h_lat = float(h_data.get('center_latitude', 0))
                 h_lon = float(h_data.get('center_longitude', 0))
+                h_radius = float(h_data.get('radius_km', 5.0))
                 h_type = h_data.get('pollutant_type', 'unknown')
                 
                 # Calcola distanza
                 distance = calculate_distance(lat, lon, h_lat, h_lon)
                 
-                # Verifica match per distanza e tipo
-                if distance <= search_radius and is_same_pollutant_type(pollutant_type, h_type):
+                # MODIFICA: Usa stesso approccio di HotspotManager per sovrapposizione
+                # Invece di usare solo distance <= search_radius, usa il criterio combined_radius * 1.1
+                combined_radius = search_radius + h_radius
+                is_overlapping = distance <= combined_radius * 1.1  # 10% margine di tolleranza
+                
+                # Verifica match per sovrapposizione e tipo
+                if is_overlapping and is_same_pollutant_type(pollutant_type, h_type):
                     # Tieni il più vicino
                     if distance < min_distance:
                         min_distance = distance
                         best_match = h_id
                         log_event("potential_duplicate", f"Trovato potenziale duplicato: {h_id} a distanza {distance:.2f}km", 
                                   {"hotspot_id": h_id, "distance": round(distance, 2), 
-                                   "pollutant_type": h_type})
+                                   "pollutant_type": h_type, 
+                                   "combined_radius": round(combined_radius, 2)})
             except (ValueError, TypeError, KeyError) as e:
                 log_event("hotspot_analysis_error", f"Errore nell'analisi dell'hotspot {h_id}", 
                           {"error": str(e), "error_type": type(e).__name__, "hotspot_id": h_id}, "warning")
@@ -1255,11 +1262,13 @@ def find_similar_hotspot(location, pollutant_type, redis_conn, postgres_conn=Non
                   {"error": str(e), "error_type": type(e).__name__, 
                    "traceback": traceback.format_exc()}, "error")
         return None
+        return None
 
 def find_similar_hotspot_in_postgres(lat, lon, pollutant_type, search_radius, postgres_conn, metrics=None):
     """
     Cerca hotspot simili in PostgreSQL quando Redis non ha risultati
     Utile per hotspot che potrebbero non essere più in cache Redis
+    Allineata con l'approccio di HotspotManager
     """
     start_time = time.time()
     
@@ -1283,12 +1292,13 @@ def find_similar_hotspot_in_postgres(lat, lon, pollutant_type, search_radius, po
         
         def query_postgres():
             with postgres_conn.cursor() as cur:
-                # Query per trovare hotspot vicini con lo stesso tipo di inquinante
+                # Query migliorata, allineata con l'approccio di HotspotManager
                 cur.execute("""
                     SELECT 
                         hotspot_id, 
                         center_latitude, 
                         center_longitude, 
+                        radius_km,
                         pollutant_type,
                         severity,
                         last_updated_at
@@ -1296,47 +1306,17 @@ def find_similar_hotspot_in_postgres(lat, lon, pollutant_type, search_radius, po
                     WHERE 
                         center_latitude BETWEEN %s AND %s
                         AND center_longitude BETWEEN %s AND %s
-                        AND pollutant_type = %s
                         AND last_updated_at > NOW() - INTERVAL '24 hours'
                         AND (source_data::jsonb->>'is_duplicate')::text IS DISTINCT FROM 'true'
                         AND status NOT IN ('inactive', 'replaced')
                     ORDER BY last_updated_at DESC
-                    LIMIT 10
+                    LIMIT 15
                 """, (
                     lat - lat_delta, lat + lat_delta,
-                    lon - lon_delta, lon + lon_delta,
-                    pollutant_type
+                    lon - lon_delta, lon + lon_delta
                 ))
                 
-                results = cur.fetchall()
-                
-                if not results:
-                    # Se non trova con tipo esatto, prova con ricerca più permissiva
-                    cur.execute("""
-                        SELECT 
-                            hotspot_id, 
-                            center_latitude, 
-                            center_longitude, 
-                            pollutant_type,
-                            severity,
-                            last_updated_at
-                        FROM active_hotspots
-                        WHERE 
-                            center_latitude BETWEEN %s AND %s
-                            AND center_longitude BETWEEN %s AND %s
-                            AND last_updated_at > NOW() - INTERVAL '24 hours'
-                            AND (source_data::jsonb->>'is_duplicate')::text IS DISTINCT FROM 'true'
-                            AND status NOT IN ('inactive', 'replaced')
-                        ORDER BY last_updated_at DESC
-                        LIMIT 10
-                    """, (
-                        lat - lat_delta, lat + lat_delta,
-                        lon - lon_delta, lon + lon_delta
-                    ))
-                    
-                    results = cur.fetchall()
-                
-                return results
+                return cur.fetchall()
         
         # Esegui la query con circuit breaker
         try:
@@ -1363,19 +1343,24 @@ def find_similar_hotspot_in_postgres(lat, lon, pollutant_type, search_radius, po
         min_distance = float('inf')
         
         for result in results:
-            hotspot_id, db_lat, db_lon, db_type, db_severity, db_updated = result
+            hotspot_id, db_lat, db_lon, db_radius, db_type, db_severity, db_updated = result
             
             # Calcola distanza effettiva
             distance = calculate_distance(lat, lon, db_lat, db_lon)
             
+            # MODIFICA: Usa stesso approccio di HotspotManager per sovrapposizione
+            combined_radius = search_radius + db_radius
+            is_overlapping = distance <= combined_radius * 1.1  # 10% margine di tolleranza
+            
             # Verifica se rientra nel raggio e ha tipo compatibile
-            if distance <= search_radius and is_same_pollutant_type(pollutant_type, db_type):
+            if is_overlapping and is_same_pollutant_type(pollutant_type, db_type):
                 if distance < min_distance:
                     min_distance = distance
                     best_match = hotspot_id
                     log_event("postgres_duplicate", f"Trovato duplicato in PostgreSQL: {hotspot_id} a distanza {distance:.2f}km", 
                               {"hotspot_id": hotspot_id, "distance": round(distance, 2), 
-                               "pollutant_type": db_type})
+                               "pollutant_type": db_type,
+                               "combined_radius": round(combined_radius, 2)})
         
         processing_time = time.time() - start_time
         if best_match:
@@ -1397,6 +1382,7 @@ def find_similar_hotspot_in_postgres(lat, lon, pollutant_type, search_radius, po
 def compare_hotspot_quality(existing_id, new_data, redis_conn, postgres_conn=None, metrics=None):
     """
     Confronta un hotspot esistente con uno nuovo per decidere quale mantenere
+    Allineato con l'approccio decisionale di HotspotManager
     Restituisce True se l'originale è migliore, False se il nuovo è migliore
     """
     start_time = time.time()
@@ -1469,14 +1455,15 @@ def compare_hotspot_quality(existing_id, new_data, redis_conn, postgres_conn=Non
                 if metrics:
                     metrics.record_db_operation("postgres", False)
                 log_event("postgres_fetch_error", f"Errore nel recupero dati da PostgreSQL per {existing_id}", 
-                          {"error": str(e), "error_type": type(e).__name__, "hotspot_id": existing_id}, "error")
+                          {"error": str(e), "error_type": type(e).__name__, 
+                           "hotspot_id": existing_id}, "error")
         
         if not existing_data:
             log_event("missing_hotspot_data", f"Nessun dato trovato per hotspot esistente {existing_id}", 
                       {"hotspot_id": existing_id})
             return False
             
-        # CRITERI DI CONFRONTO
+        # CRITERI DI CONFRONTO - allineati con HotspotManager
         
         # 1. Preferisci sempre hotspot con severità maggiore
         severity_rank = {"high": 3, "medium": 2, "low": 1, "unknown": 0, "none": 0}
@@ -1570,24 +1557,6 @@ def compare_hotspot_quality(existing_id, new_data, redis_conn, postgres_conn=Non
                               {"decision": "keep_new", "reason": "more_recent", 
                                "time_diff_minutes": round(time_diff_minutes)})
                     return False
-        except (ValueError, TypeError):
-            pass
-        
-        # 6. In caso di ulteriore parità, preferisci quello con raggio minore (più preciso)
-        try:
-            existing_radius = float(existing_data.get("radius_km", existing_data.get("location", {}).get("radius_km", 10.0)))
-            new_radius = float(new_data.get("radius_km", new_data.get("location", {}).get("radius_km", 10.0)))
-            
-            if existing_radius < new_radius * 0.8:  # Almeno 20% più piccolo
-                log_event("keep_original_radius", f"Mantengo originale: raggio minore/più preciso ({existing_radius:.2f}km < {new_radius:.2f}km)", 
-                          {"decision": "keep_original", "reason": "smaller_radius", 
-                           "existing_radius": round(existing_radius, 2), "new_radius": round(new_radius, 2)})
-                return True
-            if new_radius < existing_radius * 0.8:
-                log_event("keep_new_radius", f"Mantengo nuovo: raggio minore/più preciso ({new_radius:.2f}km < {existing_radius:.2f}km)", 
-                          {"decision": "keep_new", "reason": "smaller_radius", 
-                           "existing_radius": round(existing_radius, 2), "new_radius": round(new_radius, 2)})
-                return False
         except (ValueError, TypeError):
             pass
         
@@ -1758,9 +1727,10 @@ def mark_hotspot_replaced(old_id, new_id, redis_conn, metrics=None):
 def acquire_lock(redis_conn, lock_name, timeout=30, retry_count=5, retry_delay=0.2, metrics=None):
     """
     Acquisisce un lock distribuito con retry
-    Utile per prevenire race condition durante il controllo duplicati
+    Allineato con l'approccio di HotspotManager per prevenire race condition
     """
-    lock_key = f"locks:duplicate_check:{lock_name}"
+    # Formato chiave di lock allineato con HotspotManager
+    lock_key = f"locks:hotspot:{lock_name}"
     lock_value = str(uuid.uuid4())
     
     for attempt in range(retry_count):
@@ -1813,8 +1783,12 @@ def acquire_lock(redis_conn, lock_name, timeout=30, retry_count=5, retry_delay=0
     return None
 
 def release_lock(redis_conn, lock_name, lock_value, metrics=None):
-    """Rilascia un lock distribuito in modo sicuro"""
-    lock_key = f"locks:duplicate_check:{lock_name}"
+    """
+    Rilascia un lock distribuito in modo sicuro
+    Allineato con l'approccio di HotspotManager
+    """
+    # Formato chiave di lock allineato con HotspotManager
+    lock_key = f"locks:hotspot:{lock_name}"
     
     try:
         # Script Lua per rilascio sicuro (rilascia solo se il valore corrisponde)
@@ -2039,7 +2013,7 @@ def process_analyzed_sensor_data(data, redis_conn, metrics):
 def process_hotspot(data, redis_conn, postgres_conn, metrics):
     """
     Processa hotspot per dashboard con controllo duplicati integrato
-    Implementa un sistema robusto di deduplicazione con lock distribuito
+    Allineato con la logica di HotspotManager per gestire duplicati in modo consistente
     """
     start_time = time.time()
     
@@ -2146,11 +2120,12 @@ def process_hotspot(data, redis_conn, postgres_conn, metrics):
             pollutant_type = data.get('pollutant_type', 'unknown')
             
             # Crea un lock name basato sulla posizione approssimativa per prevenire race condition
+            # MODIFICA: Usa lo stesso formato di chiave di lock di HotspotManager
             lat = float(location['center_latitude'])
             lon = float(location['center_longitude'])
-            lat_bin = math.floor(lat * 10) / 10  # Arrotonda a 0.1 gradi (circa 11km)
-            lon_bin = math.floor(lon * 10) / 10
-            lock_name = f"{lat_bin}_{lon_bin}_{pollutant_type}"
+            lat_bin = math.floor(lat * 1000) / 1000  # Usa 3 decimali come HotspotManager
+            lon_bin = math.floor(lon * 1000) / 1000
+            lock_name = f"{lat_bin}:{lon_bin}:{pollutant_type}"  # Usa ":" invece di "_"
             
             # Acquisisci lock per prevenire race condition
             lock_value = acquire_lock(redis_conn, lock_name, metrics=metrics)
@@ -2326,12 +2301,12 @@ def process_hotspot(data, redis_conn, postgres_conn, metrics):
                 else:
                     pipe.srem("dashboard:hotspots:duplicates", hotspot_id)
                 
-                # Calcolo standardizzato degli hash spaziali
+                # Calcolo standardizzato degli hash spaziali - allineato con HotspotManager
                 try:
                     lat = float(location['center_latitude'])
                     lon = float(location['center_longitude'])
                     
-                    # Usa esattamente lo stesso metodo di binning di HotspotManager
+                    # Usa esattamente lo stesso metodo di binning
                     lat_bin = math.floor(lat / SPATIAL_BIN_SIZE)
                     lon_bin = math.floor(lon / SPATIAL_BIN_SIZE)
                     spatial_key = spatial_bin_key(lat_bin, lon_bin)
