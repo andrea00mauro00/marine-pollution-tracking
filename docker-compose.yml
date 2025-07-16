@@ -494,6 +494,18 @@ services:
     restart: on-failure
 
   # Aggiungi alla fine del docker-compose.yml esistente
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    ports:
+      - "9002:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    restart: unless-stopped
+    networks:
+      - marine_net
+
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:latest
     container_name: cadvisor
@@ -517,3 +529,4 @@ volumes:
   dashboard_data:
   postgres_data:
   timescaledb_data:
+  portainer_data:
