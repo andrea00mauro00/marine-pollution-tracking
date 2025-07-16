@@ -1,14 +1,42 @@
 """
 ==============================================================================
-Marine Pollution Monitoring System - Enhanced Image Standardizer with ML
+Marine Pollution Monitoring System - Smart Image Standardizer with Safe Tiling
 ==============================================================================
-This job:
+
+This module processes satellite imagery for marine pollution detection using 
+an intelligent tiling strategy that automatically adapts to image size:
+
+• Direct processing for small images (< 50MB) - typical satellite imagery
+• Sequential tiling for large images (> 50MB) - memory-efficient processing
+• NO ThreadPoolExecutor to ensure Flink compatibility and avoid gRPC conflicts
+
+WORKFLOW:
 1. Consumes satellite imagery metadata from Kafka
-2. Retrieves the original image from MinIO Bronze layer
-3. Standardizes the image format and applies basic preprocessing
-4. Analyzes images using ML models for pollution detection
-5. Publishes the processed imagery metadata back to Kafka
-6. Creates spatial index in Silver layer
+2. Retrieves raw images from MinIO Bronze layer
+3. Applies smart image processing (direct or tiled)
+4. Performs pollution detection using ML models + rule-based fallback
+5. Creates pollution masks and calculates affected areas
+6. Generates spectral analysis and environmental indices
+7. Stores processed results in MinIO Silver layer
+8. Publishes enriched data to Kafka for downstream processing
+
+POLLUTION DETECTION:
+- Supports oil spills, algal blooms, sediment, and chemical discharge
+- Uses trained ML models when available, falls back to rule-based detection
+- Leverages spectral band information for enhanced accuracy
+- Creates binary masks and confidence scores
+
+TECHNICAL DETAILS:
+- Tile size: 512x512 pixels for large image processing
+- Memory threshold: 50MB for processing strategy selection
+- Retry logic: 3 attempts with exponential backoff
+- Checkpoint interval: 60 seconds for fault tolerance
+- Compatible with Apache Flink streaming execution
+
+ENVIRONMENT VARIABLES:
+- KAFKA_BOOTSTRAP_SERVERS, SATELLITE_TOPIC, PROCESSED_IMAGERY_TOPIC
+- MINIO_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+==============================================================================
 """
 
 import os
@@ -40,7 +68,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration variables - corrected variable names
+# Configuration variables
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 SATELLITE_TOPIC = os.environ.get("SATELLITE_TOPIC", "satellite_imagery")
 PROCESSED_IMAGERY_TOPIC = os.environ.get("PROCESSED_IMAGERY_TOPIC", "processed_imagery")
@@ -49,16 +77,21 @@ MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "minio:9000")
 MINIO_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
 MINIO_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
 
+# Smart tiling configuration
+TILE_SIZE = 512  # Tile size for large images
+LARGE_IMAGE_THRESHOLD = 50 * 1024 * 1024  # 50MB threshold for tiling
+MAX_DIRECT_DIMENSION = 4096  # Max dimension for direct processing
+
 # Retry configuration
 MAX_RETRIES = 3
-BACKOFF_FACTOR = 2  # secondi
+BACKOFF_FACTOR = 2
 
-# Oggetto metrics globale
+# Global metrics object
 metrics = None
 
-# Funzione per logging strutturato
+# Structured logging function
 def log_event(event_type, message, data=None):
-    """Funzione centralizzata per logging strutturato"""
+    """Centralized structured logging function"""
     log_data = {
         "event_type": event_type,
         "component": "image_standardizer",
@@ -68,37 +101,49 @@ def log_event(event_type, message, data=None):
         log_data.update(data)
     logger.info(f"{message}", extra={"data": json.dumps(log_data)})
 
-# Classe per metriche di performance
+# Simple metrics class
 class SimpleMetrics:
-    """Implementazione semplice di metriche di performance"""
+    """Simple performance metrics implementation"""
     def __init__(self):
         self.start_time = time.time()
         self.processed_count = 0
         self.error_count = 0
+        self.direct_processing_count = 0
+        self.tiling_count = 0
     
     def record_processed(self):
-        """Registra un messaggio elaborato con successo"""
+        """Record a successfully processed message"""
         self.processed_count += 1
-        if self.processed_count % 10 == 0:  # Frequenza minore per immagini che sono più pesanti
+        if self.processed_count % 10 == 0:
             self.log_metrics()
     
     def record_error(self):
-        """Registra un errore di elaborazione"""
+        """Record a processing error"""
         self.error_count += 1
     
+    def record_direct_processing(self):
+        """Record direct processing usage"""
+        self.direct_processing_count += 1
+    
+    def record_tiling(self):
+        """Record tiling usage"""
+        self.tiling_count += 1
+    
     def log_metrics(self):
-        """Registra le metriche di performance attuali"""
+        """Log current performance metrics"""
         elapsed = time.time() - self.start_time
         log_event("metrics_update", "Performance metrics", {
             "processed_count": self.processed_count,
             "error_count": self.error_count,
+            "direct_processing_count": self.direct_processing_count,
+            "tiling_count": self.tiling_count,
             "messages_per_second": round(self.processed_count / elapsed if elapsed > 0 else 0, 2),
             "uptime_seconds": int(elapsed)
         })
 
-# Funzione generica di retry con backoff esponenziale
+# Generic retry function with exponential backoff
 def retry_operation(operation, max_attempts=MAX_RETRIES, initial_delay=1):
-    """Funzione di retry con backoff esponenziale"""
+    """Retry function with exponential backoff"""
     attempt = 0
     delay = initial_delay
     
@@ -117,9 +162,8 @@ def retry_operation(operation, max_attempts=MAX_RETRIES, initial_delay=1):
                 "delay": delay
             })
             time.sleep(delay)
-            delay *= 2  # Backoff esponenziale
+            delay *= 2
     
-    # Non dovrebbe mai arrivare qui perché l'ultimo tentativo fallito lancia un'eccezione
     raise Exception(f"Operation failed after {max_attempts} attempts")
 
 def configure_checkpoints(env):
@@ -127,12 +171,16 @@ def configure_checkpoints(env):
     env.enable_checkpointing(60000)  # 60 seconds
     checkpoint_config = env.get_checkpoint_config()
     checkpoint_config.set_checkpoint_timeout(30000)
+    checkpoint_config.set_max_concurrent_checkpoints(1)
+    checkpoint_config.set_min_pause_between_checkpoints(5000)
     return env
 
 class ImageStandardizer(ProcessFunction):
     """
-    Standardize satellite imagery from the raw format into a consistent format
-    suitable for further analysis. Creates spatial index for efficient retrieval.
+    Smart Image Standardizer with safe tiling:
+    - Direct processing for small images (< 50MB)
+    - Sequential tiling for large images (> 50MB)
+    - NO ThreadPoolExecutor to avoid Flink conflicts
     """
     
     def __init__(self):
@@ -140,7 +188,7 @@ class ImageStandardizer(ProcessFunction):
     
     def open(self, runtime_context):
         """Initialize resources when worker starts"""
-        log_event("standardizer_init", "Initializing Image Standardizer")
+        log_event("standardizer_init", "Initializing Smart Image Standardizer")
         
         # Load ML model from MinIO
         self._load_models_with_retry()
@@ -231,23 +279,20 @@ class ImageStandardizer(ProcessFunction):
             # Extract image pointer and metadata with Schema Registry support
             image_path = data.get("image_pointer")
             
-            # CRITICAL CORRECTION: Handle Schema Registry format
+            # Handle Schema Registry format
             metadata_content = {}
             if isinstance(data.get("metadata"), str):
                 try:
-                    # Deserialize the payload complete from metadata string
                     metadata_content = json.loads(data.get("metadata", "{}"))
                     log_event("metadata_parsing", f"Parsed metadata string", {
                         "keys_found": list(metadata_content.keys())
                     })
                     
-                    # Extract fields from deserialized content
                     metadata = metadata_content.get("metadata", {})
                     spectral_metadata = metadata_content.get("spectral_metadata", {})
                     cloud_coverage = metadata_content.get("cloud_coverage", 0)
                     cloud_metadata = metadata_content.get("cloud_metadata", {})
                     
-                    # If we don't have an image_pointer yet, check in metadata_content
                     if not image_path and "image_pointer" in metadata_content:
                         image_path = metadata_content["image_pointer"]
                         log_event("image_pointer_found", f"Found image_pointer in metadata content", {
@@ -263,7 +308,6 @@ class ImageStandardizer(ProcessFunction):
                     cloud_coverage = 0
                     cloud_metadata = {}
             else:
-                # Format with fields at the root level
                 metadata = data.get("metadata", {})
                 spectral_metadata = data.get("spectral_metadata", {})
                 cloud_coverage = data.get("cloud_coverage", 0)
@@ -280,7 +324,7 @@ class ImageStandardizer(ProcessFunction):
             # Generate unique ID
             image_id = str(uuid.uuid4())
             
-            # Extract timestamp - handle different formats
+            # Extract timestamp
             timestamp = self._extract_timestamp(data, metadata, metadata_content)
             
             log_event("image_processing", f"Processing satellite image", {
@@ -289,7 +333,7 @@ class ImageStandardizer(ProcessFunction):
                 "timestamp": timestamp
             })
             
-            # Create S3 client and retrieve image with retry
+            # Retrieve image with retry
             def retrieve_image_operation():
                 import boto3
                 s3_client = boto3.client(
@@ -320,45 +364,29 @@ class ImageStandardizer(ProcessFunction):
                     metrics.record_error()
                 return
             
-            # Assess image quality based on cloud coverage
+            # Assess image quality
             image_reliability = self._assess_image_quality(cloud_coverage, cloud_metadata)
             log_event("image_quality", f"Image reliability assessment", {
                 "reliability": round(image_reliability, 2),
                 "cloud_coverage": cloud_coverage
             })
             
-            # Process image with memory optimization
+            # SMART IMAGE PROCESSING - This is where the magic happens
             try:
-                # Open image with memory optimization
-                img = self._open_and_process_image(image_bytes)
+                img = self._process_image_smart(image_bytes)
                 if img is None:
-                    log_event("image_processing_error", "Failed to open image, skipping processing", {
+                    log_event("image_processing_error", "Failed to process image, skipping", {
                         "image_path": image_path
                     })
                     if metrics:
                         metrics.record_error()
                     return
                     
-                log_event("image_opened", f"Opened image successfully", {
+                log_event("image_processed", f"Successfully processed image", {
                     "format": img.format,
                     "mode": img.mode,
                     "size": f"{img.size[0]}x{img.size[1]}"
                 })
-                
-                # Convert to RGB and apply basic enhancements
-                if img.mode != 'RGB':
-                    log_event("image_conversion", f"Converting image mode", {
-                        "from_mode": img.mode,
-                        "to_mode": "RGB"
-                    })
-                    img = img.convert('RGB')
-                
-                # Apply Gaussian blur for noise reduction
-                img = img.filter(ImageFilter.GaussianBlur(radius=0.5))
-                
-                # Enhance contrast slightly
-                enhancer = ImageEnhance.Contrast(img)
-                img = enhancer.enhance(1.2)
                 
                 # Calculate centroid from satellite_data
                 centroid_latitude, centroid_longitude = self._calculate_centroid(metadata)
@@ -374,16 +402,13 @@ class ImageStandardizer(ProcessFunction):
                         "indices_types": list(env_indices.keys())
                     })
                 
-                # Extract thumbnail for faster processing downstream
-                thumbnail = self._create_thumbnail(img)
-                
                 # Extract features for pollution classification
                 features = self._extract_image_features(img)
                 log_event("feature_extraction", f"Extracted image features", {
                     "feature_count": len(features)
                 })
                 
-                # Detect pollution type using ML model or rules
+                # Detect pollution type
                 pollution_type, confidence = self._detect_pollution_type(features, spectral_metadata)
                 log_event("pollution_detection", f"Detected pollution type", {
                     "pollution_type": pollution_type,
@@ -416,10 +441,7 @@ class ImageStandardizer(ProcessFunction):
                 mask_path = None
                 
                 def save_processed_image():
-                    # Ensure silver bucket exists
                     self._ensure_bucket_exists(s3_client, "silver")
-                    
-                    # Save the processed image
                     s3_client.put_object(
                         Bucket="silver",
                         Key=processed_image_path,
@@ -466,7 +488,7 @@ class ImageStandardizer(ProcessFunction):
                         "error_message": str(e)
                     })
                 
-                # Create spatial index with retry
+                # Create spatial index
                 def create_spatial_index_operation():
                     return self._create_spatial_index(image_id, timestamp, data, metadata, processed_image_path, s3_client)
                 
@@ -479,10 +501,10 @@ class ImageStandardizer(ProcessFunction):
                     })
                     spatial_index_path = None
                 
-                # Generate recommendations based on pollution type
+                # Generate recommendations
                 recommendations = self._generate_recommendations(pollution_type, affected_area_ratio)
                 
-                # Create standardized result with all required fields
+                # Create standardized result
                 processed_data = {
                     "image_id": image_id,
                     "timestamp": timestamp,
@@ -490,7 +512,7 @@ class ImageStandardizer(ProcessFunction):
                     "location": {
                         "latitude": centroid_latitude,
                         "longitude": centroid_longitude,
-                        "radius_km": affected_area_ratio * 10  # Approximate radius based on affected area
+                        "radius_km": affected_area_ratio * 10
                     },
                     "metadata": metadata,
                     "spectral_analysis": spectral_analysis,
@@ -529,13 +551,12 @@ class ImageStandardizer(ProcessFunction):
                     "size_bytes": message_size
                 })
                 
-                # If message is too large, create a simplified version
-                if message_size > 900000:  # Close to 1MB limit
+                # Simplify message if too large
+                if message_size > 900000:
                     log_event("message_size_warning", f"Message size approaching Kafka limit, simplifying", {
                         "original_size": message_size,
                         "limit": 900000
                     })
-                    # Create simplified version by removing large arrays and details
                     processed_data["spectral_analysis"]["processed_bands"] = processed_data["spectral_analysis"]["processed_bands"][:2]
                     processed_data["recommendations"] = processed_data["recommendations"][:3]
                     json_output = json.dumps(processed_data)
@@ -547,7 +568,6 @@ class ImageStandardizer(ProcessFunction):
                 if metrics:
                     metrics.record_processed()
                 
-                # Log completamento
                 processing_time = time.time() - start_time
                 log_event("processing_complete", f"Completed image processing", {
                     "image_id": image_id,
@@ -558,7 +578,6 @@ class ImageStandardizer(ProcessFunction):
                 yield json_output
                 
             except Exception as e:
-                # Record error
                 if metrics:
                     metrics.record_error()
                 
@@ -572,7 +591,6 @@ class ImageStandardizer(ProcessFunction):
                 return
                 
         except Exception as e:
-            # Record error
             if metrics:
                 metrics.record_error()
             
@@ -583,6 +601,178 @@ class ImageStandardizer(ProcessFunction):
                 "traceback": traceback.format_exc(),
                 "processing_time_ms": int(processing_time * 1000)
             })
+    
+    def _process_image_smart(self, image_bytes):
+        """
+        Smart image processing that chooses the best strategy:
+        - Direct processing for small images
+        - Sequential tiling for large images
+        - NO ThreadPoolExecutor for Flink compatibility
+        """
+        try:
+            # First, analyze the image
+            image_size = len(image_bytes)
+            log_event("image_analysis", f"Analyzing image for processing strategy", {
+                "size_bytes": image_size,
+                "size_mb": round(image_size / (1024*1024), 2)
+            })
+            
+            # Strategy decision based on size
+            if image_size < LARGE_IMAGE_THRESHOLD:
+                # Small image - use direct processing
+                log_event("strategy_direct", f"Using direct processing for small image", {
+                    "size_mb": round(image_size / (1024*1024), 2),
+                    "threshold_mb": round(LARGE_IMAGE_THRESHOLD / (1024*1024), 2)
+                })
+                if metrics:
+                    metrics.record_direct_processing()
+                return self._process_image_direct(image_bytes)
+            else:
+                # Large image - use sequential tiling
+                log_event("strategy_tiling", f"Using sequential tiling for large image", {
+                    "size_mb": round(image_size / (1024*1024), 2),
+                    "threshold_mb": round(LARGE_IMAGE_THRESHOLD / (1024*1024), 2)
+                })
+                if metrics:
+                    metrics.record_tiling()
+                return self._process_image_with_sequential_tiling(image_bytes)
+                
+        except Exception as e:
+            log_event("smart_processing_error", f"Error in smart processing: {str(e)}", {
+                "error_type": type(e).__name__,
+                "error_message": str(e)
+            })
+            return None
+    
+    def _process_image_direct(self, image_bytes):
+        """Direct processing for small images"""
+        try:
+            img = Image.open(BytesIO(image_bytes))
+            
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Apply standard processing
+            img = img.filter(ImageFilter.GaussianBlur(radius=0.5))
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(1.2)
+            
+            return img
+            
+        except Exception as e:
+            log_event("direct_processing_error", f"Error in direct processing: {str(e)}", {
+                "error_type": type(e).__name__,
+                "error_message": str(e)
+            })
+            return None
+    
+    def _process_image_with_sequential_tiling(self, image_bytes):
+        """
+        Sequential tiling for large images - NO ThreadPoolExecutor
+        This is Flink-safe and processes tiles one by one
+        """
+        try:
+            # First, check if we can open the image
+            with Image.open(BytesIO(image_bytes)) as img:
+                width, height = img.size
+                
+                # If image is still manageable, try direct processing with downsizing
+                if width <= MAX_DIRECT_DIMENSION and height <= MAX_DIRECT_DIMENSION:
+                    log_event("tiling_fallback_direct", f"Image within direct processing limits", {
+                        "size": f"{width}x{height}",
+                        "max_dimension": MAX_DIRECT_DIMENSION
+                    })
+                    return self._process_image_direct(image_bytes)
+                
+                # Create result image
+                result_img = Image.new('RGB', (width, height))
+                
+                # Create tiles
+                tiles = []
+                for y in range(0, height, TILE_SIZE):
+                    for x in range(0, width, TILE_SIZE):
+                        box = (x, y, min(x + TILE_SIZE, width), min(y + TILE_SIZE, height))
+                        tiles.append(box)
+                
+                log_event("sequential_tiling", f"Processing {len(tiles)} tiles sequentially", {
+                    "original_size": f"{width}x{height}",
+                    "tile_size": TILE_SIZE,
+                    "tile_count": len(tiles)
+                })
+                
+                # Process tiles sequentially (NO parallel processing)
+                for i, box in enumerate(tiles):
+                    try:
+                        # Open image fresh for each tile to manage memory
+                        with Image.open(BytesIO(image_bytes)) as img:
+                            # Extract tile
+                            tile = img.crop(box)
+                            
+                            # Process tile
+                            if tile.mode != 'RGB':
+                                tile = tile.convert('RGB')
+                            
+                            tile = tile.filter(ImageFilter.GaussianBlur(radius=0.5))
+                            enhancer = ImageEnhance.Contrast(tile)
+                            tile = enhancer.enhance(1.2)
+                            
+                            # Insert into result image
+                            result_img.paste(tile, (box[0], box[1]))
+                            
+                            # Log progress every 20 tiles
+                            if i % 20 == 0:
+                                log_event("tile_progress", f"Processed {i+1}/{len(tiles)} tiles")
+                            
+                            # Give control back to Flink every 10 tiles
+                            if i % 10 == 0:
+                                time.sleep(0.001)  # Micro-sleep for Flink
+                                
+                    except Exception as e:
+                        log_event("tile_error", f"Error processing tile {i}: {str(e)}", {
+                            "error_type": type(e).__name__,
+                            "tile_index": i,
+                            "tile_box": box
+                        })
+                        # Continue with next tile
+                        continue
+                
+                log_event("sequential_tiling_complete", f"Sequential tiling completed", {
+                    "total_tiles": len(tiles)
+                })
+                
+                return result_img
+                
+        except Exception as e:
+            log_event("sequential_tiling_error", f"Sequential tiling failed: {str(e)}", {
+                "error_type": type(e).__name__,
+                "error_message": str(e)
+            })
+            
+            # Final fallback: try to downsize and process directly
+            try:
+                log_event("final_fallback", "Attempting final fallback with downsizing")
+                with Image.open(BytesIO(image_bytes)) as img:
+                    # Downsize to manageable dimensions
+                    scale_factor = MAX_DIRECT_DIMENSION / max(img.size)
+                    new_size = (int(img.size[0] * scale_factor), int(img.size[1] * scale_factor))
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                    
+                    # Convert to RGB
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    
+                    # Apply processing
+                    img = img.filter(ImageFilter.GaussianBlur(radius=0.5))
+                    enhancer = ImageEnhance.Contrast(img)
+                    img = enhancer.enhance(1.2)
+                    
+                    return img
+            except Exception as fallback_e:
+                log_event("final_fallback_error", f"Final fallback failed: {str(fallback_e)}", {
+                    "error_type": type(fallback_e).__name__
+                })
+                return None
     
     def _extract_timestamp(self, data, metadata, metadata_content):
         """Extract and normalize timestamp from data"""
@@ -643,30 +833,23 @@ class ImageStandardizer(ProcessFunction):
                 "image_path": image_path
             })
             
-            # Try to list available keys to help with debugging
+            # Try to find alternatives
             try:
-                # Extract the prefix path from the key
                 prefix_parts = image_path.split('/')
                 prefix = '/'.join(prefix_parts[:-1]) + '/'
                 
-                log_event("listing_alternatives", f"Listing objects with prefix", {
-                    "prefix": f"bronze/{prefix}"
-                })
                 result = s3_client.list_objects_v2(Bucket="bronze", Prefix=prefix, MaxKeys=20)
                 
                 if 'Contents' in result:
                     available_keys = [obj['Key'] for obj in result['Contents']]
                     log_event("alternatives_found", f"Found available keys in directory", {
                         "key_count": len(available_keys),
-                        "keys": available_keys[:5]  # Limit to first 5 for brevity
+                        "keys": available_keys[:5]
                     })
                     
-                    # Try to find a similar key with 'sat_img' in the name
+                    # Try to find a similar key
                     for available_key in available_keys:
                         if 'sat_img' in available_key:
-                            log_event("trying_alternative", f"Trying alternative key", {
-                                "alternative_key": available_key
-                            })
                             try:
                                 response = s3_client.get_object(Bucket="bronze", Key=available_key)
                                 image_bytes = response['Body'].read()
@@ -681,13 +864,10 @@ class ImageStandardizer(ProcessFunction):
                                     "alternative_key": available_key
                                 })
                         
-                    # If we still don't have an image, try any image file
+                    # If still no image, try any image file
                     if not image_bytes:
                         for file in available_keys:
                             if file.endswith(('.jpg', '.jpeg', '.png', '.tif', '.tiff')):
-                                log_event("trying_any_image", f"Trying any image file", {
-                                    "file": file
-                                })
                                 try:
                                     response = s3_client.get_object(Bucket="bronze", Key=file)
                                     image_bytes = response['Body'].read()
@@ -724,14 +904,11 @@ class ImageStandardizer(ProcessFunction):
     
     def _calculate_centroid(self, metadata):
         """Calculate centroid from satellite_data points"""
-        # Default values if we can't calculate
         default_lat = 38.0
         default_lon = -76.0
         
         try:
-            # Try to extract from satellite_data array
             if "satellite_data" in metadata and isinstance(metadata["satellite_data"], list) and metadata["satellite_data"]:
-                # Extract all lat/lon pairs
                 lats = []
                 lons = []
                 for point in metadata["satellite_data"]:
@@ -739,7 +916,6 @@ class ImageStandardizer(ProcessFunction):
                         lats.append(point["latitude"])
                         lons.append(point["longitude"])
                 
-                # Calculate centroid if we have points
                 if lats and lons:
                     centroid_lat = sum(lats) / len(lats)
                     centroid_lon = sum(lons) / len(lons)
@@ -749,24 +925,14 @@ class ImageStandardizer(ProcessFunction):
                     })
                     return centroid_lat, centroid_lon
             
-            # Try direct lat/lon in metadata
             if "lat" in metadata and "lon" in metadata:
-                log_event("centroid_found", f"Found direct lat/lon in metadata")
                 return metadata["lat"], metadata["lon"]
                 
             if "latitude" in metadata and "longitude" in metadata:
-                log_event("centroid_found", f"Found direct latitude/longitude in metadata")
                 return metadata["latitude"], metadata["longitude"]
             
-            # Use microarea_id to approximate location
             if "microarea_id" in metadata:
-                log_event("centroid_approximated", f"Using microarea_id to approximate location", {
-                    "microarea_id": metadata["microarea_id"]
-                })
-                # Simplified location lookup based on microarea_id
                 return default_lat, default_lon
-            
-            log_event("centroid_default", f"Using default centroid values")
         
         except Exception as e:
             log_event("centroid_error", f"Error calculating centroid: {str(e)}", {
@@ -774,128 +940,50 @@ class ImageStandardizer(ProcessFunction):
                 "error_message": str(e)
             })
         
-        # Default fallback
         return default_lat, default_lon
     
     def _assess_image_quality(self, cloud_coverage, cloud_metadata):
         """Assess image quality based on cloud coverage and other metadata"""
-        # Default reliability
         reliability = 1.0
         
-        # Check cloud coverage
         if cloud_coverage > 0:
-            # Reduce reliability as cloud coverage increases
             reliability *= max(0.3, 1.0 - (cloud_coverage / 100.0))
         
-        # Check quality assessment from metadata
         quality_assessment = cloud_metadata.get("quality_assessment", "high")
         
-        # Apply quality factor
         if quality_assessment == "low":
             reliability *= 0.7
         elif quality_assessment == "medium":
             reliability *= 0.85
         
-        # Check if cloud shadows are detected
         if cloud_metadata.get("cloud_shadows_detected", False):
             reliability *= 0.9
         
-        log_event("image_quality_assessment", f"Assessed image quality", {
-            "cloud_coverage": cloud_coverage,
-            "quality_assessment": quality_assessment,
-            "cloud_shadows_detected": cloud_metadata.get("cloud_shadows_detected", False),
-            "reliability": round(reliability, 2)
-        })
-        
         return reliability
     
-    def _open_and_process_image(self, image_bytes, max_dim=2048):
-        """Opens and processes image with memory optimization"""
-        try:
-            img = Image.open(BytesIO(image_bytes))
-            width, height = img.size
-            
-            # Resize if image is too large
-            if width > max_dim or height > max_dim:
-                scale_factor = max_dim / max(width, height)
-                new_width = int(width * scale_factor)
-                new_height = int(height * scale_factor)
-                img = img.resize((new_width, new_height))
-                log_event("image_resize", f"Resized large image", {
-                    "original_size": f"{width}x{height}",
-                    "new_size": f"{new_width}x{new_height}",
-                    "scale_factor": round(scale_factor, 2)
-                })
-            
-            return img
-        except MemoryError as e:
-            log_event("memory_error", f"Memory error opening image: {str(e)}", {
-                "error_type": "MemoryError",
-                "error_message": str(e),
-                "max_dim": max_dim
-            })
-            # Try again with smaller max dimension
-            if max_dim > 1024:
-                log_event("retry_smaller", f"Retrying with smaller image dimensions", {
-                    "new_max_dim": 1024
-                })
-                return self._open_and_process_image(image_bytes, max_dim=1024)
-            else:
-                log_event("memory_error_fatal", f"Failed to process image even with reduced dimensions")
-                return None
-        except Exception as e:
-            log_event("image_open_error", f"Error opening image: {str(e)}", {
-                "error_type": type(e).__name__,
-                "error_message": str(e)
-            })
-            return None
-    
     def _perform_enhanced_spectral_analysis(self, img, metadata, spectral_metadata):
-        """
-        Perform enhanced spectral analysis using available metadata.
-        """
-        # Get image dimensions
+        """Perform enhanced spectral analysis using available metadata"""
         width, height = img.size
         
-        # Simple RGB histogram analysis
-        r, g, b = 0, 0, 0
-        pixel_count = 0
-        
-        # Sample pixels (for large images, sample a subset)
+        # Sample pixels for analysis
         sample_step = max(1, width * height // 10000)
         try:
             pixels = list(img.getdata())
             
-            # Ensure we have pixels to process
             if not pixels:
-                log_event("pixel_analysis_warning", f"No pixel data available")
                 r_avg, g_avg, b_avg = 0, 0, 0
             else:
-                # Sample pixels for analysis
                 sampled_pixels = pixels[::sample_step]
                 
-                # Check if pixels are in RGB format
                 if isinstance(sampled_pixels[0], tuple) and len(sampled_pixels[0]) >= 3:
                     r_vals = [p[0] for p in sampled_pixels]
                     g_vals = [p[1] for p in sampled_pixels]
                     b_vals = [p[2] for p in sampled_pixels]
                     
-                    # Calculate averages
                     r_avg = sum(r_vals) / len(r_vals) if r_vals else 0
                     g_avg = sum(g_vals) / len(g_vals) if g_vals else 0
                     b_avg = sum(b_vals) / len(b_vals) if b_vals else 0
-                    
-                    log_event("rgb_analysis", f"Analyzed RGB values", {
-                        "r_avg": round(r_avg, 2),
-                        "g_avg": round(g_avg, 2),
-                        "b_avg": round(b_avg, 2),
-                        "sample_size": len(sampled_pixels)
-                    })
                 else:
-                    # Handle grayscale or other formats
-                    log_event("pixel_format_warning", f"Image doesn't have RGB pixels", {
-                        "pixel_type": str(type(sampled_pixels[0]))
-                    })
                     avg_val = sum(sampled_pixels) / len(sampled_pixels) if sampled_pixels else 0
                     r_avg = g_avg = b_avg = avg_val
         except Exception as e:
@@ -905,10 +993,10 @@ class ImageStandardizer(ProcessFunction):
             })
             r_avg, g_avg, b_avg = 0, 0, 0
         
-        # Simple water detection (blue dominance)
+        # Simple water detection
         is_water_dominant = b_avg > r_avg and b_avg > g_avg
         
-        # Create enhanced spectral analysis
+        # Create spectral analysis
         spectral_analysis = {
             "image_size": {"width": width, "height": height},
             "rgb_averages": {"r": r_avg, "g": g_avg, "b": b_avg},
@@ -929,49 +1017,31 @@ class ImageStandardizer(ProcessFunction):
             band_info = spectral_metadata.get("band_info", {})
             spectral_analysis["band_descriptions"] = band_info
             
-            # Add analysis based on specific bands if relevant
-            if "B08" in available_bands or "B8" in available_bands:  # NIR band
+            if "B08" in available_bands or "B8" in available_bands:
                 spectral_analysis["has_nir"] = True
                 if is_water_dominant:
-                    # Water absorbs NIR, so dark NIR over water is normal
-                    # Brighter NIR over water can indicate surface materials (oil, algae)
                     spectral_analysis["pollution_indicators"]["surface_materials_likely"] = True
             
-            if "B11" in available_bands or "B12" in available_bands:  # SWIR bands
+            if "B11" in available_bands or "B12" in available_bands:
                 spectral_analysis["has_swir"] = True
-                # SWIR can help distinguish oil from other materials
                 
-            # Flag for advanced analysis capabilities
             spectral_analysis["advanced_analysis_possible"] = True
-            
-            log_event("spectral_metadata", f"Incorporated spectral bands information", {
-                "available_bands": available_bands,
-                "has_nir": spectral_analysis.get("has_nir", False),
-                "has_swir": spectral_analysis.get("has_swir", False)
-            })
         
         # Extract satellite_data from metadata if available
         satellite_data = metadata.get("satellite_data", [])
         
-        # Include satellite_data points as processed bands if available
         if satellite_data:
-            for i, point in enumerate(satellite_data[:10]):  # Limit to 10 points for brevity
+            for i, point in enumerate(satellite_data[:10]):
                 if "latitude" in point and "longitude" in point:
                     band_data = {
                         "lat": point["latitude"],
                         "lon": point["longitude"]
                     }
                     
-                    # Include band values if available
                     if "bands" in point:
                         band_data["band_values"] = point["bands"]
                     
                     spectral_analysis["processed_bands"].append(band_data)
-            
-            log_event("satellite_data", f"Processed satellite data points", {
-                "total_points": len(satellite_data),
-                "included_points": len(spectral_analysis["processed_bands"])
-            })
         
         return spectral_analysis
     
@@ -982,7 +1052,6 @@ class ImageStandardizer(ProcessFunction):
         if not spectral_metadata:
             return indices
             
-        # Check if NDVI (Normalized Difference Vegetation Index) is available
         if spectral_metadata.get("ndvi_available", False):
             indices["ndvi"] = {
                 "description": "Normalized Difference Vegetation Index",
@@ -990,7 +1059,6 @@ class ImageStandardizer(ProcessFunction):
                 "available": True
             }
         
-        # Check if NDWI (Normalized Difference Water Index) is available
         if spectral_metadata.get("ndwi_available", False):
             indices["ndwi"] = {
                 "description": "Normalized Difference Water Index",
@@ -998,7 +1066,6 @@ class ImageStandardizer(ProcessFunction):
                 "available": True
             }
         
-        # Check available bands for other possible indices
         available_bands = spectral_metadata.get("available_bands", [])
         
         if "B11" in available_bands and "B12" in available_bands:
@@ -1015,7 +1082,6 @@ class ImageStandardizer(ProcessFunction):
                 "available": True
             }
         
-        # Add oil detection-specific indices
         if "B04" in available_bands and "B12" in available_bands:
             indices["osi"] = {
                 "description": "Oil Spill Index",
@@ -1023,7 +1089,6 @@ class ImageStandardizer(ProcessFunction):
                 "available": True
             }
         
-        # Add algal bloom detection
         if "B03" in available_bands and "B05" in available_bands:
             indices["fai"] = {
                 "description": "Floating Algae Index",
@@ -1031,73 +1096,31 @@ class ImageStandardizer(ProcessFunction):
                 "available": True
             }
         
-        log_event("environmental_indices", f"Calculated environmental indices", {
-            "available_indices": list(indices.keys())
-        })
-        
         return indices
     
-    def _create_thumbnail(self, img):
-        """Create a small thumbnail of the image"""
-        try:
-            # Create thumbnail
-            MAX_SIZE = (200, 200)
-            thumbnail = img.copy()
-            thumbnail.thumbnail(MAX_SIZE)
-            log_event("thumbnail_created", f"Created thumbnail", {
-                "max_size": MAX_SIZE,
-                "actual_size": thumbnail.size
-            })
-            return thumbnail
-        except Exception as e:
-            log_event("thumbnail_error", f"Error creating thumbnail: {str(e)}", {
-                "error_type": type(e).__name__,
-                "error_message": str(e)
-            })
-            return None
-    
     def _extract_image_features(self, img):
-        """
-        Extract features for pollution detection:
-        - dark_patch_ratio: Ratio of dark pixels (oil spills appear dark)
-        - green_dominance: Ratio of green dominant pixels (algae blooms)
-        - spectral_contrast: Contrast between bands (pollution creates contrasts)
-        - texture_variance: Variance in texture (indicates disturbances)
-        - edge_density: Density of edges (pollution boundaries)
-        """
+        """Extract features for pollution detection"""
         try:
-            # Convert image to numpy array
             img_array = np.array(img)
             
-            # Calculate dark patch ratio (oil spills appear as dark patches)
-            # Dark is defined as pixels where average RGB is below 50
+            # Calculate features
             rgb_avg = np.mean(img_array, axis=2)
             dark_pixels = np.sum(rgb_avg < 50)
             dark_patch_ratio = dark_pixels / (img_array.shape[0] * img_array.shape[1])
             
-            # Calculate green dominance (for algal blooms)
-            # Green dominant pixels have G channel significantly higher than R and B
             r, g, b = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2]
             green_dominant = np.logical_and(g > r * 1.1, g > b * 1.1)
             green_dominance = np.sum(green_dominant) / (img_array.shape[0] * img_array.shape[1])
             
-            # Calculate spectral contrast (pollution creates spectral anomalies)
-            # Using standard deviation between RGB channels
             spectral_contrast = np.mean(np.std(img_array, axis=2))
-            
-            # Calculate texture variance (pollution changes water texture)
-            # Use a simple window variance approach
             texture_variance = np.var(rgb_avg)
             
-            # Calculate edge density (pollution creates edges)
-            # Simple gradient-based edge detection
             dx = np.abs(np.diff(rgb_avg, axis=1, append=rgb_avg[:,-1:]))
             dy = np.abs(np.diff(rgb_avg, axis=0, append=rgb_avg[-1:,:]))
             gradient_magnitude = np.sqrt(dx**2 + dy**2)
-            edge_pixels = np.sum(gradient_magnitude > 20)  # Threshold for edge detection
+            edge_pixels = np.sum(gradient_magnitude > 20)
             edge_density = edge_pixels / (img_array.shape[0] * img_array.shape[1])
             
-            # Return features as a list
             features = [dark_patch_ratio, green_dominance, spectral_contrast, texture_variance, edge_density]
             
             log_event("feature_extraction", f"Extracted image features", {
@@ -1115,46 +1138,23 @@ class ImageStandardizer(ProcessFunction):
                 "error_type": type(e).__name__,
                 "error_message": str(e)
             })
-            # Return default features
             return [0.0, 0.0, 0.0, 0.0, 0.0]
     
     def _detect_pollution_type(self, features, spectral_metadata):
-        """
-        Detect pollution type using ML model or rule-based classification.
-        Enhanced with spectral metadata if available.
-        
-        Returns:
-            tuple: (pollution_type, confidence)
-        """
-        # Try to use ML model if available
+        """Detect pollution type using ML model or rule-based classification"""
         if self.pollution_classifier is not None:
             try:
-                # Reshape features for sklearn model
                 X = np.array(features).reshape(1, -1)
-                
-                # Get class prediction
                 pollution_type = self.pollution_classifier.predict(X)[0]
-                
-                # Get probability/confidence
                 probabilities = self.pollution_classifier.predict_proba(X)[0]
                 confidence = np.max(probabilities)
                 
-                # If we have spectral metadata, adjust confidence
                 if spectral_metadata:
-                    # Certain bands improve detection confidence for specific pollution types
                     available_bands = spectral_metadata.get("available_bands", [])
                     if pollution_type == "oil_spill" and "B11" in available_bands:
-                        # SWIR bands improve oil detection
                         confidence = min(1.0, confidence * 1.2)
                     elif pollution_type == "algal_bloom" and "B05" in available_bands:
-                        # Red edge bands improve algae detection
                         confidence = min(1.0, confidence * 1.2)
-                
-                log_event("ml_pollution_detection", f"Detected pollution type using ML model", {
-                    "pollution_type": pollution_type,
-                    "confidence": round(confidence, 2),
-                    "confidence_adjusted": spectral_metadata is not None
-                })
                 
                 return pollution_type, float(confidence)
             
@@ -1163,100 +1163,57 @@ class ImageStandardizer(ProcessFunction):
                     "error_type": type(e).__name__,
                     "error_message": str(e)
                 })
-                log_event("ml_fallback", f"Falling back to rule-based classification")
         
-        # Rule-based classification (fallback or primary approach if model not available)
+        # Rule-based classification fallback
         dark_patch_ratio, green_dominance, spectral_contrast, texture_variance, edge_density = features
         
-        # Check spectral metadata for enhanced detection
         has_swir = False
         if spectral_metadata:
             available_bands = spectral_metadata.get("available_bands", [])
             has_swir = "B11" in available_bands or "B12" in available_bands
         
-        # Enhanced rule-based classification
         if dark_patch_ratio > 0.15:
-            # High dark patch ratio indicates oil spill
-            # SWIR bands improve oil detection confidence
-            confidence = 0.7
-            if has_swir:
-                confidence = 0.85
+            confidence = 0.85 if has_swir else 0.7
             pollution_type = "oil_spill"
         elif green_dominance > 0.2:
-            # High green dominance indicates algal bloom
             pollution_type = "algal_bloom"
             confidence = 0.8
         elif 0.05 < edge_density < 0.2 and texture_variance > 100:
-            # Medium edge density with high texture variance indicates sediment
             pollution_type = "sediment"
             confidence = 0.65
         elif edge_density > 0.2 and spectral_contrast > 30:
-            # High edge density with high spectral contrast might indicate chemical discharge
             pollution_type = "chemical_discharge"
             confidence = 0.5
         else:
             pollution_type = "unknown"
             confidence = 0.3
         
-        log_event("rule_based_detection", f"Detected pollution type using rules", {
-            "pollution_type": pollution_type,
-            "confidence": round(confidence, 2),
-            "has_swir": has_swir
-        })
-        
         return pollution_type, confidence
     
     def _create_pollution_mask(self, img, pollution_type):
-        """
-        Create a binary mask of polluted areas based on the pollution type.
-        Uses threshold-based segmentation with rules specific to each pollutant.
-        
-        Returns:
-            tuple: (mask, affected_area_ratio)
-            - mask: binary numpy array (1 for pollution, 0 for clean water)
-            - affected_area_ratio: ratio of polluted pixels to total pixels
-        """
+        """Create a binary mask of polluted areas"""
         try:
-            # Convert image to numpy array
             img_array = np.array(img)
             height, width, _ = img_array.shape
             
-            # Initialize mask
             mask = np.zeros((height, width), dtype=bool)
             
-            # Extract RGB channels
             r, g, b = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2]
             
-            # Apply different thresholding based on pollution type
             if pollution_type == "oil_spill":
-                # Oil appears dark and has low blue channel
                 rgb_avg = np.mean(img_array, axis=2)
                 mask = np.logical_and(rgb_avg < 60, b < 70)
-                
             elif pollution_type == "algal_bloom":
-                # Algae appears green
                 mask = np.logical_and(g > r * 1.1, g > b * 1.1)
-                
             elif pollution_type == "sediment":
-                # Sediment appears brownish (high red, medium green, low blue)
                 mask = np.logical_and(np.logical_and(r > 100, g > 50), b < g * 0.8)
-                
             elif pollution_type == "chemical_discharge":
-                # Chemicals often create unusual colors with high contrast
                 rgb_std = np.std(img_array, axis=2)
                 mask = rgb_std > 40
             
-            # Calculate affected area ratio
             affected_pixels = np.sum(mask)
             total_pixels = height * width
             affected_area_ratio = affected_pixels / total_pixels
-            
-            log_event("pollution_mask_created", f"Created pollution mask", {
-                "pollution_type": pollution_type,
-                "affected_pixels": int(affected_pixels),
-                "total_pixels": total_pixels,
-                "affected_area_ratio": round(affected_area_ratio, 4)
-            })
             
             return mask, affected_area_ratio
             
@@ -1271,22 +1228,17 @@ class ImageStandardizer(ProcessFunction):
     def _create_spatial_index(self, image_id, timestamp, data, metadata, processed_image_path, s3_client):
         """Create spatial index for efficient geographic retrieval"""
         try:
-            # Calculate date parts for partitioning
             dt = datetime.fromtimestamp(timestamp / 1000) if isinstance(timestamp, int) else datetime.now()
             year = dt.strftime("%Y")
             month = dt.strftime("%m")
             day = dt.strftime("%d")
             
-            # Calculate path for metadata file
             parquet_key = f"analyzed_data/satellite/year={year}/month={month}/day={day}/analyzed_{image_id}_{timestamp}.parquet"
             
-            # Extract location data - calculate centroid from satellite_data
             centroid_lat, centroid_lon = self._calculate_centroid(metadata)
             
-            # Extract satellite data for bounding box
             satellite_data = metadata.get("satellite_data", [])
             
-            # Create spatial index structure
             spatial_index = {
                 "image_id": image_id,
                 "timestamp": timestamp,
@@ -1298,7 +1250,6 @@ class ImageStandardizer(ProcessFunction):
                 "source_pointer": data.get("image_pointer", "")
             }
             
-            # Add bounding box if available directly
             if "bbox" in metadata:
                 bbox = metadata["bbox"]
                 spatial_index["bbox"] = bbox
@@ -1307,7 +1258,6 @@ class ImageStandardizer(ProcessFunction):
                     spatial_index["min_lat"] = min(bbox[1], bbox[3])
                     spatial_index["max_lon"] = max(bbox[0], bbox[2])
                     spatial_index["max_lat"] = max(bbox[1], bbox[3])
-            # Otherwise try to extract from satellite data
             elif satellite_data:
                 lats = [p.get("latitude") for p in satellite_data if "latitude" in p]
                 lons = [p.get("longitude") for p in satellite_data if "longitude" in p]
@@ -1318,34 +1268,26 @@ class ImageStandardizer(ProcessFunction):
                     spatial_index["min_lon"] = min(lons)
                     spatial_index["max_lon"] = max(lons)
                 
-                # Include pixel count and sample data
                 spatial_index["pixel_count"] = len(satellite_data)
                 
                 if len(satellite_data) > 0:
                     spatial_index["sample_pixels"] = satellite_data[:3]
             
-            # Create directory structure
             try:
-                # Make sure the silver bucket exists
                 self._ensure_bucket_exists(s3_client, "silver")
                     
-                # Create directory structure
                 directory_key = f"spatial_index/satellite/year={year}/month={month}/day={day}/"
                 s3_client.put_object(
                     Bucket="silver",
                     Key=directory_key,
                     Body=b''
                 )
-                log_event("directory_created", f"Created spatial index directory", {
-                    "directory": f"silver/{directory_key}"
-                })
             except Exception as e:
-                log_event("directory_warning", f"Error creating directory structure (can be ignored): {str(e)}", {
+                log_event("directory_warning", f"Error creating directory structure: {str(e)}", {
                     "error_type": type(e).__name__,
                     "error_message": str(e)
                 })
             
-            # Save spatial index
             spatial_index_key = f"spatial_index/satellite/year={year}/month={month}/day={day}/spatial_{image_id}_{timestamp}.json"
             s3_client.put_object(
                 Bucket="silver",
@@ -1371,7 +1313,6 @@ class ImageStandardizer(ProcessFunction):
         """Generate recommendations based on pollution type and severity"""
         recommendations = []
         
-        # Base recommendations by pollution type
         type_recommendations = {
             "oil_spill": [
                 "Deploy containment booms to prevent spreading",
@@ -1405,11 +1346,9 @@ class ImageStandardizer(ProcessFunction):
             ]
         }
         
-        # Add type-specific recommendations
         if pollution_type in type_recommendations:
             recommendations.extend(type_recommendations[pollution_type])
         
-        # Add severity-based recommendations
         if affected_area_ratio > 0.2:
             recommendations.append("Initiate immediate response protocol")
             recommendations.append("Alert relevant environmental authorities")
@@ -1420,15 +1359,8 @@ class ImageStandardizer(ProcessFunction):
         else:
             recommendations.append("Continue routine monitoring")
         
-        # Add satellite-specific recommendations
         recommendations.append("Schedule follow-up satellite imagery acquisition")
         recommendations.append("Correlate satellite observations with in-situ measurements")
-        
-        log_event("recommendations_generated", f"Generated recommendations", {
-            "pollution_type": pollution_type,
-            "affected_area_ratio": round(affected_area_ratio, 2),
-            "recommendation_count": len(recommendations)
-        })
         
         return recommendations
 
@@ -1439,7 +1371,7 @@ def wait_for_services():
     # Check Kafka
     kafka_ready = False
     max_retries = 10
-    retry_interval = 5  # seconds
+    retry_interval = 5
     
     for attempt in range(max_retries):
         try:
@@ -1498,11 +1430,10 @@ def wait_for_services():
 
 def main():
     """Main function to set up and run the Flink job"""
-    # Inizializza l'oggetto metrics globale
     global metrics
     metrics = SimpleMetrics()
     
-    log_event("job_start", "Starting Enhanced Image Standardizer Job with ML")
+    log_event("job_start", "Starting Smart Image Standardizer with Safe Tiling")
     
     # Wait for services to be ready
     log_event("services_waiting", "Waiting for services to be available...")
@@ -1514,7 +1445,7 @@ def main():
     log_event("flink_setup", "Setting up Flink environment")
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_runtime_mode(RuntimeExecutionMode.STREAMING)
-    env.set_parallelism(1)  # Set parallelism to 1 for simplicity
+    env.set_parallelism(1)  # Safe parallelism for this solution
     
     # Configure checkpoints
     env = configure_checkpoints(env)
@@ -1523,10 +1454,16 @@ def main():
     props = {
         'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
         'group.id': 'image_standardizer',
-        'auto.offset.reset': 'earliest'
+        'auto.offset.reset': 'earliest',
+        'enable.auto.commit': 'true',
+        'auto.commit.interval.ms': '5000',
+        'session.timeout.ms': '30000',
+        'heartbeat.interval.ms': '10000',
+        'max.poll.records': '1',
+        'fetch.max.wait.ms': '500'
     }
     
-    # Create Kafka consumer for satellite_imagery topic
+    # Create Kafka consumer
     log_event("kafka_consumer", f"Creating Kafka consumer", {
         "topic": SATELLITE_TOPIC,
         "group_id": "image_standardizer"
@@ -1536,16 +1473,15 @@ def main():
         SimpleStringSchema(),
         properties=props
     )
-    # Set to read from the beginning of the topic
     satellite_consumer.set_start_from_earliest()
     
-    # Create Kafka producer for processed_imagery topic
+    # Create Kafka producer
     log_event("kafka_producer", f"Creating Kafka producer", {
         "topic": PROCESSED_IMAGERY_TOPIC,
         "max_request_size": "2097152"
     })
     producer_props = props.copy()
-    producer_props['max.request.size'] = '2097152'  # Increase to 2MB
+    producer_props['max.request.size'] = '2097152'
     processed_producer = FlinkKafkaProducer(
         topic=PROCESSED_IMAGERY_TOPIC,
         serialization_schema=SimpleStringSchema(),
@@ -1557,15 +1493,15 @@ def main():
     satellite_stream = env.add_source(satellite_consumer)
     processed_stream = satellite_stream \
         .process(ImageStandardizer(), output_type=Types.STRING()) \
-        .name("Standardize_Satellite_Imagery_With_ML")
+        .name("Smart_Image_Standardizer_Safe_Tiling")
     
-    # Add sink to processed_imagery topic
+    # Add sink
     processed_stream.add_sink(processed_producer).name("Publish_Processed_Imagery")
     
     # Execute the Flink job
-    log_event("job_execute", "Executing Enhanced Image Standardizer Job with ML")
+    log_event("job_execute", "Executing Smart Image Standardizer with Safe Tiling")
     try:
-        env.execute("Marine_Pollution_Image_Standardizer_ML")
+        env.execute("Marine_Pollution_Smart_Image_Standardizer")
     except Exception as e:
         log_event("job_error", f"Error executing Flink job: {str(e)}", {
             "error_type": type(e).__name__,

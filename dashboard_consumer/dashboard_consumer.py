@@ -2010,6 +2010,237 @@ def process_analyzed_sensor_data(data, redis_conn, metrics):
                   {"error": str(e), "error_type": type(e).__name__, 
                    "traceback": traceback.format_exc()}, "error")
 
+def final_duplicate_check(hotspot_id, location, pollutant_type, redis_conn, postgres_conn, metrics=None):
+    """
+    Ultimo controllo di sicurezza prima del salvataggio degli hotspot.
+    Verifica se ci sono duplicati che potrebbero essere sfuggiti al controllo iniziale.
+    
+    Args:
+        hotspot_id: ID dell'hotspot da verificare
+        location: dati di location dell'hotspot
+        pollutant_type: tipo di inquinante
+        redis_conn: connessione Redis
+        postgres_conn: connessione PostgreSQL
+        metrics: oggetto per le metriche
+        
+    Returns:
+        tuple: (is_duplicate, duplicate_of)
+            - is_duplicate: True se è un duplicato
+            - duplicate_of: ID dell'hotspot originale se è un duplicato, altrimenti None
+    """
+    start_time = time.time()
+    
+    try:
+        log_event("final_duplicate_check", f"Controllo finale duplicazione per hotspot {hotspot_id}", {
+            "hotspot_id": hotspot_id,
+            "pollutant_type": pollutant_type
+        })
+        
+        # Estrai coordinate con validazione
+        try:
+            lat = float(location.get('center_latitude', location.get('latitude', 0)))
+            lon = float(location.get('center_longitude', location.get('longitude', 0)))
+            radius_km = float(location.get('radius_km', 1.0))
+            
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return False, None
+                
+        except (ValueError, TypeError):
+            return False, None
+        
+        # 1. Controllo nei duplicati già noti
+        known_duplicates = set()
+        try:
+            def get_duplicates():
+                return redis_conn.smembers("dashboard:hotspots:duplicates")
+            
+            duplicates_result = retry_operation(get_duplicates, circuit_breaker=redis_cb)
+            if metrics:
+                metrics.record_redis_operation(True)
+            
+            if duplicates_result:
+                for dup in duplicates_result:
+                    dup_id = dup.decode('utf-8') if isinstance(dup, bytes) else dup
+                    known_duplicates.add(dup_id)
+        except Exception:
+            if metrics:
+                metrics.record_redis_operation(False)
+        
+        # Se questo hotspot è già conosciuto come duplicato, verifica il suo originale
+        if hotspot_id in known_duplicates:
+            try:
+                def get_parent():
+                    return redis_conn.hget(hotspot_key(hotspot_id), "parent_hotspot_id")
+                
+                parent_result = retry_operation(get_parent, circuit_breaker=redis_cb)
+                if metrics:
+                    metrics.record_redis_operation(True)
+                
+                if parent_result:
+                    parent_id = parent_result.decode('utf-8') if isinstance(parent_result, bytes) else parent_result
+                    if parent_id and parent_id != hotspot_id:
+                        log_event("duplicate_caught", f"Hotspot {hotspot_id} identificato come duplicato di {parent_id} in controllo finale", {
+                            "hotspot_id": hotspot_id,
+                            "parent_id": parent_id,
+                            "source": "known_duplicates"
+                        })
+                        return True, parent_id
+            except Exception:
+                if metrics:
+                    metrics.record_redis_operation(False)
+        
+        # 2. Cerca nei bin spaziali vicini
+        search_radius = get_duplicate_search_radius(pollutant_type)
+        lat_bin = math.floor(lat / SPATIAL_BIN_SIZE)
+        lon_bin = math.floor(lon / SPATIAL_BIN_SIZE)
+        
+        nearby_ids = set()
+        for dlat in range(-1, 2):
+            for dlon in range(-1, 2):
+                bin_key = spatial_bin_key(lat_bin + dlat, lon_bin + dlon)
+                
+                try:
+                    def get_bin_members():
+                        return redis_conn.smembers(bin_key)
+                    
+                    bin_result = retry_operation(get_bin_members, circuit_breaker=redis_cb)
+                    if metrics:
+                        metrics.record_redis_operation(True)
+                    
+                    if bin_result:
+                        for member in bin_result:
+                            member_id = member.decode('utf-8') if isinstance(member, bytes) else member
+                            if member_id != hotspot_id:  # Escludi se stesso
+                                nearby_ids.add(member_id)
+                except Exception:
+                    if metrics:
+                        metrics.record_redis_operation(False)
+        
+        # Controlla ogni ID vicino
+        for nearby_id in nearby_ids:
+            try:
+                def get_hotspot_data():
+                    return redis_conn.hgetall(hotspot_key(nearby_id))
+                
+                nearby_data = retry_operation(get_hotspot_data, circuit_breaker=redis_cb)
+                if metrics:
+                    metrics.record_redis_operation(True)
+                
+                if not nearby_data:
+                    continue
+                
+                # Converti da formato Redis hash a dizionario Python
+                nearby_data = {k.decode('utf-8') if isinstance(k, bytes) else k: 
+                             v.decode('utf-8') if isinstance(v, bytes) else v 
+                             for k, v in nearby_data.items()}
+                
+                # Skip hotspot inattivi, replaced o già duplicati
+                if nearby_data.get('status') in ['inactive', 'replaced'] or nearby_data.get('is_duplicate') == 'true':
+                    continue
+                
+                nearby_lat = float(nearby_data.get('center_latitude', 0))
+                nearby_lon = float(nearby_data.get('center_longitude', 0))
+                nearby_radius = float(nearby_data.get('radius_km', 5.0))
+                nearby_type = nearby_data.get('pollutant_type', 'unknown')
+                
+                # Calcola distanza
+                distance = calculate_distance(lat, lon, nearby_lat, nearby_lon)
+                
+                # Usa criterio di sovrapposizione di HotspotManager
+                combined_radius = radius_km + nearby_radius
+                is_overlapping = distance <= combined_radius * 1.1  # 10% margine di tolleranza
+                
+                if is_overlapping and is_same_pollutant_type(pollutant_type, nearby_type):
+                    log_event("duplicate_caught", f"Hotspot {hotspot_id} identificato come duplicato di {nearby_id} in controllo finale", {
+                        "hotspot_id": hotspot_id,
+                        "parent_id": nearby_id,
+                        "distance": round(distance, 2),
+                        "combined_radius": round(combined_radius, 2),
+                        "source": "spatial_bin"
+                    })
+                    return True, nearby_id
+            except Exception as e:
+                log_event("final_check_hotspot_error", f"Errore nell'analisi dell'hotspot {nearby_id}", {
+                    "error": str(e),
+                    "hotspot_id": nearby_id
+                }, "warning")
+        
+        # 3. Verifica in PostgreSQL come ultima risorsa
+        if postgres_conn:
+            try:
+                lat_delta = search_radius / 111.0
+                lon_delta = search_radius / (111.0 * math.cos(math.radians(lat)))
+                
+                def query_postgres():
+                    with postgres_conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT 
+                                hotspot_id, 
+                                center_latitude, 
+                                center_longitude, 
+                                radius_km,
+                                pollutant_type
+                            FROM active_hotspots
+                            WHERE 
+                                hotspot_id <> %s
+                                AND center_latitude BETWEEN %s AND %s
+                                AND center_longitude BETWEEN %s AND %s
+                                AND last_updated_at > NOW() - INTERVAL '24 hours'
+                                AND (source_data::jsonb->>'is_duplicate')::text IS DISTINCT FROM 'true'
+                                AND status NOT IN ('inactive', 'replaced')
+                            LIMIT 10
+                        """, (
+                            hotspot_id,  # Escludi se stesso
+                            lat - lat_delta, lat + lat_delta,
+                            lon - lon_delta, lon + lon_delta
+                        ))
+                        return cur.fetchall()
+                
+                db_results = retry_operation(query_postgres, circuit_breaker=postgres_cb)
+                if metrics:
+                    metrics.record_db_operation("postgres", True)
+                
+                for result in db_results:
+                    db_id, db_lat, db_lon, db_radius, db_type = result
+                    
+                    # Calcola distanza
+                    distance = calculate_distance(lat, lon, db_lat, db_lon)
+                    
+                    # Usa criterio di sovrapposizione
+                    combined_radius = radius_km + db_radius
+                    is_overlapping = distance <= combined_radius * 1.1
+                    
+                    if is_overlapping and is_same_pollutant_type(pollutant_type, db_type):
+                        log_event("duplicate_caught", f"Hotspot {hotspot_id} identificato come duplicato di {db_id} in controllo finale", {
+                            "hotspot_id": hotspot_id,
+                            "parent_id": db_id,
+                            "distance": round(distance, 2),
+                            "source": "postgres"
+                        })
+                        return True, db_id
+            except Exception:
+                if metrics:
+                    metrics.record_db_operation("postgres", False)
+        
+        # Nessun duplicato trovato
+        processing_time = time.time() - start_time
+        log_event("final_check_complete", f"Controllo finale completato per {hotspot_id}, nessun duplicato trovato", {
+            "hotspot_id": hotspot_id,
+            "processing_time_ms": round(processing_time * 1000)
+        })
+        return False, None
+    
+    except Exception as e:
+        processing_time = time.time() - start_time
+        log_event("final_check_error", f"Errore nel controllo finale di duplicazione", {
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "hotspot_id": hotspot_id,
+            "processing_time_ms": round(processing_time * 1000)
+        }, "error")
+        return False, None  # In caso di errore, permetti di continuare
+
+
 def process_hotspot(data, redis_conn, postgres_conn, metrics):
     """
     Processa hotspot per dashboard con controllo duplicati integrato
@@ -2260,7 +2491,27 @@ def process_hotspot(data, redis_conn, postgres_conn, metrics):
                 log_event("duplicate_check_error", f"Errore nella verifica status duplicato", 
                           {"error": str(e), "error_type": type(e).__name__, 
                            "hotspot_id": hotspot_id}, "warning")
-        
+
+        final_is_duplicate, final_duplicate_of = final_duplicate_check(
+            hotspot_id, location, hotspot_data['pollutant_type'], redis_conn, postgres_conn, metrics
+        )
+
+        # Se il controllo finale trova un duplicato non rilevato in precedenza
+        if final_is_duplicate and not is_duplicate:
+            log_event("final_duplicate_correction", f"Hotspot {hotspot_id} corretto come duplicato di {final_duplicate_of}", {
+                "hotspot_id": hotspot_id,
+                "duplicate_of": final_duplicate_of
+            })
+            
+            # Aggiorna i campi di relazione
+            is_duplicate = True
+            duplicate_of = final_duplicate_of
+            hotspot_data['is_duplicate'] = 'true'
+            hotspot_data['duplicate_of'] = duplicate_of
+            hotspot_data['parent_hotspot_id'] = duplicate_of
+            
+            # Aggiorna relazione nell'originale
+            update_original_with_duplicate_info(final_duplicate_of, hotspot_id, redis_conn, metrics)
         # Salva i dati dell'hotspot
         def save_hotspot():
             with redis_conn.pipeline() as pipe:
