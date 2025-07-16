@@ -1,3 +1,4 @@
+```markdown
 # Marine Pollution Tracking System
 
 ![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
@@ -14,11 +15,13 @@
 - [System Architecture](#system-architecture)
 - [Core Components](#core-components)
 - [Data Processing Pipeline](#data-processing-pipeline)
+- [Flink Processing Jobs & ML Components](#flink-processing-jobs--ml-components)
 - [Dashboard & Visualization](#dashboard--visualization)
 - [Installation & Setup](#installation--setup)
 - [Performance & Results](#performance--results)
 - [Technical Implementation](#technical-implementation)
 - [Limitations & Future Work](#limitations--future-work)
+- [Lessons Learned](#lessons-learned)
 - [Team & Contributors](#team--contributors)
 - [References](#references)
 
@@ -68,6 +71,16 @@ The system follows a distributed microservices pattern with event-driven communi
 The detailed component interaction diagram shows how data flows through the system:
 
 ![System Architecture Flow](./data/system_architecture_flow.png)
+
+### Data Flow
+
+1. Data sources (NOAA/USGS & SentinelHub) provide raw data to producers every 30 seconds (buoys) and 15 minutes (satellite imagery)
+2. Producers publish standardized data to Kafka topics (buoy_data, satellite_imagery)
+3. Flink jobs process these streams for analysis (sensor_analyzer, image_standardizer) 
+4. Detection algorithms identify pollution hotspots (pollution_detector)
+5. Prediction models forecast pollution spread (ml_prediction)
+6. Results are stored in appropriate databases based on data type and purpose
+7. The dashboard provides real-time visualization of all system insights
 
 The architecture enables several key capabilities:
 
@@ -148,6 +161,7 @@ The system ingests data from two primary sources:
    - Water quality parameters (pH, dissolved oxygen, turbidity)
    - Chemical contaminants (nitrogen compounds, phosphates, hydrocarbons)
    - Physical properties (temperature, salinity, conductivity)
+   - Microplastics concentration
 
 2. **Satellite Imagery**: Sentinel-2 satellites capture multispectral imagery every 15 minutes, offering:
    - Broad spatial coverage of the entire bay area
@@ -183,6 +197,47 @@ The components communicate through a message-driven architecture:
 - **Schema Registry**: Centralized schema management ensures consistent data formats
 
 This design provides buffering during load spikes, enables multiple consumers for the same events, and ensures reliable message delivery.
+
+## Flink Processing Jobs & ML Components
+
+The system implements various machine learning models, each integrated into a specific Flink job to perform specialized analysis functions:
+
+### Sensor Analyzer Job
+- **Pollutant Classifier (RandomForestClassifier)**
+  - **Input**: Sensor parameters [pH, turbidity, temperature, mercury, lead, petroleum, oxygen, microplastics]
+  - **Output**: Pollution type classification [oil_spill, chemical_discharge, agricultural_runoff, sewage, algal_bloom, unknown]
+- **Anomaly Detector (IsolationForest)**
+  - **Input**: Same sensor parameters
+  - **Output**: Detection of anomalies in sensor data (contamination=0.05)
+
+### Image Standardizer Job
+- **Image Classifier (RandomForestClassifier)**
+  - **Input**: Features extracted from images [dark_patch_ratio, green_dominance, spectral_contrast, texture_variance, edge_density]
+  - **Output**: Visible pollution type [oil_spill, algal_bloom, sediment, chemical_discharge, unknown]
+
+### Pollution Detector Job
+- **Confidence Estimator (RandomForestRegressor)**
+  - **Input**: Detection metrics [num_points, avg_risk, max_risk, source_diversity, time_span]
+  - **Output**: Confidence score (0-1) on detection validity
+
+### ML Prediction Job
+- **Oil Spill Model (RandomForestRegressor)**
+  - **Input**: Environmental and pollution parameters [lat, lon, radius, pollution_level, wind_speed, wind_direction, current_speed, current_direction, hours_ahead]
+  - **Output**: Spread prediction [new_lat, new_lon, new_radius]
+- **Chemical Model (RandomForestRegressor)**
+  - **Input**: Same environmental parameters
+  - **Output**: Spread prediction specific to chemical pollutants
+
+All models are basic implementations (RandomForest with only 10 estimators) trained on synthetic data, representing a limitation of the current implementation that would require enhancement for production deployment.
+
+### Hybrid Processing Approach
+
+The system effectively combines ML models with rule-based approaches:
+- ML models enhance sensitivity for subtle pollution patterns
+- Rule-based systems ensure reliable baseline detection
+- Fallback mechanisms maintain system operation when ML encounters issues
+
+This complementary approach has proven more effective than either method alone.
 
 ## Dashboard & Visualization
 
@@ -369,6 +424,7 @@ The CPU usage pattern demonstrates characteristic processing behavior:
 - Short-duration processing spikes during intensive computation
 - Rapid return to baseline during idle periods
 - Healthy distribution between system and application processes
+- Performance predictability shown through consistent burst patterns
 
 ### Processing Metrics
 
@@ -470,7 +526,7 @@ Despite its advanced capabilities, the current implementation has several limita
 
 1. **Synthetic Data Reliance**: The system currently uses synthetic data rather than real NOAA/USGS APIs and Sentinel Hub services, limiting validation under authentic environmental conditions
 
-2. **Static ML Models**: Basic RandomForest classifiers built on synthetic data without mechanisms for retraining with newly collected information
+2. **Static ML Models**: Basic RandomForest classifiers built on synthetic data without mechanisms for retraining with newly collected information. This means the system's predictive capabilities remain static, preventing improvement over time despite new data collection.
 
 3. **Spatial Clustering Constraints**: The hybrid approach with fixed grid size struggles with events crossing grid boundaries and isn't optimal across varying data densities
 
@@ -484,9 +540,9 @@ Despite its advanced capabilities, the current implementation has several limita
 
 As the system scales to handle larger geographic areas or higher data volumes, several components would require enhancement:
 
-- **Memory Management**: Flink jobs would encounter memory constraints during satellite imagery analysis and pollution detection
+- **Memory Management**: Flink jobs would encounter memory constraints during satellite imagery analysis and pollution detection. Without proper partitioning and memory management strategies, jobs would encounter OutOfMemoryError exceptions when handling larger or more frequent satellite images.
 
-- **Spatial Clustering**: The current approach would face computational bottlenecks in high-density regions
+- **Spatial Clustering**: The current approach would face computational bottlenecks in high-density regions, where the SpatialClusteringProcessor must process numerous points within each partition
 
 - **Message Broker**: The single-node Kafka configuration would experience performance degradation with increased volume
 
@@ -496,9 +552,9 @@ As the system scales to handle larger geographic areas or higher data volumes, s
 
 Several improvements could address current limitations without a complete redesign:
 
-- **Continuous Learning**: Implement mechanisms for ML models to update with newly collected data
+- **Continuous Learning**: Implement mechanisms for ML models to update with newly collected data through incremental learning that periodically retrains models as validated data becomes available
 
-- **Adaptive Spatial Clustering**: Implement adaptive grid sizing based on data density with boundary-crossing detection
+- **Adaptive Spatial Clustering**: Implement adaptive grid sizing based on data density with boundary-crossing detection mechanisms
 
 - **State Management**: Develop improved strategies for Flink jobs including backpressure handling and optimized checkpointing
 
@@ -521,6 +577,48 @@ With additional resources, future development would prioritize:
 - **Infrastructure Optimization**: Implement proper Kafka clustering, optimize TimescaleDB, and deploy comprehensive monitoring
 
 - **Kubernetes Deployment**: Develop dynamic scaling capabilities based on data volume and processing requirements
+
+## Lessons Learned
+
+### Main Challenges
+
+During development, we encountered several significant challenges:
+
+1. **Distributed Pipeline Architecture**: Integrating multiple components through Kafka required extensive configuration and troubleshooting. Establishing correct topic structures, managing serialization formats, and ensuring proper message routing between components demanded considerable effort.
+
+2. **Medallion Architecture Implementation**: The most time-consuming aspect was implementing proper data flow through our medallion architecture and developing effective deduplication strategies. Distinguishing between new pollution events and evolutions of existing ones proved exceptionally difficult.
+
+3. **Spatial Clustering**: Creating deterministic hotspot IDs that accounted for spatial proximity and temporal evolution required multiple iterations to refine our clustering algorithms and spatial indexing strategies.
+
+4. **Database Configuration**: Designing and configuring specialized databases for different types of data presented unique challenges, particularly configuring TimescaleDB for time-series sensor data, PostgreSQL with spatial extensions for geospatial analysis, and Redis for fast dashboard access.
+
+5. **Heterogeneous Data Sources**: Working with different data sources presented significant complexity, from structured sensor readings to large satellite imagery—each requiring different ingestion, validation, and preprocessing approaches.
+
+### What Worked Well
+
+Several aspects of our implementation proved particularly effective:
+
+1. **Medallion Architecture**: The medallion architecture proved highly effective for data quality management, enabling clean separation between raw data and processed insights while providing clear data lineage tracking.
+
+2. **Apache Flink**: Stream processing capabilities exceeded expectations, providing robust real-time analysis with minimal latency. The exactly-once processing semantics and flexible windowing operations were particularly valuable.
+
+3. **Containerized Microservices**: Our approach allowed for independent scaling and isolated development of each component, significantly accelerating the development cycle despite the system's complexity.
+
+4. **Hybrid ML+Rules Approach**: Combining rule-based detection with machine learning models provided reliable baseline detection while enhancing sensitivity for subtle pollution patterns. This complementary approach proved more effective than either method alone.
+
+5. **Data Standardization**: Standardizing formats immediately after ingestion significantly reduced downstream complexity.
+
+### Key Insights
+
+Limited time and resources forced strategic compromises, but taught valuable lessons:
+
+1. **Data Quality Over Quantity**: For environmental monitoring systems, data quality is more critical than quantity, fundamentally shifting our focus from maximizing data collection to optimizing data reliability.
+
+2. **Early Standardization**: The importance of data standardization early in the pipeline cannot be overstated.
+
+3. **Functional Prototype First**: Our approach focused on creating a functionally complete prototype rather than a fully-scaled big data system, choosing technologies that support big data principles but implementing them in simplified configurations.
+
+4. **Strategic Compromises**: We omitted Airflow for ML model orchestration, implemented basic observability with structured logging rather than a full monitoring stack, and used synthetic data generation for buoy readings rather than complex integration with real APIs, allowing us to deliver a functional prototype while understanding which areas would require expansion in a production environment.
 
 ## Team & Contributors
 
