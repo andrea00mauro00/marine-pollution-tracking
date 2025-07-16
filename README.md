@@ -177,7 +177,7 @@ The system provides a comprehensive visualization interface designed for environ
 
 The main dashboard provides an overview of system status and key environmental metrics:
 
-![Home Dashboard](./images/dashboard_home.png)
+![Home Dashboard](./data/dashboard_screenshot/home.png)
 
 Key features include:
 - System metrics showing active hotspots, alerts, and sensors
@@ -190,7 +190,7 @@ Key features include:
 
 The alerts interface enables monitoring and management of pollution notifications:
 
-![Alerts Dashboard](./images/dashboard_alerts.png)
+![Alerts Dashboard](./data/dashboard_screenshot/alerts.png)
 
 This view provides:
 - Severity-based alert filtering (high, medium, low)
@@ -203,7 +203,7 @@ This view provides:
 
 Clicking on an alert provides comprehensive information and response guidance:
 
-![Alert Details](./images/dashboard_alert_details.png)
+![Alert Details](./data/dashboard_screenshot/alert_details.png)
 
 The detailed view includes:
 - Complete alert metadata and status information
@@ -218,7 +218,7 @@ The detailed view includes:
 
 The map view provides specialized geospatial visualization of pollution events:
 
-![Map View](./images/dashboard_map.png)
+![Map View](./data/dashboard_screenshot/map.png)
 
 Features include:
 - Filterable map display by pollutant type and severity
@@ -231,7 +231,7 @@ Features include:
 
 The hotspots view enables detailed analysis of pollution concentration areas:
 
-![Hotspots Dashboard](./images/dashboard_hotspots.png)
+![Hotspots Dashboard](./data/dashboard_screenshot/hotspots.png)
 
 This specialized view offers:
 - Hotspot network status overview
@@ -244,7 +244,7 @@ This specialized view offers:
 
 The predictions interface visualizes the projected spread of pollution events:
 
-![Predictions Dashboard](./images/dashboard_predictions.png)
+![Predictions Dashboard](.//data/dashboard_screenshot/predictions.png)
 
 This forward-looking view provides:
 - Time horizon selection for prediction visualization
@@ -257,7 +257,7 @@ This forward-looking view provides:
 
 The reports view offers in-depth analysis of pollution trends and patterns:
 
-![Reports Dashboard](./images/dashboard_reports.png)
+![Reports Dashboard](./data/dashboard_screenshot/reports.png)
 
 Advanced analytical features include:
 - Pollutant trend analysis across time periods
@@ -270,7 +270,7 @@ Advanced analytical features include:
 
 The sensor details view provides comprehensive monitoring of individual sensors:
 
-![Sensor Details](./images/dashboard_sensor_details.png)
+![Sensor Details](./data/dashboard_screenshot/sensor_details.png)
 
 This technical view includes:
 - Current sensor readings and status
@@ -301,7 +301,6 @@ This technical view includes:
    - Add your SentinelHub API credentials:
      ```json
      {
-       "instance_id": "your-instance-id",
        "client_id": "your-client-id",
        "client_secret": "your-client-secret"
      }
@@ -321,7 +320,7 @@ This technical view includes:
    - Dashboard: http://localhost:8501
    - MinIO Console: http://localhost:9001 (user/pass: minioadmin)
    - Kafka UI: http://localhost:8080
-   - PostgreSQL: localhost:5432 (user: postgres, pass: postgres)
+   - PostgreSQL: localhost:5432 (user/pass: postgres)
 
 ### Docker Infrastructure
 
