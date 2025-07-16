@@ -462,10 +462,11 @@ This project leverages foundational research in environmental monitoring, anomal
 
 This project was developed by:
 
-- @lorenzo-attolico
-- @00andrea00mauro
-- @marcoRossi27
-- @walterscf
+- [@lorenzoattolico](https://github.com/lorenzoattolico)  
+- [@00andrea00mauro](https://github.com/00andrea00mauro)  
+- [@marcoRossi27](https://github.com/marcoRossi27)  
+- [@walterscf](https://github.com/walterscf)
+
 
 
 
