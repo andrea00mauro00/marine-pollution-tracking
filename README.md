@@ -48,27 +48,27 @@ Using **Apache Flink** and **Apache Kafka**, the system processes the data in st
 
 The system follows a **microservice-oriented architecture** structured into multiple layers following the medallion data model (bronze/silver/gold):
 
-### 🛰️ Producers
+### Producers
 - `buoy_producer/`: emits synthetic buoy sensor data to Kafka (`buoy_data`)
 - `satellite_producer/`: downloads Sentinel-2 imagery and sends raw images to Kafka (`satellite_imagery`), stores to MinIO (bronze layer)
 
-### ⚙️ Processing Pipelines (Apache Flink)
+### Processing Pipelines (Apache Flink)
 - `sensor_analyzer/`: cleans and analyzes buoy sensor readings
 - `image_standardizer/`: transforms and normalizes satellite imagery
 - `pollution_detector/`: fuses image/sensor data to identify hotspots
 - `ml_prediction/`: predicts pollution drift using trained models
 
-### 🧠 Storage
+### Storage
 - **MinIO**: object storage, medallion layers for image processing
 - **PostgreSQL**: stores pollution metadata, alert history
 - **TimescaleDB**: stores time-series sensor measurements
 
-### 👁️ Consumers
+### Consumers
 - `storage_consumer/`: writes structured data into databases and MinIO
 - `dashboard_consumer/`: pushes real-time metrics to Redis
 - `alert_manager/`: detects high-risk events and triggers custom alerts
 
-### 📊 Visualization
+### Visualization
 - `dashboard/`: Streamlit dashboard for live insights, maps, and alerts
 
 ![Architecture Diagram](data/metrics_visuals/architecture_diagram.png)
@@ -79,35 +79,35 @@ The system follows a **microservice-oriented architecture** structured into mult
 
 This system provides a full-stack, real-time architecture with advanced environmental monitoring capabilities:
 
-### ✅ Real-Time Multi-Source Ingestion
+### Real-Time Multi-Source Ingestion
 - Kafka-based ingestion of synthetic **buoy sensor** data (pH, turbidity, oxygen, microplastics, chemical signals)
 - Scheduled fetching of **Sentinel-2 satellite imagery** using Copernicus APIs
 
-### ⚙️ Flink Streaming Pipelines
+### Flink Streaming Pipelines
 - **Event-time processing** with exactly-once semantics for reliable pollution tracking
 - **Sensor and image fusion** to detect patterns invisible to either source alone
 - Pre-processing includes deduplication, spatial partitioning, and windowed aggregation
 
-### 🔁 Medallion Architecture
+### Medallion Architecture
 - **Bronze**: raw satellite imagery (stored in MinIO)
 - **Silver**: standardized and processed data
 - **Gold**: analyzed pollution data and predictions
 
-### 🧠 Machine Learning Integration
+### Machine Learning Integration
 - 4 predictive models based on fluid dynamics and seasonal features
 - Pollution spread prediction using spatial grid + regression models
 - Real-time classification of anomaly severity
 
-### 🚨 Alert Management
+### Alert Management
 - Automatic generation of **tiered alerts** (low/medium/high) based on pollutant severity
 - Configurable **email/webhook/SMS** logic via environment variables
 - DLQ (Dead Letter Queues) implemented for all Kafka topics to ensure fault tolerance
 
-### 📈 Time-Series Storage
+### Time-Series Storage
 - TimescaleDB for fast retrieval and trend analysis of sensor data
 - PostgreSQL + PostGIS for geo-tagged hotspot metadata
 
-### 🌍 Interactive Dashboard
+### Interactive Dashboard
 - Built with **Streamlit**, featuring:
   - Multi-page navigation
   - Geospatial overlays for satellite + sensor layers
@@ -124,7 +124,7 @@ The Streamlit-based dashboard is composed of multiple pages, each providing a di
 
 ---
 
-### 🏠 Home
+### Home
 
 This is the main landing page of the system. It provides a comprehensive summary of the monitoring network status, active pollution hotspots, recent alerts, and average water quality metrics over the past 24 hours. Key indicators include:
 
@@ -137,7 +137,7 @@ This is the main landing page of the system. It provides a comprehensive summary
 
 ---
 
-### 🗺️ Map View
+### Map View
 
 This page offers a geographic view of all pollution hotspots and sensor locations with dynamic filtering by pollutant type and severity level. The map is interactive and supports detailed spatial navigation.
 
@@ -149,7 +149,7 @@ This page offers a geographic view of all pollution hotspots and sensor location
 
 ---
 
-### 🔥 Hotspots
+### Hotspots
 
 The Hotspots page is dedicated to visualizing and analyzing the current pollution zones. It shows:
 
@@ -162,7 +162,7 @@ The Hotspots page is dedicated to visualizing and analyzing the current pollutio
 
 ---
 
-### 🔮 Predictions
+### Predictions
 
 This page forecasts the future location, severity, and environmental impact of pollution hotspots. The core components include:
 
@@ -174,7 +174,7 @@ This page forecasts the future location, severity, and environmental impact of p
 
 ---
 
-### 📡 Sensors
+### Sensors
 
 This page shows the latest sensor readings and historical trends for each monitoring device. When selecting a sensor, users see:
 
@@ -186,7 +186,7 @@ This page shows the latest sensor readings and historical trends for each monito
 
 ---
 
-### 🚨 Alerts
+### Alerts
 
 The Alerts page highlights detected pollution events classified by severity. It displays:
 
@@ -200,7 +200,7 @@ The Alerts page highlights detected pollution events classified by severity. It 
 
 ---
 
-### 🧭 Alert Details
+### Alert Details
 
 Clicking on a specific alert brings up a detailed breakdown with intervention instructions. The alert details page provides:
 
@@ -214,7 +214,7 @@ Clicking on a specific alert brings up a detailed breakdown with intervention in
 
 ---
 
-### 📊 Reports
+### Reports
 
 The Reports page summarizes system-wide analytics across time, offering insight into environmental trends. It includes:
 
@@ -300,7 +300,7 @@ The system is composed of independent microservices and Flink streaming jobs, ea
 
 ---
 
-### ⚙️ Flink Stream Processors
+### Flink Stream Processors
 
 * **`sensor_analyzer/`**
   Parses and enriches sensor data, performs anomaly detection.
@@ -345,7 +345,7 @@ The system is composed of independent microservices and Flink streaming jobs, ea
 
 ---
 
-### 📥 Consumers & Persistence
+### Consumers & Persistence
 
 * **`storage_consumer/`**
   Consumes all processed topics and stores them into PostgreSQL, TimescaleDB, and MinIO accordingly.
@@ -355,7 +355,7 @@ The system is composed of independent microservices and Flink streaming jobs, ea
 
 ---
 
-### 🚨 Alerting
+### Alerting
 
 * **`alert_manager/`**
   Detects high-risk events and emits tiered alerts (low/medium/high). Can be configured to:
@@ -366,14 +366,14 @@ The system is composed of independent microservices and Flink streaming jobs, ea
 
 ---
 
-### ❌ Error Handling
+### Error Handling
 
 * **`dlq_consumer/` + `create_dlq_topics.py`**
   Implements Dead Letter Queues (DLQs) for every Kafka topic to prevent data loss in case of serialization or processing errors.
 
 ---
 
-### 📊 Dashboard
+### Dashboard
 
 * **`dashboard/`**
   Built with Streamlit, this frontend aggregates all data layers into a single live monitoring interface. It provides:
@@ -390,22 +390,22 @@ All components are designed to be stateless and restartable. The system is fully
 
 While the prototype successfully demonstrates the core features of a real-time marine pollution monitoring system, several technical and architectural limitations remain:
 
-### ⚠️ Data Source Limitations
+### Data Source Limitations
 - All data used in this implementation is **synthetic** (sensor and satellite), not real NOAA/USGS or Copernicus feeds.
 - No real-world validation of the alerting and prediction accuracy.
 
-### 📉 Machine Learning Shortcomings
+### Machine Learning Shortcomings
 - Static ML models (Random Forests) trained on synthetic datasets.
 - No continuous learning, versioning, or performance monitoring pipeline implemented.
 - Absence of drift detection and retraining mechanisms.
 
-### 📦 System Architecture Constraints
+### System Architecture Constraints
 - Kafka is deployed in **single-broker** mode without replication or partitioning — not suitable for production scale.
 - **Fixed spatial grid** for hotspot detection may miss pollution clusters near boundaries or in highly variable density regions.
 - TimescaleDB lacks automated retention policies and advanced downsampling strategies.
 - Dashboard analytics are limited (e.g., no export, filtering, or user annotation features).
 
-### 🧠 Observability & Ops
+### Observability & Ops
 - No real-time system monitoring (e.g., Prometheus, Grafana, ELK).
 - Minimal observability: only structured logging and Redis pub/sub used.
 
@@ -415,23 +415,23 @@ While the prototype successfully demonstrates the core features of a real-time m
 
 With additional time and resources, the following upgrades would make the system production-ready and more robust:
 
-### ✅ Data & ML Enhancements
+### Data & ML Enhancements
 - Integrate **real data sources** from NOAA, USGS, and Sentinel Hub (Copernicus APIs)
 - Build a **retraining pipeline** using incoming data streams
 - Implement **drift detection** and **model performance monitoring**
 - Use modern architectures like LSTM, GRU, or Transformer-based time series models
 
-### ⚙️ Infrastructure
+### Infrastructure
 - Deploy **Kafka clusters** with topic replication and custom partitioning
 - Add **Kubernetes orchestration** for dynamic autoscaling and zero-downtime rollouts
 - Move toward **cloud-native storage** with governance tools (e.g., AWS S3 + Lake Formation)
 
-### 📊 Dashboard Extensions
+### Dashboard Extensions
 - Add data export (CSV, GeoJSON), time filters, user feedback input
 - Integrate multi-layer overlays (e.g., temperature, salinity, wind)
 - Add download/export functionality for analytics and reports
 
-### 📌 Geo & Spatial Improvements
+### Geo & Spatial Improvements
 - Use **adaptive spatial clustering** based on pollution density
 - Handle **boundary-overlapping events** and mobility of hotspots
 - Implement **spatiotemporal joins** between satellite events and sensor anomalies
