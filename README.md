@@ -1,6 +1,7 @@
 # Marine Pollution Monitoring System
 
-An end-to-end, real-time environmental intelligence platform designed to track, analyze, and forecast marine pollution events. This system ingests satellite imagery and buoy sensor data from multiple sources, processes it using Flink-based streaming pipelines, and provides a responsive dashboard for environmental agencies to act quickly and effectively. Deployed via Docker, it integrates ML prediction models and geospatial visualizations to detect pollution hotspots, forecast their evolution, and generate automated alerts.
+Real-time detection. Predictive intelligence. Actionable insights.
+A fully containerized platform that monitors marine pollution in real time by combining satellite imagery and IoT buoy data. Powered by Apache Flink, Kafka, and ML models, it identifies environmental threats, forecasts their evolution, and delivers instant alerts through a dynamic, geospatial dashboard — helping agencies make fast, data-driven decisions to protect coastal ecosystems.
 
 ![System Architecture](data/metrics_visuals/system_architecture.png)
 
