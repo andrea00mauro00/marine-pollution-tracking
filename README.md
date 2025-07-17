@@ -1,65 +1,54 @@
 # Marine Pollution Tracking System
 
-![Version](https://img.shields.io/badge/version-1.0.0-green.svg)
-![Python](https://img.shields.io/badge/python-3.9-blue.svg)
-![Flink](https://img.shields.io/badge/Flink-1.17-orange.svg)
-![Kafka](https://img.shields.io/badge/Kafka-7.5.0-red.svg)
-![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-9cf.svg)
+![version](https://img.shields.io/badge/version-1.0.0-green)
+![python](https://img.shields.io/badge/python-3.9-blue)
+![Flink](https://img.shields.io/badge/Flink-1.17-orange)
+![Kafka](https://img.shields.io/badge/Kafka-7.5.0-red)
+![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-blue)
 
 ![Logo](./data/logo.png)
 
 ## Table of Contents
 
-- [Introduction](#introduction)
-- [System Architecture](#system-architecture)
-- [Core Components](#core-components)
-- [Data Processing Pipeline](#data-processing-pipeline)
-- [Flink Processing Jobs & ML Components](#flink-processing-jobs--ml-components)
-- [Dashboard & Visualization](#dashboard--visualization)
-- [Installation & Setup](#installation--setup)
-- [Performance & Results](#performance--results)
-- [Technical Implementation](#technical-implementation)
-- [Limitations & Future Work](#limitations--future-work)
-- [Lessons Learned](#lessons-learned)
-- [Team & Contributors](#team--contributors)
-- [References](#references)
+* [Introduction](#introduction)
+* [System Architecture](#system-architecture)
+* [Core Components](#core-components)
+* [Data Processing Pipeline](#data-processing-pipeline)
+* [Flink Processing Jobs & ML Components](#flink-processing-jobs--ml-components)
+* [Dashboard & Visualization](#dashboard--visualization)
+* [Installation & Setup](#installation--setup)
+* [Performance & Results](#performance--results)
+* [Limitations & Future Work](#limitations--future-work)
+* [Team & Contributors](#team--contributors)
+* [Conclusion](#conclusion)
+* [References](#references)
 
 ## Introduction
 
-The Marine Pollution Tracking System is an advanced real-time environmental intelligence platform designed to transform how we monitor and respond to water pollution events. By integrating data from diverse sources—including IoT sensor buoys and satellite imagery—the system enables comprehensive tracking, analysis, and prediction of pollution in the Chesapeake Bay ecosystem.
+The **Marine Pollution Monitoring System** is a prototype real-time environmental intelligence platform designed to demonstrate how we could monitor and respond to water pollution events. The system uses synthetic data to simulate pollution monitoring in the Chesapeake Bay.
 
 ### The Environmental Challenge
 
-Current water pollution monitoring approaches face critical limitations that hamper effective environmental protection:
+Current water pollution monitoring systems face critical limitations that hamper effective environmental protection:
 
-- **Data Silos**: Environmental data from different sources (sensors, satellites, manual sampling) remains disconnected, preventing comprehensive analysis
-- **Delayed Response**: Manual analysis creates significant lag time between pollution events and intervention, allowing contamination to spread
-- **Limited Predictive Capabilities**: Without integrated data and advanced modeling, agencies cannot anticipate pollution spread patterns
-- **Reactive Paradigm**: Traditional monitoring is primarily reactive, detecting pollution only after it becomes severe
+* **Data Silos**: Environmental data from different sources (sensors, satellites, manual sampling) remains disconnected, preventing comprehensive analysis
+* **Delayed Response**: Manual analysis creates significant lag time between pollution events and intervention, allowing contamination to spread
+* **Limited Predictive Capabilities**: Without integrated data and advanced modeling, agencies cannot anticipate pollution spread patterns
+* **Reactive Paradigm**: Traditional monitoring is primarily reactive, detecting pollution only after it becomes severe
 
-Our system addresses these challenges by creating a unified, real-time monitoring infrastructure that enables environmental agencies to identify emerging threats quickly, allocate resources efficiently, and develop targeted intervention strategies before pollution events become severe.
-
-### Project Objectives
-
-The Marine Pollution Tracking System aims to:
-
-1. Integrate disparate data sources into a unified environmental monitoring platform
-2. Enable real-time detection of pollution events as they emerge
-3. Provide predictive capabilities to forecast contamination spread
-4. Support data-driven decision-making for environmental protection agencies
-5. Transform environmental monitoring from reactive to proactive
+Our system demonstrates how a unified, real-time monitoring infrastructure would allow environmental agencies to identify emerging threats quickly, allocate resources efficiently, and develop targeted intervention strategies before pollution events become severe.
 
 ## System Architecture
 
-The system implements a modern microservices architecture optimized for real-time environmental data processing. The architecture consists of several integrated layers, each handling specific aspects of the pollution monitoring workflow:
+The system implements a microservices architecture optimized for real-time environmental data processing. The architecture consists of several integrated layers, each handling specific aspects of the pollution monitoring workflow:
 
-![System Architecture Diagram](./data/system_architecture_diagram.png)
+![System Architecture](./data/system_architecture_diagram.png)
 
 ### Architectural Overview
 
 The system follows a distributed microservices pattern with event-driven communication, organized into five primary layers:
 
-1. **Data Acquisition Layer**: Collects data from sensors and satellites, standardizing inputs before publishing to the message broker
+1. **Data Acquisition Layer**: Collects synthetic sensor data representing buoys and simulated satellite imagery data
 2. **Stream Processing Layer**: Processes events in real-time using Apache Flink, performing analysis and detection
 3. **Storage Layer**: Implements a medallion architecture (Bronze/Silver/Gold) across multiple specialized databases
 4. **Analytics Layer**: Combines rule-based detection with ML models to identify hotspots and predict spread
@@ -69,24 +58,15 @@ The system follows a distributed microservices pattern with event-driven communi
 
 The detailed component interaction diagram shows how data flows through the system:
 
-![System Architecture Flow](./data/system_architecture_flow.png)
+![Component Interaction Flow](./data/system_architecture_flow.png)
 
-### Data Flow
-
-1. Data sources (NOAA/USGS & SentinelHub) provide raw data to producers every 30 seconds (buoys) and 15 minutes (satellite imagery)
-2. Producers publish standardized data to Kafka topics (buoy_data, satellite_imagery)
-3. Flink jobs process these streams for analysis (sensor_analyzer, image_standardizer) 
+1. Data sources include synthetically generated buoy sensor data and simulated satellite imagery
+2. Producers publish standardized data to **Kafka topics** (buoy_data, satellite_imagery)
+3. **Flink jobs** process these streams for analysis (sensor_analyzer, image_standardizer)
 4. Detection algorithms identify pollution hotspots (pollution_detector)
 5. Prediction models forecast pollution spread (ml_prediction)
 6. Results are stored in appropriate databases based on data type and purpose
-7. The dashboard provides real-time visualization of all system insights
-
-The architecture enables several key capabilities:
-
-- **Decoupled Components**: Services can be developed, scaled, and maintained independently
-- **Failure Isolation**: Issues in one component don't cascade throughout the system
-- **Horizontal Scalability**: Components can scale based on processing demands
-- **Progressive Enhancement**: The system can evolve through component upgrades
+7. The dashboard provides visualization of system insights
 
 ## Core Components
 
@@ -94,78 +74,73 @@ The system comprises multiple specialized microservices organized by function, a
 
 ```
 marine-pollution-tracking/
-├── alert_manager/                # Alert processing and notification service
-├── buoy_producer/                # Retrieves and publishes sensor data from buoys
-├── common/                       # Shared utilities and libraries
-├── create_dlq_topics/            # Sets up Dead Letter Queues for error handling
-├── dashboard/                    # Streamlit visualization interface
-├── dashboard_consumer/           # Prepares data for dashboard visualization
-├── data/                         # Data storage directory
-├── dlq_consumer/                 # Processes messages from Dead Letter Queues
-├── docker-compose.yml            # Container orchestration configuration
-├── image_standardizer/           # Processes and standardizes satellite imagery
-├── LICENSE                       # License information
-├── ml_prediction/                # Machine learning models for pollution prediction
-├── pollution_detector/           # Identifies pollution hotspots through analysis
-├── README.md                     # Project documentation
-├── satellite_producer/           # Retrieves and publishes satellite imagery
-├── schemas/                      # Data schema definitions
-├── scripts/                      # Utility scripts for setup and maintenance
-├── sensor_analyzer/              # Analyzes and classifies sensor readings
-├── setup_database/               # Database initialization and configuration
-├── setup_minio/                  # MinIO object storage configuration
-└── storage_consumer/             # Manages data persistence across storage systems
+├── alert_manager/             # Alert processing and notification service
+├── buoy_producer/             # Generates simulated sensor data
+├── common/                    # Shared utilities and libraries
+├── create_dlq_topics/         # Sets up Dead Letter Queues for error handling
+├── dashboard/                 # Streamlit visualization interface
+├── dashboard_consumer/        # Prepares data for dashboard visualization
+├── data/                      # Data storage directory
+├── dlq_consumer/              # Processes messages from Dead Letter Queues
+├── docker-compose.yml         # Container orchestration configuration
+├── image_standardizer/        # Processes and standardizes satellite imagery
+├── LICENSE                    # License information
+├── ml_prediction/             # Machine learning models for pollution prediction
+├── pollution_detector/        # Identifies pollution hotspots through analysis
+├── README.md                  # Project documentation
+├── satellite_producer/        # Creates simulated satellite imagery data
+├── schemas/                   # Data schema definitions
+├── sensor_analyzer/           # Analyzes and classifies sensor readings
+├── setup_database/            # Database initialization and configuration
+├── setup_minio/               # MinIO object storage configuration
+└── storage_consumer/          # Manages data persistence across storage systems
 ```
 
 ### Data Producers
 
-- **buoy_producer**: Fetches sensor data from NOAA/USGS APIs, validates readings, and publishes to Kafka
-- **satellite_producer**: Retrieves Sentinel-2 satellite imagery, preprocesses it, and pushes to Kafka
+* **buoy_producer**: Generates simulated sensor data representing buoy readings, validates them, and publishes to Kafka
+* **satellite_producer**: Creates simulated satellite imagery data and pushes to Kafka
 
-### Stream Processors
+### Flink Stream Processing Jobs
 
-- **image_standardizer**: Normalizes satellite imagery through spectral analysis and format standardization
-- **sensor_analyzer**: Performs quality checks, statistical analysis, and anomaly detection on sensor readings
-- **pollution_detector**: Uses spatial clustering algorithms to identify potential pollution hotspots
-- **ml_prediction**: Executes fluid dynamics models to predict pollution spread patterns
+* **image_standardizer**: Processes raw satellite imagery through band normalization, cloud masking, and geometric corrections. Applies ML-based classification to identify potential pollution signatures in spectral data and standardizes formats for downstream analysis.
+
+* **sensor_analyzer**: Performs multi-stage validation of buoy sensor readings, including range validation, statistical anomaly detection, and temporal consistency checks. Applies machine learning models to classify potential pollution events and enriches data with calculated risk scores.
+
+* **pollution_detector**: Integrates data from both satellite and sensor sources using spatial-temporal correlation. Implements a hybrid grid-based spatial clustering algorithm to identify pollution concentration areas, and generates confidence scores for each detected hotspot.
+
+* **ml_prediction**: Applies simplified fluid dynamics models to forecast pollution spread over time. Incorporates environmental variables (wind, currents, temperature) and pollutant physical properties to estimate dispersion patterns, generating spatial prediction maps for up to 48 hours.
 
 ### Data Consumers
 
-- **storage_consumer**: Manages persistent storage across the medallion architecture
-- **dashboard_consumer**: Prepares and caches data for visualization components
-- **alert_manager**: Processes pollution events and generates notifications
-- **dlq_consumer**: Handles messages that failed processing in their primary pipelines
+* **storage_consumer**: Manages persistent storage across the medallion architecture
+* **dashboard_consumer**: Prepares and caches data for visualization components
+* **alert_manager**: Processes pollution events and generates notifications
+* **dlq_consumer**: Handles messages that failed processing in their primary pipelines
 
 ### Storage Services
 
-- **setup_database**: Initializes PostgreSQL with PostGIS extension and TimescaleDB for time-series data
-- **setup_minio**: Configures MinIO object storage with appropriate buckets for the medallion architecture
-
-### Support Components
-
-- **common**: Shared utilities, configurations, and libraries used across services
-- **schemas**: Data schema definitions ensuring consistent data formats throughout the system
-- **scripts**: Utility scripts for setup, maintenance, and testing
-- **create_dlq_topics**: Sets up Dead Letter Queues for robust error handling
+* **setup_database**: Initializes PostgreSQL with PostGIS extension and TimescaleDB for time-series data
+* **setup_minio**: Configures MinIO object storage with appropriate buckets for the medallion architecture
 
 ## Data Processing Pipeline
 
-The system implements a sophisticated data pipeline that processes environmental information through multiple stages, ensuring reliability, accuracy, and analytical depth.
+The system implements a data pipeline that processes environmental information through multiple stages, demonstrating potential approaches for reliability, accuracy, and analytical depth in a real-world system.
 
 ### Data Acquisition
 
 The system ingests data from two primary sources:
 
-1. **Sensor Buoys**: Environmental sensors deployed throughout Chesapeake Bay transmit readings every 30 seconds, providing measurements of:
-   - Water quality parameters (pH, dissolved oxygen, turbidity)
-   - Chemical contaminants (nitrogen compounds, phosphates, hydrocarbons)
-   - Physical properties (temperature, salinity, conductivity)
-   - Microplastics concentration
+1. **Sensor Buoys**: Simulated environmental sensors representing deployments throughout Chesapeake Bay transmit readings every 30 seconds, providing measurements of:
+   * Water quality parameters (pH, dissolved oxygen, turbidity)
+   * Chemical contaminants (nitrogen compounds, phosphates, hydrocarbons)
+   * Physical properties (temperature, salinity, conductivity)
+   * Microplastics concentration
 
-2. **Satellite Imagery**: Sentinel-2 satellites capture multispectral imagery every 15 minutes, offering:
-   - Broad spatial coverage of the entire bay area
-   - Spectral bands optimized for water quality assessment
-   - Visual confirmation of potential pollution events
+2. **Satellite Imagery**: Simulated satellite imagery with synthetic pollution effects, offering:
+   * Broad spatial coverage of the entire bay area
+   * Spectral bands optimized for water quality assessment
+   * Simulated data for testing detection capabilities
 
 ### Real-Time Processing
 
@@ -175,357 +150,372 @@ Data flows through a series of specialized Flink jobs that perform increasingly 
 2. **Anomaly Detection**: Statistical methods identify unusual readings that may indicate pollution
 3. **Spatial Analysis**: Clustering algorithms detect potential pollution hotspots
 4. **Temporal Analysis**: Time-window processing differentiates new events from evolving existing ones
-5. **Predictive Modeling**: Fluid dynamics models simulate contamination spread
+5. **Predictive Modeling**: Simplified fluid dynamics models simulate contamination spread
 
-### Medallion Architecture
+## Medallion Architecture
 
-The system implements a comprehensive medallion architecture for data management:
+The system implements a comprehensive data management strategy using the medallion architecture in MinIO object storage:
 
-- **Bronze Layer**: Raw data preserved exactly as received, providing the foundation for reprocessing
-- **Silver Layer**: Validated, cleansed, and standardized data ready for analysis
-- **Gold Layer**: Derived insights, analytical results, and aggregated metrics for visualization
+### Bronze Layer (Raw Data)
+* **Buoy Readings**: JSON-formatted sensor data stored in a partitioned structure:
+  ```
+  bronze/buoy_data/year={year}/month={month}/day={day}/buoy_{sensor_id}_{timestamp}.json
+  ```
+* **Satellite Metadata**: Information about image acquisition time and properties:
+  ```
+  bronze/satellite_imagery/sentinel2/year={year}/month={month}/day={day}/metadata_{scene_id}_{timestamp}.json
+  ```
+* **Raw Imagery**: Original satellite images in their native format:
+  ```
+  bronze/satellite_imagery/sentinel2/year={year}/month={month}/day={day}/sat_img_{scene_id}_{timestamp}.jpg
+  ```
+* **Event Logs**: System operation logs for debugging and audit purposes
 
-This approach ensures data quality while maintaining complete lineage from raw inputs to final insights.
+### Silver Layer (Processed Data)
+* **Analyzed Sensor Data**: Validated and enriched sensor readings with anomaly scores in Parquet format:
+  ```
+  silver/analyzed_data/buoy/year={year}/month={month}/day={day}/analyzed_{source_id}_{timestamp}.parquet
+  ```
+* **Processed Imagery**: Enhanced satellite images with feature extractions and pollution probability maps:
+  ```
+  silver/analyzed_data/satellite/year={year}/month={month}/day={day}/processed_{image_id}_{timestamp}.geotiff
+  ```
+* **Pollution Masks**: Binary masks showing potential pollution areas:
+  ```
+  silver/analyzed_data/satellite/year={year}/month={month}/day={day}/mask_{image_id}_{timestamp}.png
+  ```
+* **Spatial Indices**: Geospatial indexing for efficient location-based queries:
+  ```
+  silver/spatial_index/satellite/year={year}/month={month}/day={day}/spatial_{image_id}_{timestamp}.json
+  ```
+
+### Gold Layer (Business Insights)
+* **Pollution Hotspots**: Detected pollution events with full metadata and confidence scores:
+  ```
+  gold/hotspots/year={year}/month={month}/day={day}/hotspot_{hotspot_id}_{timestamp}.parquet
+  ```
+* **Prediction Maps**: Spatial and temporal forecasts of pollution spread:
+  ```
+  gold/predictions/year={year}/month={month}/day={day}/prediction_{prediction_set_id}_{timestamp}.parquet
+  ```
+
+### Additional Specialized Buckets
+* **Models**: Contains trained ML models organized by component:
+  - `models/sensor_analysis/`: Models for anomaly detection and pollution classification from sensor data
+  - `models/image_analysis/`: Models for pollution detection in satellite imagery
+  - `models/pollution_detection/`: Models for hotspot verification and confidence scoring
+  - `models/diffusion_prediction/`: Models for forecasting pollution spread patterns
+
+* **Configs**: Configuration files for each processing component:
+  - `configs/sensor_analyzer/`: Parameter configurations for sensor validation and analysis
+  - `configs/image_standardizer/`: Settings for image processing and standardization
+  - `configs/pollution_detector/`: Configurations for spatial clustering algorithms
+  - `configs/ml_prediction/`: Parameters for prediction models and simulation settings
 
 ### Event-Driven Communication
 
 The components communicate through a message-driven architecture:
 
-- **Kafka Topics**: Specialized topics for different data domains enable loose coupling
-- **Dead Letter Queues**: Failed messages are captured for analysis and potential reprocessing
-- **Schema Registry**: Centralized schema management ensures consistent data formats
+* **Kafka Topics**: Specialized topics for different data domains enable loose coupling
+* **Dead Letter Queues**: Failed messages are captured for analysis and potential reprocessing
+* **Schema Registry**: Centralized schema management ensures consistent data formats
 
-This design provides buffering during load spikes, enables multiple consumers for the same events, and ensures reliable message delivery.
+This design provides buffering during load spikes, enables multiple consumers for the same events, and demonstrates approaches for reliable message delivery.
 
 ## Flink Processing Jobs & ML Components
 
-The system implements various machine learning models, each integrated into a specific Flink job to perform specialized analysis functions:
+The system implements basic machine learning models, each integrated into a specific Flink job to perform specialized analysis functions. These models are simplified implementations intended to demonstrate the concepts rather than provide production-grade predictions.
 
 ### Sensor Analyzer Job
-- **Pollutant Classifier (RandomForestClassifier)**
-  - **Input**: Sensor parameters [pH, turbidity, temperature, mercury, lead, petroleum, oxygen, microplastics]
-  - **Output**: Pollution type classification [oil_spill, chemical_discharge, agricultural_runoff, sewage, algal_bloom, unknown]
-- **Anomaly Detector (IsolationForest)**
-  - **Input**: Same sensor parameters
-  - **Output**: Detection of anomalies in sensor data (contamination=0.05)
+
+* **Pollutant Classifier** (RandomForestClassifier)
+  * Input: Sensor parameters [pH, turbidity, temperature, mercury, lead, petroleum, oxygen, microplastics]
+  * Output: Pollution type classification [oil_spill, chemical_discharge, agricultural_runoff, sewage, algal_bloom, unknown]
+* **Anomaly Detector** (IsolationForest)
+  * Input: Same sensor parameters
+  * Output: Detection of anomalies in sensor data (contamination=0.05)
 
 ### Image Standardizer Job
-- **Image Classifier (RandomForestClassifier)**
-  - **Input**: Features extracted from images [dark_patch_ratio, green_dominance, spectral_contrast, texture_variance, edge_density]
-  - **Output**: Visible pollution type [oil_spill, algal_bloom, sediment, chemical_discharge, unknown]
+
+* **Image Classifier** (RandomForestClassifier)
+  * Input: Features extracted from images [dark_patch_ratio, green_dominance, spectral_contrast, texture_variance, edge_density]
+  * Output: Visible pollution type [oil_spill, algal_bloom, sediment, chemical_discharge, unknown]
 
 ### Pollution Detector Job
-- **Confidence Estimator (RandomForestRegressor)**
-  - **Input**: Detection metrics [num_points, avg_risk, max_risk, source_diversity, time_span]
-  - **Output**: Confidence score (0-1) on detection validity
+
+* **Confidence Estimator** (RandomForestRegressor)
+  * Input: Detection metrics [num_points, avg_risk, max_risk, source_diversity, time_span]
+  * Output: Confidence score (0-1) on detection validity
 
 ### ML Prediction Job
-- **Oil Spill Model (RandomForestRegressor)**
-  - **Input**: Environmental and pollution parameters [lat, lon, radius, pollution_level, wind_speed, wind_direction, current_speed, current_direction, hours_ahead]
-  - **Output**: Spread prediction [new_lat, new_lon, new_radius]
-- **Chemical Model (RandomForestRegressor)**
-  - **Input**: Same environmental parameters
-  - **Output**: Spread prediction specific to chemical pollutants
 
-All models are basic implementations (RandomForest with only 10 estimators) trained on synthetic data, representing a limitation of the current implementation that would require enhancement for production deployment.
+* **Oil Spill Model** (RandomForestRegressor)
+  * Input: Environmental and pollution parameters [lat, lon, radius, pollution_level, wind_speed, wind_direction, current_speed, current_direction, hours_ahead]
+  * Output: Spread prediction [new_lat, new_lon, new_radius]
+* **Chemical Model** (RandomForestRegressor)
+  * Input: Same environmental parameters
+  * Output: Spread prediction specific to chemical pollutants
+
+**Important Note:** All models are basic implementations trained on simulated pollution patterns. These are proof-of-concept demonstrations that would require significant enhancement with real pollution data and more sophisticated algorithms for production deployment.
 
 ### Hybrid Processing Approach
 
-The system effectively combines ML models with rule-based approaches:
-- ML models enhance sensitivity for subtle pollution patterns
-- Rule-based systems ensure reliable baseline detection
-- Fallback mechanisms maintain system operation when ML encounters issues
+The system effectively combines ML models with rule-based approaches to demonstrate a potential real-world implementation strategy:
 
-This complementary approach has proven more effective than either method alone.
+* ML models enhance sensitivity for **subtle pollution patterns**
+* Rule-based systems ensure **reliable baseline detection**
+* Fallback mechanisms maintain **system operation** when ML encounters issues
+
+This complementary approach has the potential to be more effective than either method alone in a real-world system.
 
 ## Dashboard & Visualization
 
-The system provides a comprehensive visualization interface designed for environmental monitoring and decision support. The dashboard offers specialized views for different aspects of pollution monitoring:
+The system provides a comprehensive visualization interface designed for environmental monitoring and decision support. The dashboard offers specialized views for different aspects of pollution monitoring.
 
 ### Home Dashboard
 
 The main dashboard provides an overview of system status and key environmental metrics:
 
-![Home Dashboard](./data/dashboard_screenshots/home.png)
+![Home Dashboard](./data/dashboard_screenshots/home_dashboard.png)
 
 Key features include:
-- System metrics showing active hotspots, alerts, and sensors
-- Water quality indicators (pH, turbidity, temperature, microplastics)
-- Pollution hotspot map with current detections
-- Critical alerts requiring immediate attention
-- Pollutant distribution visualization
+
+* System metrics showing **active hotspots**, alerts, and sensors
+* Water quality indicators (pH, turbidity, temperature, microplastics)
+* **Pollution hotspot map** with current detections
+* **Critical alerts** requiring immediate attention
+* Pollutant distribution visualization
 
 ### Alerts Management
 
 The alerts interface enables monitoring and management of pollution notifications:
 
-![Alerts Dashboard](./data/dashboard_screenshots/alerts.png)
+![Alerts Management](./data/dashboard_screenshots/alerts_dashboard.png)
 
 This view provides:
-- Severity-based alert filtering (high, medium, low)
-- Geospatial visualization of alert locations
-- Detailed alert information including ID, type, and status
-- Key recommendations for intervention
-- Statistical analysis of alerts by pollutant type and severity
+
+* **Severity-based alert filtering** (high, medium, low)
+* Geospatial visualization of alert locations
+* Detailed alert information including ID, type, and status
+* Key recommendations for intervention
+* Statistical analysis of alerts by pollutant type and severity
 
 ### Alert Details
 
 Clicking on an alert provides comprehensive information and response guidance:
 
-![Alert Details](./data/dashboard_screenshots/alerts_details.png)
+![Alert Details](./data/dashboard_screenshots/alert_details.png)
 
 The detailed view includes:
-- Complete alert metadata and status information
-- Precise geolocation of the pollution event
-- Intervention recommendations with specific actions
-- Resource requirements for response operations
-- Stakeholder notification recommendations
-- Regulatory implications and compliance requirements
-- Environmental impact assessment
+
+* Complete alert metadata and status information
+* Precise geolocation of the pollution event
+* **Intervention recommendations** with specific actions
+* Resource requirements for response operations
+* Stakeholder notification recommendations
+* Regulatory implications and compliance requirements
+* Environmental impact assessment
 
 ### Pollution Mapping
 
 The map view provides specialized geospatial visualization of pollution events:
 
-![Map View](./data/dashboard_screenshots/map.png)
+![Pollution Map](./data/dashboard_screenshots/pollution_map.png)
 
 Features include:
-- Filterable map display by pollutant type and severity
-- Interactive controls for visualization customization
-- Detailed statistics on visible hotspots and sensors
-- Severity distribution visualization
-- Base map selection options
+
+* **Filterable map display** by pollutant type and severity
+* Interactive controls for visualization customization
+* Detailed statistics on visible hotspots and sensors
+* Severity distribution visualization
+* Base map selection options
 
 ### Hotspot Analysis
 
 The hotspots view enables detailed analysis of pollution concentration areas:
 
-![Hotspots Dashboard](./data/dashboard_screenshots/hotspots.png)
+![Hotspot Analysis](./data/dashboard_screenshots/hotspot_analysis.png)
 
 This specialized view offers:
-- Hotspot network status overview
-- Distribution analysis by pollutant type
-- Severity classification visualization
-- Risk score calculation by pollutant type
-- Advanced analytical tools for pollution pattern identification
+
+* Hotspot network status overview
+* **Distribution analysis** by pollutant type
+* Severity classification visualization
+* **Risk score calculation** by pollutant type
+* Advanced analytical tools for pollution pattern identification
 
 ### Prediction Forecasting
 
 The predictions interface visualizes the projected spread of pollution events:
 
-![Predictions Dashboard](./data/dashboard_screenshots/predictions.png)
+![Prediction Forecasting](./data/dashboard_screenshots/prediction_forecasting.png)
 
 This forward-looking view provides:
-- Time horizon selection for prediction visualization
-- Geospatial representation of predicted pollution spread
-- Temporal evolution graph showing contamination progression
-- Detailed prediction metrics including confidence scores
-- Filtering by severity and prediction timeframe
+
+* **Time horizon selection** for prediction visualization
+* Geospatial representation of predicted pollution spread
+* **Temporal evolution graph** showing contamination progression
+* Detailed prediction metrics including confidence scores
+* Filtering by severity and prediction timeframe
 
 ### Analytical Reporting
 
 The reports view offers in-depth analysis of pollution trends and patterns:
 
-![Reports Dashboard](./data/dashboard_screenshots/report.png)
+![Analytical Reporting](./data/dashboard_screenshots/analytical_reporting.png)
 
 Advanced analytical features include:
-- Pollutant trend analysis across time periods
-- Comparative visualization by pollutant type
-- Severity distribution analysis
-- Risk score distribution visualization
-- Customizable report generation capabilities
+
+* **Pollutant trend analysis** across time periods
+* Comparative visualization by pollutant type
+* Severity distribution analysis
+* Risk score distribution visualization
+* Customizable report generation capabilities
 
 ### Sensor Monitoring
 
 The sensor details view provides comprehensive monitoring of individual sensors:
 
-![Sensor Details](./data/dashboard_screenshots/sensor_details.png)
+![Sensor Monitoring](./data/dashboard_screenshots/sensor_monitoring.png)
 
 This technical view includes:
-- Current sensor readings and status
-- Historical measurement visualization
-- Parameter correlation analysis
-- Trend identification and anomaly highlighting
-- Multiple parameter visualization options
+
+* Current sensor readings and status
+* **Historical measurement visualization**
+* Parameter correlation analysis
+* **Trend identification** and anomaly highlighting
+* Multiple parameter visualization options
 
 ## Installation & Setup
 
 ### Prerequisites
 
-- Docker and Docker Compose
-- 8GB RAM minimum (16GB recommended)
-- 50GB free disk space
-- Internet connection for data retrieval from NOAA/USGS and SentinelHub
+* **Docker and Docker Compose**
+* 8GB RAM minimum (**16GB recommended** for optimal performance)
+* 50GB free disk space
+* Internet connection for package downloads during container building
 
 ### Installation Steps
 
 1. Clone the repository:
-   ```bash
-   git clone https://github.com/andrea00mauro00/marine-pollution-tracking.git
-   cd marine-pollution-tracking
-   ```
 
-2. Configure SentinelHub credentials:
-   - Create a credentials.json file in the satellite_producer directory
-   - Add your SentinelHub API credentials:
-     ```json
-     {
-       "client_id": "your-client-id",
-       "client_secret": "your-client-secret"
-     }
-     ```
+```bash
+git clone https://github.com/andrea00mauro00/marine-pollution-tracking.git
+cd marine-pollution-tracking
+```
+
+2. **Configure SentinelHub credentials**:
+
+Create a credentials.json file in the satellite_producer directory:
+
+```json
+{
+  "client_id": "your-client-id",
+  "client_secret": "your-client-secret"
+}
+```
 
 3. Start the system:
-   ```bash
-   docker-compose up -d
-   ```
+
+```bash
+docker-compose up -d
+```
 
 4. Verify services are running:
-   ```bash
-   docker-compose ps
-   ```
+
+```bash
+docker-compose ps
+```
 
 5. Access interfaces:
-   - Dashboard: http://localhost:8501
-   - MinIO Console: http://localhost:9001 (user/pass: minioadmin)
-   - Kafka UI: http://localhost:8080
-   - PostgreSQL: localhost:5432 (user: postgres, pass: postgres)
+
+* **Dashboard**: http://localhost:8501
+* **MinIO Console**: http://localhost:9001 (user/pass: minioadmin)
+* **Kafka UI**: http://localhost:8080
+* **PostgreSQL**: localhost:5432 (user: postgres, pass: postgres)
 
 ### Docker Infrastructure
 
 The system uses the following Docker images for deployment:
-- python:3.9
-- postgres:14-alpine
-- timescale/timescaledb:latest-pg14
-- redis:7-alpine
-- confluentinc/cp-zookeeper:7.5.0
-- confluentinc/cp-kafka:7.5.0
-- minio/minio:latest
-- flink:1.17-scala_2.12
+
+* python:3.9
+* postgres:14-alpine
+* timescale/timescaledb:latest-pg14
+* redis:7-alpine
+* confluentinc/cp-zookeeper:7.5.0
+* confluentinc/cp-kafka:7.5.0
+* minio/minio:latest
+* flink:1.17-scala_2.12
 
 ## Performance & Results
 
-The Marine Pollution Tracking System demonstrates robust performance characteristics essential for reliable environmental monitoring. Comprehensive testing has validated the system's efficiency, reliability, and scalability.
+The Marine Pollution Tracking System demonstrates performance characteristics based on testing with simulated data. These metrics provide insights into how a similar architecture might behave in a real-world environmental monitoring context.
 
 ### System Resource Utilization
 
-The system maintains efficient resource usage while handling complex processing tasks:
+The prototype system utilization during testing shows:
 
-![CPU Usage](./data/cpu_usage_metrics.png)
+![CPU Usage](./data/cpu_usage.png)
 
-Key metrics include:
-- **Average CPU utilization**: ~1.2 cores during normal operation
-- **Peak processing**: 5 cores during satellite image analysis and pollution detection
-- **Memory utilization**: Satellite processing consumes 50% of memory resources
-- **Resource efficiency**: System automatically scales down during idle periods
+Based on our testing:
 
-The CPU usage pattern demonstrates characteristic processing behavior:
-- Short-duration processing spikes during intensive computation
-- Rapid return to baseline during idle periods
-- Healthy distribution between system and application processes
-- Performance predictability shown through consistent burst patterns
+* Average CPU utilization: ~1.2 cores during normal operation in test environment
+* **Peak processing**: Up to 5 cores during satellite image analysis and pollution detection under simulated load
+* Memory utilization: Satellite processing consumes approximately 50% of allocated memory resources
+* Resource efficiency: System scales down during idle periods
+
+The CPU usage pattern in the test environment demonstrates:
+
+* **Processing spikes** during intensive computation
+* Return to baseline during idle periods
+* Distribution between system and application processes
+* Burst patterns that would need optimization in a real deployment
 
 ### Processing Metrics
 
-The system handles substantial data volume with consistent throughput:
+The system handled the following data volumes in our test environment:
 
-![System Metrics Overview](./data/system_metrics_overview.png)
+![System Metrics](./data/system_metrics.png)
 
-Pipeline metrics show:
-- **Data Pipeline Throughput**: 
-  - Ingestion: 120 msgs/min
-  - Processing: 100 msgs/min
-  - Storage: 95 msgs/min
-  - Analysis: 80 msgs/min
-- **Message Distribution**:
-  - Buoy data: 61.2% of message traffic
-  - Pollution hotspots: 18.4%
-  - Satellite imagery: 12.2%
-  - Sensor alerts: 8.2%
+Pipeline metrics from testing:
 
-Resource allocation is strategically distributed with processing components (40%), storage (30%), monitoring (20%), and producers (10%), optimizing the system for computational efficiency.
+* **Data Pipeline Throughput**:
+  * Ingestion: ~120 msgs/min
+  * Processing: ~100 msgs/min
+  * Storage: ~95 msgs/min
+  * Analysis: ~80 msgs/min
+* **Message Distribution** in test environment:
+  * Buoy data: 61.2% of message traffic
+  * Pollution hotspots: 18.4%
+  * Satellite imagery: 12.2%
+  * Sensor alerts: 8.2%
+
+Resource allocation in the prototype is distributed with processing components (40%), storage (30%), monitoring (20%), and producers (10%), optimized for computational efficiency in the test environment.
 
 ### Reliability Metrics
 
-The system demonstrates exceptional reliability characteristics:
+The prototype system demonstrates reliability characteristics in our testing:
 
-![Kafka Topics Analysis](./data/kafka_topics_analysis.png)
+![Kafka Topics](./data/kafka_topics.png)
 
-Key reliability indicators include:
-- **Topic Health Scores**: >95% across all Kafka topics
-- **Error Handling**: Low DLQ message counts (1-5 errors) demonstrate >95% success rate
-- **System Stability**: No sustained high-load periods, indicating good resource management
-- **Processing Consistency**: Balanced throughput across 24-hour operation periods
+Key reliability indicators from test environment:
 
-The implementation of Dead Letter Queues provides robust fault tolerance, with comprehensive error handling ensuring no data loss during processing failures.
+* **Topic Health Scores**: >95% across all Kafka topics in test loads
+* **Error Handling**: Low DLQ message counts (1-5 errors) demonstrate >95% message processing success rate under test conditions
+* **System Stability**: No sustained high-load periods during testing, indicating resource management strategies function as expected
+* **Processing Consistency**: Balanced throughput across 24-hour operation periods in simulation
 
-### Operational Validation
-
-The performance metrics validate the system's capability to handle real-time marine pollution monitoring with:
-- Efficient resource management optimized for environmental processing tasks
-- Robust error handling with comprehensive fault tolerance
-- Processing power scaled appropriately for complex analytical operations
-- Reliable data transmission across distributed components
-
-## Technical Implementation
-
-### Technology Stack & Justifications
-
-The system employs a carefully selected technology stack, with each component chosen for specific technical advantages:
-
-| Component | Technology | Justification |
-|-----------|------------|---------------|
-| Core Language | Python | Rich data science ecosystem (NumPy, pandas) with native Flink/Kafka integration via PyFlink. Simplified satellite image processing with rasterio and effective ML model integration. |
-| Containerization platform | Docker | Ensures consistent deployment across environments for all 11 microservices. Docker Compose orchestrates the system with appropriate resource allocation and network isolation. |
-| In-Memory Cache | Redis | Microsecond access to frequent queries, optimized for geospatial operations with sorted sets. Supports real-time dashboard updates and alert distribution with pub/sub capabilities. |
-| Message Broker | Kafka | Fault-tolerant data pipeline with topic partitioning for high-throughput sensor data. Persistence ensures reliable delivery of critical environmental measurements and supports event replay for analysis. |
-| Stream Processing | Apache Flink | True event-time processing with exactly-once semantics critical for temporal pollution analysis. Stateful computations enable tracking pollution evolution with sub-100ms latency. |
-| Main Database | PostgreSQL | ACID-compliant storage for pollution events and metadata. PostGIS extension enables critical geospatial queries for hotspot identification and intervention planning. |
-| Time-Series | TimescaleDB | PostgreSQL extension optimized for sensor time-series data, with hypertables providing efficient querying of historical measurements. Supports continuous aggregations for trend analysis. |
-| Object Storage | MinIO | Implements bronze/silver/gold medallion architecture for data quality management. S3-compatible API with versioning supports large satellite imagery storage and processing pipeline integration. |
-| Dashboard | Streamlit | Rapid development of interactive pollution maps and monitoring dashboards. Integrates with geospatial libraries to provide actionable environmental intelligence to stakeholders. |
-| Error Handling | DLQ Pattern | Implements Dead Letter Queues for each Kafka topic to ensure no data loss during processing failures. Provides robust fault tolerance with >95% reliability for mission-critical environmental monitoring. |
-
-### Machine Learning Implementation
-
-The system incorporates four specialized predictive models:
-
-1. **Contamination Spread Model**: Uses fluid dynamics principles to predict how pollution will disperse through water based on currents, wind patterns, and pollutant properties
-
-2. **Source Identification Algorithm**: Employs backtracking techniques to identify potential pollution sources based on detected patterns and environmental conditions
-
-3. **Severity Classification System**: Categorizes pollution events by environmental impact severity using multi-parameter analysis and historical comparison
-
-4. **Temporal Evolution Predictor**: Forecasts how contamination profiles will change over time, enabling proactive intervention planning
-
-These models incorporate multiple environmental factors:
-- Fluid dynamics principles for water movement modeling
-- Pollutant physical properties (density, solubility, degradation rates)
-- Environmental patterns (seasonal winds, water currents, temperature gradients)
-- Historical pollution behavior patterns from similar events
-
-### Containerization & Orchestration
-
-The system leverages Docker and Docker Compose for consistent deployment and operation:
-
-- **Service Isolation**: Each component runs in its own container with appropriate resource limits
-- **Network Configuration**: Internal communication occurs over defined networks with appropriate security
-- **Volume Management**: Persistent data is stored in named volumes for data preservation
-- **Health Monitoring**: All services include health checks for operational monitoring
-- **Resource Allocation**: Containers are configured with appropriate CPU and memory limits
-- **Restart Policies**: Automatic recovery from failures ensures operational continuity
-
-This containerized approach enables consistent deployment across development, testing, and production environments while simplifying scaling and maintenance.
+The implementation of Dead Letter Queues provides a demonstration of fault tolerance approaches, with error handling that could be expanded for production environments.
 
 ## Limitations & Future Work
 
 ### Current Limitations
 
-Despite its advanced capabilities, the current implementation has several limitations:
+Despite its capabilities, the current implementation has several significant limitations:
 
-1. **Synthetic Data Reliance**: The system currently uses synthetic data rather than real NOAA/USGS APIs and Sentinel Hub services, limiting validation under authentic environmental conditions
+1. **Synthetic Data**: The system generates synthetic sensor readings that mimic buoy data rather than connecting to real NOAA/USGS APIs
 
-2. **Static ML Models**: Basic RandomForest classifiers built on synthetic data without mechanisms for retraining with newly collected information. This means the system's predictive capabilities remain static, preventing improvement over time despite new data collection.
+2. **Basic ML Models**: The current implementation uses simplified RandomForest classifiers built on simulated pollution patterns without mechanisms for retraining with newly collected information
 
 3. **Spatial Clustering Constraints**: The hybrid approach with fixed grid size struggles with events crossing grid boundaries and isn't optimal across varying data densities
 
@@ -537,87 +527,53 @@ Despite its advanced capabilities, the current implementation has several limita
 
 ### Scaling Challenges
 
-As the system scales to handle larger geographic areas or higher data volumes, several components would require enhancement:
+In a real-world implementation scaling to handle larger geographic areas or higher data volumes, several components would require enhancement:
 
-- **Memory Management**: Flink jobs would encounter memory constraints during satellite imagery analysis and pollution detection. Without proper partitioning and memory management strategies, jobs would encounter OutOfMemoryError exceptions when handling larger or more frequent satellite images.
+* **Memory Management**: Flink jobs would encounter memory constraints during satellite imagery analysis and pollution detection. Without proper partitioning and memory management strategies, jobs would encounter OutOfMemoryError exceptions when handling larger or more frequent satellite images.
 
-- **Spatial Clustering**: The current approach would face computational bottlenecks in high-density regions, where the SpatialClusteringProcessor must process numerous points within each partition
+* **Spatial Clustering**: The current approach would face computational bottlenecks in high-density regions, where the SpatialClusteringProcessor must process numerous points within each partition
 
-- **Message Broker**: The single-node Kafka configuration would experience performance degradation with increased volume
+* **Message Broker**: The single-node Kafka configuration would experience performance degradation with increased volume
 
-- **Time-Series Storage**: TimescaleDB would face challenges as data accumulates without proper hypertable partitioning strategies
+* **Time-Series Storage**: TimescaleDB would face challenges as data accumulates without proper hypertable partitioning strategies
 
 ### Potential Improvements
 
-Several improvements could address current limitations without a complete redesign:
+Several improvements could address current limitations for a more robust implementation:
 
-- **Continuous Learning**: Implement mechanisms for ML models to update with newly collected data through incremental learning that periodically retrains models as validated data becomes available
+* **Real Data Integration**: Connect to actual NOAA/USGS APIs instead of generating simulated buoy data
 
-- **Adaptive Spatial Clustering**: Implement adaptive grid sizing based on data density with boundary-crossing detection mechanisms
+* **Continuous Learning**: Implement mechanisms for ML models to update with newly collected data through incremental learning that periodically retrains models as validated data becomes available
 
-- **State Management**: Develop improved strategies for Flink jobs including backpressure handling and optimized checkpointing
+* **Adaptive Spatial Clustering**: Implement adaptive grid sizing based on data density with boundary-crossing detection mechanisms
 
-- **Data Lifecycle Management**: Implement automated archiving for historical data while maintaining access to recent measurements
+* **State Management**: Develop improved strategies for Flink jobs including backpressure handling and optimized checkpointing
 
-- **Enhanced Analytics**: Strengthen the dashboard with more advanced analytical capabilities
+* **Data Lifecycle Management**: Implement automated archiving for historical data while maintaining access to recent measurements
+
+* **Enhanced Analytics**: Strengthen the dashboard with more advanced analytical capabilities
 
 ### Future Work
 
 With additional resources, future development would prioritize:
 
-- **Real Data Integration**: Connect with NOAA, USGS, and Copernicus APIs for authentic environmental readings
+* **Real Sensor Data Integration**: Connect with NOAA, USGS, and Copernicus APIs for authentic environmental readings
 
-- **Comprehensive ML Pipeline**: Develop continuous training, performance monitoring, and drift detection capabilities
+* **Comprehensive ML Pipeline**: Develop continuous training, performance monitoring, and drift detection capabilities
 
-- **Advanced Spatial Framework**: Implement multi-level gridding, adaptive partitioning, and specialized algorithms for different pollution patterns
+* **Advanced Spatial Framework**: Implement multi-level gridding, adaptive partitioning, and specialized algorithms for different pollution patterns
 
-- **Cross-Validation Mechanisms**: Create validation between different data sources to increase confidence in event detection
+* **Cross-Validation Mechanisms**: Create validation between different data sources to increase confidence in event detection
 
-- **Infrastructure Optimization**: Implement proper Kafka clustering, optimize TimescaleDB, and deploy comprehensive monitoring
+* **Infrastructure Optimization**: Implement proper Kafka clustering, optimize TimescaleDB, and deploy comprehensive monitoring
 
-- **Kubernetes Deployment**: Develop dynamic scaling capabilities based on data volume and processing requirements
+* **Kubernetes Deployment**: Develop dynamic scaling capabilities based on data volume and processing requirements
 
-## Lessons Learned
+## Conclusion
 
-### Main Challenges
+The Marine Pollution Tracking System represents a prototype demonstration of how big data systems could be applied to environmental monitoring. While it uses synthetic data and simplified models, the system demonstrates the architecture and approach that could be adopted in a full implementation.
 
-During development, we encountered several significant challenges:
-
-1. **Distributed Pipeline Architecture**: Integrating multiple components through Kafka required extensive configuration and troubleshooting. Establishing correct topic structures, managing serialization formats, and ensuring proper message routing between components demanded considerable effort.
-
-2. **Medallion Architecture Implementation**: The most time-consuming aspect was implementing proper data flow through our medallion architecture and developing effective deduplication strategies. Distinguishing between new pollution events and evolutions of existing ones proved exceptionally difficult.
-
-3. **Spatial Clustering**: Creating deterministic hotspot IDs that accounted for spatial proximity and temporal evolution required multiple iterations to refine our clustering algorithms and spatial indexing strategies.
-
-4. **Database Configuration**: Designing and configuring specialized databases for different types of data presented unique challenges, particularly configuring TimescaleDB for time-series sensor data, PostgreSQL with spatial extensions for geospatial analysis, and Redis for fast dashboard access.
-
-5. **Heterogeneous Data Sources**: Working with different data sources presented significant complexity, from structured sensor readings to large satellite imagery—each requiring different ingestion, validation, and preprocessing approaches.
-
-### What Worked Well
-
-Several aspects of our implementation proved particularly effective:
-
-1. **Medallion Architecture**: The medallion architecture proved highly effective for data quality management, enabling clean separation between raw data and processed insights while providing clear data lineage tracking.
-
-2. **Apache Flink**: Stream processing capabilities exceeded expectations, providing robust real-time analysis with minimal latency. The exactly-once processing semantics and flexible windowing operations were particularly valuable.
-
-3. **Containerized Microservices**: Our approach allowed for independent scaling and isolated development of each component, significantly accelerating the development cycle despite the system's complexity.
-
-4. **Hybrid ML+Rules Approach**: Combining rule-based detection with machine learning models provided reliable baseline detection while enhancing sensitivity for subtle pollution patterns. This complementary approach proved more effective than either method alone.
-
-5. **Data Standardization**: Standardizing formats immediately after ingestion significantly reduced downstream complexity.
-
-### Key Insights
-
-Limited time and resources forced strategic compromises, but taught valuable lessons:
-
-1. **Data Quality Over Quantity**: For environmental monitoring systems, data quality is more critical than quantity, fundamentally shifting our focus from maximizing data collection to optimizing data reliability.
-
-2. **Early Standardization**: The importance of data standardization early in the pipeline cannot be overstated.
-
-3. **Functional Prototype First**: Our approach focused on creating a functionally complete prototype rather than a fully-scaled big data system, choosing technologies that support big data principles but implementing them in simplified configurations.
-
-4. **Strategic Compromises**: We omitted Airflow for ML model orchestration, implemented basic observability with structured logging rather than a full monitoring stack, and used synthetic data generation for buoy readings rather than complex integration with real APIs, allowing us to deliver a functional prototype while understanding which areas would require expansion in a production environment.
+The medallion architecture, real-time processing with Apache Flink, and multi-tier storage approach provide a solid model that could be expanded for real environmental monitoring applications. The current limitations of the system highlight the areas that would require significant attention for a production deployment.
 
 ## Team & Contributors
 
@@ -628,23 +584,23 @@ This project was developed by:
 - [@marcoRossi27](https://github.com/marcoRossi27)  
 - [@walterscf](https://github.com/walterscf)
 
+
 ## References
 
 This project leverages foundational research in environmental monitoring, anomaly detection, and satellite image analysis:
 
-[1] Sannigrahi, S., Basu, B., Basu, A. S., & Pilla, F. (2021). *Detection of marine floating plastic using Sentinel-2 imagery and machine learning models*. arXiv preprint arXiv:2106.03694.
+[1] Sannigrahi, S., Basu, B., Basu, A. S., & Pilla, F. (2021). Detection of marine floating plastic using Sentinel-2 imagery and machine learning models. arXiv preprint arXiv:2106.03694.
 
-[2] Walsh, E. S., Kreakie, B. J., Cantwell, M. G., & Nacci, D. (2017). *A Random Forest approach to predict the spatial distribution of sediment pollution in an estuarine system*. PLoS One, 12(7), e0179473.
+[2] Walsh, E. S., Kreakie, B. J., Cantwell, M. G., & Nacci, D. (2017). A Random Forest approach to predict the spatial distribution of sediment pollution in an estuarine system. PLoS One, 12(7), e0179473.
 
-[3] Li, Z., Zhu, Y., & Van Leeuwen, M. (2023). *A survey on explainable anomaly detection*. ACM Transactions on Knowledge Discovery from Data, 18(1), 1–54.
+[3] Li, Z., Zhu, Y., & Van Leeuwen, M. (2023). A survey on explainable anomaly detection. ACM Transactions on Knowledge Discovery from Data, 18(1), 1-54.
 
-[4] El-Shafeiy, E., Alsabaan, M., Ibrahem, M. I., & Elwahsh, H. (2023). *Real-time anomaly detection for water quality sensor monitoring based on multivariate deep learning technique*. Sensors, 23(20), 8613.
+[4]Kim D, Antariksa G, Handayani MP, Lee S, Lee J. Explainable Anomaly Detection Framework for Maritime Main Engine Sensor Data. Sensors (Basel). 2021 Jul 31;21(15):5200. doi: 10.3390/s21155200. PMID: 34372436; PMCID: PMC8347810.
 
-[5] Zhou, H., Zhang, S., Peng, J., Zhang, S., Li, J., Xiong, H., & Zhang, W. (2021). *Informer: Beyond efficient transformer for long sequence time-series forecasting*. Proceedings of the AAAI Conference on Artificial Intelligence, 35(12), 11106–11115.
+[5] Sadaiappan, B., Balakrishnan, P., CR, V., Vijayan, N. T., Subramanian, M., & Gauns, M. U. (2023). Applications of machine learning in chemical and biological oceanography. ACS omega, 8(18), 15831-15853.
+```
 
-[6] Yao, J., Zhang, B., Li, C., Hong, D., & Chanussot, J. (2023). *Extended Vision Transformer (ExViT) for Land Use and Land Cover Classification: A Multimodal Deep Learning Framework*. IEEE Transactions on Geoscience and Remote Sensing, 61, 1–15. https://doi.org/10.1109/TGRS.2023.3284671
 
-[7] Sadaiappan, B., Balakrishnan, P., CR, V., Vijayan, N. T., Subramanian, M., & Gauns, M. U. (2023). *Applications of machine learning in chemical and biological oceanography*. ACS Omega, 8(18), 15831–15853.
 
 
 
