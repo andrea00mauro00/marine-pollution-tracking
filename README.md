@@ -20,7 +20,7 @@
 * [Technologies & Justifications](#technologies--justifications)
 * [Core Components](#core-components)
 * [Data Processing Pipeline](#data-processing-pipeline)
-* [Flink Processing Jobs & ML Components](#flink-processing-jobs--ml-components)
+* [ML Components](#ml-components)
 * [Dashboard & Visualization](#dashboard--visualization)
 * [Installation & Setup](#installation--setup)
 * [Performance & Results](#performance--results)
@@ -255,7 +255,7 @@ The components communicate through a message-driven architecture built around Ap
 
 This design provides buffering during load spikes, enables multiple consumers for the same events, and demonstrates an approach for message routing in a distributed environmental monitoring system.
 
-## Flink Processing Jobs & ML Components
+## ML Components
 
 The system implements basic machine learning models, each integrated into a specific Flink job to perform specialized analysis functions. These models are simplified implementations intended to demonstrate the concepts rather than provide production-grade predictions.
 
