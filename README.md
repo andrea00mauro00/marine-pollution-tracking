@@ -455,7 +455,7 @@ The Marine Pollution Tracking System demonstrates performance characteristics ba
 
 The prototype system utilization during testing shows:
 
-![CPU Usage](./data/cpu_usage.png)
+![CPU Usage](./data/cpu_usage_metrics.png)
 
 Based on our testing:
 
@@ -475,7 +475,7 @@ The CPU usage pattern in the test environment demonstrates:
 
 The system handled the following data volumes in our test environment:
 
-![System Metrics](./data/system_metrics.png)
+![System Metrics](./data/system_metrics_overview.png)
 
 Pipeline metrics from testing:
 
@@ -496,7 +496,7 @@ Resource allocation in the prototype is distributed with processing components (
 
 The prototype system demonstrates reliability characteristics in our testing:
 
-![Kafka Topics](./data/kafka_topics.png)
+![Kafka Topics](./data/kafka_topics_analysis.png)
 
 Key reliability indicators from test environment:
 
