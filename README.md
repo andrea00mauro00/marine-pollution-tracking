@@ -82,14 +82,14 @@ Our system architecture leverages the following technologies, each selected for 
 |-----------|------------|---------------|
 | Core Language | Python | Rich data science ecosystem (NumPy, pandas) with native Flink/Kafka integration via PyFlink. Simplified satellite image processing with rasterio and effective ML model integration. |
 | Containerization platform | Docker | Ensures consistent deployment across environments for all microservices. Docker Compose orchestrates the system with appropriate resource allocation and network isolation. |
-| In-Memory Cache | Redis | Microsecond access to frequent queries, optimized for geospatial operations with sorted sets. Supports real-time dashboard updates and alert distribution with pub/sub capabilities. |
-| Message Broker | Kafka | Fault-tolerant data pipeline with topic partitioning for high-throughput sensor data. Persistence ensures reliable delivery of critical environmental measurements and supports event replay for analysis. |
-| Stream Processing | Apache Flink | True event-time processing with exactly-once semantics critical for temporal pollution analysis. Stateful computations enable tracking pollution evolution with sub-100ms latency. |
+| In-Memory Cache | Redis | In-memory caching layer with custom spatial binning for dashboard queries. Pub/sub capabilities enable real-time updates while Redis's native geospatial features remain available for future optimization. |
+| Message Broker | Kafka | Distributed streaming platform providing fault-tolerant message delivery. Architecture supports future topic partitioning and event replay capabilities essential for scaling to high-throughput production workloads. |
+| Stream Processing | Apache Flink | Stream processing framework with stateful computations and fault tolerance. Architecture designed to support event-time processing and exactly-once semantics for future scaling requirements while currently providing reliable near-real-time analysis. |
 | Main Database | PostgreSQL | ACID-compliant storage for pollution events and metadata. PostGIS extension enables critical geospatial queries for hotspot identification and intervention planning. |
-| Time-Series | TimescaleDB | PostgreSQL extension optimized for sensor time-series data, with hypertables providing efficient querying of historical measurements. Supports continuous aggregations for trend analysis. |
-| Object Storage | MinIO | Implements bronze/silver/gold medallion architecture for data quality management. S3-compatible API with versioning supports large satellite imagery storage and processing pipeline integration. |
+| Time-Series | TimescaleDB | PostgreSQL extension optimized for sensor time-series data with hypertables providing efficient querying of historical measurements. Architecture supports future continuous aggregations for automated trend analysis. |
+| Object Storage | MinIO | Implements bronze/silver/gold medallion architecture for data quality management. S3-compatible API enables future versioning and lifecycle policies for large-scale satellite imagery storage. |
 | Dashboard | Streamlit | Rapid development of interactive pollution maps and monitoring dashboards. Integrates with geospatial libraries to provide actionable environmental intelligence to stakeholders. |
-| Error Handling | DLQ Pattern |Implements Dead Letter Queue patterns to improve fault tolerance. The actual reliability of the system under real conditions would require specific and prolonged testing. |
+| Error Handling | DLQ Pattern | Implements Dead Letter Queue patterns to improve fault tolerance. The actual reliability of the system under real conditions would require specific and prolonged testing. |
 
 ## Core Components
 
