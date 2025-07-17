@@ -213,13 +213,23 @@ The system implements a comprehensive data management strategy using the medalli
 
 ### Event-Driven Communication
 
-The components communicate through a message-driven architecture:
+The components communicate through a message-driven architecture built around Apache Kafka:
 
-* **Kafka Topics**: Specialized topics for different data domains enable loose coupling
-* **Dead Letter Queues**: Failed messages are captured for analysis and potential reprocessing
-* **Schema Registry**: Centralized schema management ensures consistent data formats
+* **Kafka Topics**: The system uses specialized topics for different data domains, enabling loose coupling between components:
+  - `buoy_data`: Raw sensor data from the buoy producer
+  - `satellite_imagery`: Raw satellite imagery metadata
+  - `processed_imagery`: Standardized and analyzed satellite imagery
+  - `analyzed_sensor_data`: Processed and validated sensor data
+  - `analyzed_data`: General analysis results
+  - `pollution_hotspots`: Detected pollution concentration areas
+  - `sensor_alerts`: Critical threshold violations
+  - `pollution_predictions`: Forecasted pollution spread patterns
 
-This design provides buffering during load spikes, enables multiple consumers for the same events, and demonstrates approaches for reliable message delivery.
+* **Message Serialization**: Messages are primarily serialized as JSON, with a basic mechanism to handle binary formats when necessary
+
+* **Error Handling**: The system includes basic error handling mechanisms that track failures and log them, with a partial implementation of Dead Letter Queue (DLQ) patterns for some components
+
+This design provides buffering during load spikes, enables multiple consumers for the same events, and demonstrates an approach for message routing in a distributed environmental monitoring system.
 
 ## Flink Processing Jobs & ML Components
 
