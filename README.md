@@ -489,10 +489,10 @@ The Marine Pollution Tracking System demonstrates performance characteristics ba
 The system demonstrates efficient resource management during testing:
 
 ![Container CPU Usage](data/cpu_usage.png)
-*System-wide CPU utilization (38.12%) with characteristic processing spikes during intensive operations and efficient returns to baseline during idle periods.*
+*System-wide CPU utilization with characteristic processing spikes reaching up to 300% during intensive operations and efficient returns to baseline during idle periods.*
 
 ![Container Memory Usage](data/memory_usage.png)
-*Stable memory consumption (6.19GB/7.47GB) after initialization, indicating absence of memory leaks.*
+*Stable memory consumption (6.13GB/7.47GB) after initialization, indicating absence of memory leaks.*
 
 Our component telemetry confirms the specialized nature of our microservices:
 - **image_standardizer**: Highest network output (139MB) with intensive disk reading (320MB)
