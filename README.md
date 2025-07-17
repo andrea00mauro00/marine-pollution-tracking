@@ -42,7 +42,7 @@ Current water pollution monitoring systems face critical limitations that hamper
 * **Limited Predictive Capabilities**: Without integrated data and advanced modeling, agencies cannot anticipate pollution spread patterns
 * **Reactive Paradigm**: Traditional monitoring is primarily reactive, detecting pollution only after it becomes severe
 
-Our system demonstrates how a unified, real-time monitoring infrastructure would allow environmental agencies to identify emerging threats quickly, allocate resources efficiently, and develop targeted intervention strategies before pollution events become severe.
+Our system illustrates how a unified, real-time monitoring infrastructure would allow environmental agencies to identify emerging threats quickly, allocate resources efficiently, and develop targeted intervention strategies before pollution events become severe.
 
 ## System Architecture
 
@@ -89,7 +89,7 @@ Our system architecture leverages the following technologies, each selected for 
 | Time-Series | TimescaleDB | PostgreSQL extension optimized for sensor time-series data, with hypertables providing efficient querying of historical measurements. Supports continuous aggregations for trend analysis. |
 | Object Storage | MinIO | Implements bronze/silver/gold medallion architecture for data quality management. S3-compatible API with versioning supports large satellite imagery storage and processing pipeline integration. |
 | Dashboard | Streamlit | Rapid development of interactive pollution maps and monitoring dashboards. Integrates with geospatial libraries to provide actionable environmental intelligence to stakeholders. |
-| Error Handling | DLQ Pattern | Implements Dead Letter Queues for each Kafka topic to ensure no data loss during processing failures. Provides robust fault tolerance with >95% reliability for mission-critical environmental monitoring. |
+| Error Handling | DLQ Pattern |Implements Dead Letter Queue patterns to improve fault tolerance. The actual reliability of the system under real conditions would require specific and prolonged testing. |
 
 ## Core Components
 
