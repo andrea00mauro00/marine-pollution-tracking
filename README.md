@@ -169,7 +169,6 @@ The system implements a comprehensive data management strategy using the medalli
   ```
   bronze/satellite_imagery/sentinel2/year={year}/month={month}/day={day}/sat_img_{scene_id}_{timestamp}.jpg
   ```
-* **Event Logs**: System operation logs for debugging and audit purposes
 
 ### Silver Layer (Processed Data)
 * **Analyzed Sensor Data**: Validated and enriched sensor readings with anomaly scores in Parquet format:
