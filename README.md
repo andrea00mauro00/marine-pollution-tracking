@@ -7,7 +7,9 @@
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-blue)
 
 
-<img src="./data/logo.png" alt="Logo" width="400"/>
+<p align="center">
+  <img src="./data/logo.png" alt="Logo" width="400"/>
+</p>
 
 
 
