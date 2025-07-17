@@ -276,7 +276,7 @@ The system provides a comprehensive visualization interface designed for environ
 
 The main dashboard provides an overview of system status and key environmental metrics:
 
-![Home Dashboard](./data/dashboard_screenshots/home_dashboard.png)
+![Home Dashboard](./data/dashboard_screenshots/home.png)
 
 Key features include:
 
@@ -290,7 +290,7 @@ Key features include:
 
 The alerts interface enables monitoring and management of pollution notifications:
 
-![Alerts Management](./data/dashboard_screenshots/alerts_dashboard.png)
+![Alerts Management](./data/dashboard_screenshots/alerts.png)
 
 This view provides:
 
@@ -304,7 +304,7 @@ This view provides:
 
 Clicking on an alert provides comprehensive information and response guidance:
 
-![Alert Details](./data/dashboard_screenshots/alert_details.png)
+![Alert Details](./data/dashboard_screenshots/alerts_details.png)
 
 The detailed view includes:
 
@@ -320,7 +320,7 @@ The detailed view includes:
 
 The map view provides specialized geospatial visualization of pollution events:
 
-![Pollution Map](./data/dashboard_screenshots/pollution_map.png)
+![Pollution Map](./data/dashboard_screenshots/map.png)
 
 Features include:
 
@@ -334,7 +334,7 @@ Features include:
 
 The hotspots view enables detailed analysis of pollution concentration areas:
 
-![Hotspot Analysis](./data/dashboard_screenshots/hotspot_analysis.png)
+![Hotspot Analysis](./data/dashboard_screenshots/hotspots.png)
 
 This specialized view offers:
 
@@ -348,7 +348,7 @@ This specialized view offers:
 
 The predictions interface visualizes the projected spread of pollution events:
 
-![Prediction Forecasting](./data/dashboard_screenshots/prediction_forecasting.png)
+![Prediction Forecasting](./data/dashboard_screenshots/predictions.png)
 
 This forward-looking view provides:
 
@@ -362,7 +362,7 @@ This forward-looking view provides:
 
 The reports view offers in-depth analysis of pollution trends and patterns:
 
-![Analytical Reporting](./data/dashboard_screenshots/analytical_reporting.png)
+![Analytical Reporting](./data/dashboard_screenshots/report.png)
 
 Advanced analytical features include:
 
@@ -376,7 +376,7 @@ Advanced analytical features include:
 
 The sensor details view provides comprehensive monitoring of individual sensors:
 
-![Sensor Monitoring](./data/dashboard_screenshots/sensor_monitoring.png)
+![Sensor Monitoring](./data/dashboard_screenshots/sensor_details.png)
 
 This technical view includes:
 
