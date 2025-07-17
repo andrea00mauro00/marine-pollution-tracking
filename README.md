@@ -6,9 +6,8 @@
 ![Kafka](https://img.shields.io/badge/Kafka-7.5.0-red)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-blue)
 
-<p align="center">
-  <img src="./data/logo.png" alt="Logo" width="400"/>
-</p>
+
+<img src="./data/logo.png" alt="Logo" width="400"/>
 
 
 
