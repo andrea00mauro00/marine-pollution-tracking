@@ -6,7 +6,12 @@
 ![Kafka](https://img.shields.io/badge/Kafka-7.5.0-red)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-blue)
 
-![Logo](./data/logo.png)
+
+<p align="center">
+  <img src="./data/logo.png" alt="Logo" width="400"/>
+</p>
+
+
 
 ## Table of Contents
 
