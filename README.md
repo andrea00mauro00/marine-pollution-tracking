@@ -598,7 +598,6 @@ This project leverages foundational research in environmental monitoring, anomal
 [4]Kim D, Antariksa G, Handayani MP, Lee S, Lee J. Explainable Anomaly Detection Framework for Maritime Main Engine Sensor Data. Sensors (Basel). 2021 Jul 31;21(15):5200. doi: 10.3390/s21155200. PMID: 34372436; PMCID: PMC8347810.
 
 [5] Sadaiappan, B., Balakrishnan, P., CR, V., Vijayan, N. T., Subramanian, M., & Gauns, M. U. (2023). Applications of machine learning in chemical and biological oceanography. ACS omega, 8(18), 15831-15853.
-```
 
 
 
