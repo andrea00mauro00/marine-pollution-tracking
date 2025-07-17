@@ -6,15 +6,21 @@
 ![Kafka](https://img.shields.io/badge/Kafka-7.5.0-red)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-blue)
 
-![Logo](./data/logo.png)
+
+<p align="center">
+  <img src="./data/logo.png" alt="Logo" width="400"/>
+</p>
+
+
 
 ## Table of Contents
 
 * [Introduction](#introduction)
 * [System Architecture](#system-architecture)
+* [Technologies & Justifications](#technologies--justifications)
 * [Core Components](#core-components)
 * [Data Processing Pipeline](#data-processing-pipeline)
-* [Flink Processing Jobs & ML Components](#flink-processing-jobs--ml-components)
+* [ML Components](#ml-components)
 * [Dashboard & Visualization](#dashboard--visualization)
 * [Installation & Setup](#installation--setup)
 * [Performance & Results](#performance--results)
@@ -36,7 +42,7 @@ Current water pollution monitoring systems face critical limitations that hamper
 * **Limited Predictive Capabilities**: Without integrated data and advanced modeling, agencies cannot anticipate pollution spread patterns
 * **Reactive Paradigm**: Traditional monitoring is primarily reactive, detecting pollution only after it becomes severe
 
-Our system demonstrates how a unified, real-time monitoring infrastructure would allow environmental agencies to identify emerging threats quickly, allocate resources efficiently, and develop targeted intervention strategies before pollution events become severe.
+Our system illustrates how a unified, real-time monitoring infrastructure would allow environmental agencies to identify emerging threats quickly, allocate resources efficiently, and develop targeted intervention strategies before pollution events become severe.
 
 ## System Architecture
 
@@ -68,6 +74,23 @@ The detailed component interaction diagram shows how data flows through the syst
 6. Results are stored in appropriate databases based on data type and purpose
 7. The dashboard provides visualization of system insights
 
+## Technologies & Justifications
+
+Our system architecture leverages the following technologies, each selected for specific capabilities essential to marine pollution monitoring:
+
+| Component | Technology | Justification |
+|-----------|------------|---------------|
+| Core Language | Python | Rich data science ecosystem (NumPy, pandas) with native Flink/Kafka integration via PyFlink. Simplified satellite image processing with rasterio and effective ML model integration. |
+| Containerization platform | Docker | Ensures consistent deployment across environments for all microservices. Docker Compose orchestrates the system with appropriate resource allocation and network isolation. |
+| In-Memory Cache | Redis | Microsecond access to frequent queries, optimized for geospatial operations with sorted sets. Supports real-time dashboard updates and alert distribution with pub/sub capabilities. |
+| Message Broker | Kafka | Fault-tolerant data pipeline with topic partitioning for high-throughput sensor data. Persistence ensures reliable delivery of critical environmental measurements and supports event replay for analysis. |
+| Stream Processing | Apache Flink | True event-time processing with exactly-once semantics critical for temporal pollution analysis. Stateful computations enable tracking pollution evolution with sub-100ms latency. |
+| Main Database | PostgreSQL | ACID-compliant storage for pollution events and metadata. PostGIS extension enables critical geospatial queries for hotspot identification and intervention planning. |
+| Time-Series | TimescaleDB | PostgreSQL extension optimized for sensor time-series data, with hypertables providing efficient querying of historical measurements. Supports continuous aggregations for trend analysis. |
+| Object Storage | MinIO | Implements bronze/silver/gold medallion architecture for data quality management. S3-compatible API with versioning supports large satellite imagery storage and processing pipeline integration. |
+| Dashboard | Streamlit | Rapid development of interactive pollution maps and monitoring dashboards. Integrates with geospatial libraries to provide actionable environmental intelligence to stakeholders. |
+| Error Handling | DLQ Pattern |Implements Dead Letter Queue patterns to improve fault tolerance. The actual reliability of the system under real conditions would require specific and prolonged testing. |
+
 ## Core Components
 
 The system comprises multiple specialized microservices organized by function, as visible in the project structure:
@@ -95,11 +118,10 @@ marine-pollution-tracking/
 ├── setup_minio/               # MinIO object storage configuration
 └── storage_consumer/          # Manages data persistence across storage systems
 ```
-
 ### Data Producers
 
-* **buoy_producer**: Generates simulated sensor data representing buoy readings, validates them, and publishes to Kafka
-* **satellite_producer**: Creates simulated satellite imagery data and pushes to Kafka
+* **buoy_producer**: Generates simulated sensor data representing buoy readings, validates them, and publishes to Kafka. We opted for synthetic data generation rather than using real buoy data due to issues with data quality and inconsistent variable availability across different buoy sources.
+* **satellite_producer**: Retrieves real Sentinel-2 satellite imagery via the Copernicus API and applies simulated pollution effects to these real images before pushing to Kafka.
 
 ### Flink Stream Processing Jobs
 
@@ -114,14 +136,16 @@ marine-pollution-tracking/
 ### Data Consumers
 
 * **storage_consumer**: Manages persistent storage across the medallion architecture
-* **dashboard_consumer**: Prepares and caches data for visualization components
+* **dashboard_consumer**: Prepares and caches data in Redis for fast visualization access in the dashboard
 * **alert_manager**: Processes pollution events and generates notifications
-* **dlq_consumer**: Handles messages that failed processing in their primary pipelines
+* **dlq_consumer**: Handles messages that failed processing in their primary pipelines (though in practice, the DLQ mechanism is implemented but rarely utilized due to well-defined message formats)
 
 ### Storage Services
 
 * **setup_database**: Initializes PostgreSQL with PostGIS extension and TimescaleDB for time-series data
 * **setup_minio**: Configures MinIO object storage with appropriate buckets for the medallion architecture
+* **Redis**: In-memory cache used for fast dashboard data access, storing frequently accessed metrics, alerts, and visualization data
+
 
 ## Data Processing Pipeline
 
@@ -137,10 +161,10 @@ The system ingests data from two primary sources:
    * Physical properties (temperature, salinity, conductivity)
    * Microplastics concentration
 
-2. **Satellite Imagery**: Simulated satellite imagery with synthetic pollution effects, offering:
-   * Broad spatial coverage of the entire bay area
-   * Spectral bands optimized for water quality assessment
-   * Simulated data for testing detection capabilities
+2. **Satellite Imagery**: Real Sentinel-2 satellite imagery with simulated pollution effects applied, offering:
+   * Authentic geographic and spectral data from actual satellite observations
+   * Real spectral bands optimized for water quality assessment
+   * Synthetic pollution effects applied to real imagery for testing detection capabilities
 
 ### Real-Time Processing
 
@@ -169,7 +193,6 @@ The system implements a comprehensive data management strategy using the medalli
   ```
   bronze/satellite_imagery/sentinel2/year={year}/month={month}/day={day}/sat_img_{scene_id}_{timestamp}.jpg
   ```
-* **Event Logs**: System operation logs for debugging and audit purposes
 
 ### Silver Layer (Processed Data)
 * **Analyzed Sensor Data**: Validated and enriched sensor readings with anomaly scores in Parquet format:
@@ -214,15 +237,25 @@ The system implements a comprehensive data management strategy using the medalli
 
 ### Event-Driven Communication
 
-The components communicate through a message-driven architecture:
+The components communicate through a message-driven architecture built around Apache Kafka:
 
-* **Kafka Topics**: Specialized topics for different data domains enable loose coupling
-* **Dead Letter Queues**: Failed messages are captured for analysis and potential reprocessing
-* **Schema Registry**: Centralized schema management ensures consistent data formats
+* **Kafka Topics**: The system uses specialized topics for different data domains, enabling loose coupling between components:
+  - `buoy_data`: Raw sensor data from the buoy producer
+  - `satellite_imagery`: Raw satellite imagery metadata
+  - `processed_imagery`: Standardized and analyzed satellite imagery
+  - `analyzed_sensor_data`: Processed and validated sensor data
+  - `analyzed_data`: General analysis results
+  - `pollution_hotspots`: Detected pollution concentration areas
+  - `sensor_alerts`: Critical threshold violations
+  - `pollution_predictions`: Forecasted pollution spread patterns
 
-This design provides buffering during load spikes, enables multiple consumers for the same events, and demonstrates approaches for reliable message delivery.
+* **Message Serialization**: Messages are primarily serialized as JSON, with a basic mechanism to handle binary formats when necessary
 
-## Flink Processing Jobs & ML Components
+* **Error Handling**: The system includes basic error handling mechanisms that track failures and log them, with a partial implementation of Dead Letter Queue (DLQ) patterns for some components
+
+This design provides buffering during load spikes, enables multiple consumers for the same events, and demonstrates an approach for message routing in a distributed environmental monitoring system.
+
+## ML Components
 
 The system implements basic machine learning models, each integrated into a specific Flink job to perform specialized analysis functions. These models are simplified implementations intended to demonstrate the concepts rather than provide production-grade predictions.
 
@@ -256,7 +289,7 @@ The system implements basic machine learning models, each integrated into a spec
   * Input: Same environmental parameters
   * Output: Spread prediction specific to chemical pollutants
 
-**Important Note:** All models are basic implementations trained on simulated pollution patterns. These are proof-of-concept demonstrations that would require significant enhancement with real pollution data and more sophisticated algorithms for production deployment.
+**Important Note:** All models are basic implementations trained on simulated pollution patterns without formal validation. These are proof-of-concept demonstrations that would require significant enhancement with real pollution data, proper validation protocols, and more sophisticated algorithms for production deployment.
 
 ### Hybrid Processing Approach
 
@@ -276,7 +309,7 @@ The system provides a comprehensive visualization interface designed for environ
 
 The main dashboard provides an overview of system status and key environmental metrics:
 
-![Home Dashboard](./data/dashboard_screenshots/home_dashboard.png)
+![Home Dashboard](./data/dashboard_screenshots/home.png)
 
 Key features include:
 
@@ -290,7 +323,7 @@ Key features include:
 
 The alerts interface enables monitoring and management of pollution notifications:
 
-![Alerts Management](./data/dashboard_screenshots/alerts_dashboard.png)
+![Alerts Management](./data/dashboard_screenshots/alerts.png)
 
 This view provides:
 
@@ -304,7 +337,7 @@ This view provides:
 
 Clicking on an alert provides comprehensive information and response guidance:
 
-![Alert Details](./data/dashboard_screenshots/alert_details.png)
+![Alert Details](./data/dashboard_screenshots/alerts_details.png)
 
 The detailed view includes:
 
@@ -320,7 +353,7 @@ The detailed view includes:
 
 The map view provides specialized geospatial visualization of pollution events:
 
-![Pollution Map](./data/dashboard_screenshots/pollution_map.png)
+![Pollution Map](./data/dashboard_screenshots/map.png)
 
 Features include:
 
@@ -334,7 +367,7 @@ Features include:
 
 The hotspots view enables detailed analysis of pollution concentration areas:
 
-![Hotspot Analysis](./data/dashboard_screenshots/hotspot_analysis.png)
+![Hotspot Analysis](./data/dashboard_screenshots/hotspots.png)
 
 This specialized view offers:
 
@@ -348,7 +381,7 @@ This specialized view offers:
 
 The predictions interface visualizes the projected spread of pollution events:
 
-![Prediction Forecasting](./data/dashboard_screenshots/prediction_forecasting.png)
+![Prediction Forecasting](./data/dashboard_screenshots/predictions.png)
 
 This forward-looking view provides:
 
@@ -362,7 +395,7 @@ This forward-looking view provides:
 
 The reports view offers in-depth analysis of pollution trends and patterns:
 
-![Analytical Reporting](./data/dashboard_screenshots/analytical_reporting.png)
+![Analytical Reporting](./data/dashboard_screenshots/report.png)
 
 Advanced analytical features include:
 
@@ -376,7 +409,7 @@ Advanced analytical features include:
 
 The sensor details view provides comprehensive monitoring of individual sensors:
 
-![Sensor Monitoring](./data/dashboard_screenshots/sensor_monitoring.png)
+![Sensor Monitoring](./data/dashboard_screenshots/sensor_details.png)
 
 This technical view includes:
 
@@ -453,29 +486,26 @@ The Marine Pollution Tracking System demonstrates performance characteristics ba
 
 ### System Resource Utilization
 
-The prototype system utilization during testing shows:
+The system demonstrates efficient resource management during testing:
 
-![CPU Usage](./data/cpu_usage.png)
+![Container CPU Usage](data/cpu_usage.png)
+*System-wide CPU utilization with characteristic processing spikes reaching up to 300% during intensive operations and efficient returns to baseline during idle periods.*
 
-Based on our testing:
+![Container Memory Usage](data/memory_usage.png)
+*Stable memory consumption (6.13GB/7.47GB) after initialization, indicating absence of memory leaks.*
 
-* Average CPU utilization: ~1.2 cores during normal operation in test environment
-* **Peak processing**: Up to 5 cores during satellite image analysis and pollution detection under simulated load
-* Memory utilization: Satellite processing consumes approximately 50% of allocated memory resources
-* Resource efficiency: System scales down during idle periods
+Our component telemetry confirms the specialized nature of our microservices:
+- **image_standardizer**: Highest network output (139MB) with intensive disk reading (320MB)
+- **sensor_analyzer**: Dominates disk operations (317MB read/183MB write) for analytics processing
+- **satellite_producer**: Prioritizes data acquisition (41.7MB network input)
 
-The CPU usage pattern in the test environment demonstrates:
-
-* **Processing spikes** during intensive computation
-* Return to baseline during idle periods
-* Distribution between system and application processes
-* Burst patterns that would need optimization in a real deployment
+These patterns validate our architectural choices, with clear separation of concerns between data acquisition, processing, and analytics components.
 
 ### Processing Metrics
 
 The system handled the following data volumes in our test environment:
 
-![System Metrics](./data/system_metrics.png)
+![System Metrics](./data/system_metrics_overview.png)
 
 Pipeline metrics from testing:
 
@@ -496,16 +526,13 @@ Resource allocation in the prototype is distributed with processing components (
 
 The prototype system demonstrates reliability characteristics in our testing:
 
-![Kafka Topics](./data/kafka_topics.png)
+![Kafka Topics](./data/kafka_topics_analysis.png)
 
 Key reliability indicators from test environment:
 
 * **Topic Health Scores**: >95% across all Kafka topics in test loads
-* **Error Handling**: Low DLQ message counts (1-5 errors) demonstrate >95% message processing success rate under test conditions
 * **System Stability**: No sustained high-load periods during testing, indicating resource management strategies function as expected
 * **Processing Consistency**: Balanced throughput across 24-hour operation periods in simulation
-
-The implementation of Dead Letter Queues provides a demonstration of fault tolerance approaches, with error handling that could be expanded for production environments.
 
 ## Limitations & Future Work
 
@@ -513,17 +540,23 @@ The implementation of Dead Letter Queues provides a demonstration of fault toler
 
 Despite its capabilities, the current implementation has several significant limitations:
 
-1. **Synthetic Data**: The system generates synthetic sensor readings that mimic buoy data rather than connecting to real NOAA/USGS APIs
+1. **Synthetic Data**: The system generates synthetic sensor readings that mimic buoy data rather than connecting to real NOAA/USGS APIs, due to issues with data quality and non-standardized variables across real buoy datasets.
 
-2. **Basic ML Models**: The current implementation uses simplified RandomForest classifiers built on simulated pollution patterns without mechanisms for retraining with newly collected information
+2. **Basic ML Models**: The current implementation uses simplified RandomForest classifiers built on simulated pollution patterns without mechanisms for retraining with newly collected information. These models have not undergone formal validation to assess their accuracy and reliability.
 
-3. **Spatial Clustering Constraints**: The hybrid approach with fixed grid size struggles with events crossing grid boundaries and isn't optimal across varying data densities
+3. **Spatial Clustering Constraints**: The hybrid approach with fixed grid size struggles with events crossing grid boundaries and isn't optimal across varying data densities.
 
-4. **Data Governance Limitations**: The MinIO implementation lacks comprehensive governance features such as quality monitoring, lineage tracking, and automated schema evolution
+4. **Hotspot Deduplication Issues**: Despite multiple implementation attempts, the system currently struggles with correctly identifying and deduplicating pollution hotspots, which can lead to duplicate entries and confusion in the monitoring interface.
 
-5. **Limited Analytics**: Dashboard offers basic analytical capabilities compared to enterprise platforms
+5. **Static Water Currents**: The water current data used in pollution spread predictions is static and not properly integrated with the geographic features, resulting in unrealistic predictions where pollution appears to spread onto land areas.
 
-6. **External Integration**: Lacks integration with external alerting infrastructure necessary for operational deployment in environmental agencies
+6. **Data Governance Limitations**: The MinIO implementation lacks comprehensive governance features such as quality monitoring, lineage tracking, and automated schema evolution.
+
+7. **Limited Analytics**: Dashboard offers basic analytical capabilities compared to enterprise platforms.
+
+8. **External Integration**: Lacks integration with external alerting infrastructure necessary for operational deployment in environmental agencies.
+
+9. **TimescaleDB Configuration**: While TimescaleDB is implemented for time-series data, the system lacks sophisticated hypertable partitioning and retention policies for long-term data management.
 
 ### Scaling Challenges
 
@@ -531,49 +564,47 @@ In a real-world implementation scaling to handle larger geographic areas or high
 
 * **Memory Management**: Flink jobs would encounter memory constraints during satellite imagery analysis and pollution detection. Without proper partitioning and memory management strategies, jobs would encounter OutOfMemoryError exceptions when handling larger or more frequent satellite images.
 
-* **Spatial Clustering**: The current approach would face computational bottlenecks in high-density regions, where the SpatialClusteringProcessor must process numerous points within each partition
+* **Spatial Clustering**: The current approach would face computational bottlenecks in high-density regions, where the SpatialClusteringProcessor must process numerous points within each partition.
 
-* **Message Broker**: The single-node Kafka configuration would experience performance degradation with increased volume
+* **Message Broker**: The single-node Kafka configuration would experience performance degradation with increased volume.
 
-* **Time-Series Storage**: TimescaleDB would face challenges as data accumulates without proper hypertable partitioning strategies
+* **Time-Series Storage**: TimescaleDB would face challenges as data accumulates without proper hypertable partitioning strategies.
 
 ### Potential Improvements
 
 Several improvements could address current limitations for a more robust implementation:
 
-* **Real Data Integration**: Connect to actual NOAA/USGS APIs instead of generating simulated buoy data
+* **Real Data Integration**: Connect to actual NOAA/USGS APIs instead of generating simulated buoy data.
 
-* **Continuous Learning**: Implement mechanisms for ML models to update with newly collected data through incremental learning that periodically retrains models as validated data becomes available
+* **Continuous Learning**: Implement mechanisms for ML models to update with newly collected data through incremental learning that periodically retrains models as validated data becomes available.
 
-* **Adaptive Spatial Clustering**: Implement adaptive grid sizing based on data density with boundary-crossing detection mechanisms
+* **Adaptive Spatial Clustering**: Implement adaptive grid sizing based on data density with boundary-crossing detection mechanisms.
 
-* **State Management**: Develop improved strategies for Flink jobs including backpressure handling and optimized checkpointing
+* **Improved Hotspot Deduplication**: Develop a more effective spatial and temporal matching algorithm to accurately identify and track evolving pollution events.
 
-* **Data Lifecycle Management**: Implement automated archiving for historical data while maintaining access to recent measurements
+* **Dynamic Water Current Integration**: Integrate realistic water current data with proper geographic constraints to generate more accurate pollution spread predictions.
 
-* **Enhanced Analytics**: Strengthen the dashboard with more advanced analytical capabilities
+* **State Management**: Develop improved strategies for Flink jobs including backpressure handling and optimized checkpointing.
+
+* **Data Lifecycle Management**: Implement automated archiving for historical data while maintaining access to recent measurements.
+
+* **Enhanced Analytics**: Strengthen the dashboard with more advanced analytical capabilities.
 
 ### Future Work
 
 With additional resources, future development would prioritize:
 
-* **Real Sensor Data Integration**: Connect with NOAA, USGS, and Copernicus APIs for authentic environmental readings
+* **Real Sensor Data Integration**: Connect with NOAA, USGS, and Copernicus APIs for authentic environmental readings.
 
-* **Comprehensive ML Pipeline**: Develop continuous training, performance monitoring, and drift detection capabilities
+* **Comprehensive ML Pipeline**: Develop continuous training, performance monitoring, and drift detection capabilities.
 
-* **Advanced Spatial Framework**: Implement multi-level gridding, adaptive partitioning, and specialized algorithms for different pollution patterns
+* **Advanced Spatial Framework**: Implement multi-level gridding, adaptive partitioning, and specialized algorithms for different pollution patterns.
 
-* **Cross-Validation Mechanisms**: Create validation between different data sources to increase confidence in event detection
+* **Cross-Validation Mechanisms**: Create validation between different data sources to increase confidence in event detection.
 
-* **Infrastructure Optimization**: Implement proper Kafka clustering, optimize TimescaleDB, and deploy comprehensive monitoring
+* **Infrastructure Optimization**: Implement proper Kafka clustering, optimize TimescaleDB, and deploy comprehensive monitoring.
 
-* **Kubernetes Deployment**: Develop dynamic scaling capabilities based on data volume and processing requirements
-
-## Conclusion
-
-The Marine Pollution Tracking System represents a prototype demonstration of how big data systems could be applied to environmental monitoring. While it uses synthetic data and simplified models, the system demonstrates the architecture and approach that could be adopted in a full implementation.
-
-The medallion architecture, real-time processing with Apache Flink, and multi-tier storage approach provide a solid model that could be expanded for real environmental monitoring applications. The current limitations of the system highlight the areas that would require significant attention for a production deployment.
+* **Kubernetes Deployment**: Develop dynamic scaling capabilities based on data volume and processing requirements.
 
 ## Team & Contributors
 
@@ -584,6 +615,11 @@ This project was developed by:
 - [@marcoRossi27](https://github.com/marcoRossi27)  
 - [@walterscf](https://github.com/walterscf)
 
+## Conclusion
+
+The Marine Pollution Tracking System represents a prototype demonstration of how big data systems could be applied to environmental monitoring. While it uses synthetic data and simplified models, the system demonstrates the architecture and approach that could be adopted in a full implementation.
+
+The medallion architecture, real-time processing with Apache Flink, and multi-tier storage approach provide a solid model that could be expanded for real environmental monitoring applications. The current limitations of the system highlight the areas that would require significant attention for a production deployment.
 
 ## References
 
@@ -598,13 +634,3 @@ This project leverages foundational research in environmental monitoring, anomal
 [4]Kim D, Antariksa G, Handayani MP, Lee S, Lee J. Explainable Anomaly Detection Framework for Maritime Main Engine Sensor Data. Sensors (Basel). 2021 Jul 31;21(15):5200. doi: 10.3390/s21155200. PMID: 34372436; PMCID: PMC8347810.
 
 [5] Sadaiappan, B., Balakrishnan, P., CR, V., Vijayan, N. T., Subramanian, M., & Gauns, M. U. (2023). Applications of machine learning in chemical and biological oceanography. ACS omega, 8(18), 15831-15853.
-```
-
-
-
-
-
-
-
-
-
