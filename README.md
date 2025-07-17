@@ -516,7 +516,6 @@ The prototype system demonstrates reliability characteristics in our testing:
 Key reliability indicators from test environment:
 
 * **Topic Health Scores**: >95% across all Kafka topics in test loads
-* **Error Handling**: Low DLQ message counts (1-5 errors) demonstrate >95% message processing success rate under test conditions
 * **System Stability**: No sustained high-load periods during testing, indicating resource management strategies function as expected
 * **Processing Consistency**: Balanced throughput across 24-hour operation periods in simulation
 
