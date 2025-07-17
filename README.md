@@ -118,6 +118,34 @@ marine-pollution-tracking/
 ├── setup_minio/               # MinIO object storage configuration
 └── storage_consumer/          # Manages data persistence across storage systems
 ```
+### Data Producers
+
+* **buoy_producer**: Generates simulated sensor data representing buoy readings, validates them, and publishes to Kafka. We opted for synthetic data generation rather than using real buoy data due to issues with data quality and inconsistent variable availability across different buoy sources.
+* **satellite_producer**: Retrieves real Sentinel-2 satellite imagery via the Copernicus API and applies simulated pollution effects to these real images before pushing to Kafka.
+
+### Flink Stream Processing Jobs
+
+* **image_standardizer**: Processes raw satellite imagery through band normalization, cloud masking, and geometric corrections. Applies ML-based classification to identify potential pollution signatures in spectral data and standardizes formats for downstream analysis.
+
+* **sensor_analyzer**: Performs multi-stage validation of buoy sensor readings, including range validation, statistical anomaly detection, and temporal consistency checks. Applies machine learning models to classify potential pollution events and enriches data with calculated risk scores.
+
+* **pollution_detector**: Integrates data from both satellite and sensor sources using spatial-temporal correlation. Implements a hybrid grid-based spatial clustering algorithm to identify pollution concentration areas, and generates confidence scores for each detected hotspot.
+
+* **ml_prediction**: Applies simplified fluid dynamics models to forecast pollution spread over time. Incorporates environmental variables (wind, currents, temperature) and pollutant physical properties to estimate dispersion patterns, generating spatial prediction maps for up to 48 hours.
+
+### Data Consumers
+
+* **storage_consumer**: Manages persistent storage across the medallion architecture
+* **dashboard_consumer**: Prepares and caches data in Redis for fast visualization access in the dashboard
+* **alert_manager**: Processes pollution events and generates notifications
+* **dlq_consumer**: Handles messages that failed processing in their primary pipelines (though in practice, the DLQ mechanism is implemented but rarely utilized due to well-defined message formats)
+
+### Storage Services
+
+* **setup_database**: Initializes PostgreSQL with PostGIS extension and TimescaleDB for time-series data
+* **setup_minio**: Configures MinIO object storage with appropriate buckets for the medallion architecture
+* **Redis**: In-memory cache used for fast dashboard data access, storing frequently accessed metrics, alerts, and visualization data
+
 
 ## Data Processing Pipeline
 
