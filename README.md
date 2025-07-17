@@ -137,10 +137,10 @@ The system ingests data from two primary sources:
    * Physical properties (temperature, salinity, conductivity)
    * Microplastics concentration
 
-2. **Satellite Imagery**: Simulated satellite imagery with synthetic pollution effects, offering:
-   * Broad spatial coverage of the entire bay area
-   * Spectral bands optimized for water quality assessment
-   * Simulated data for testing detection capabilities
+2. **Satellite Imagery**: Real Sentinel-2 satellite imagery with simulated pollution effects applied, offering:
+   * Authentic geographic and spectral data from actual satellite observations
+   * Real spectral bands optimized for water quality assessment
+   * Synthetic pollution effects applied to real imagery for testing detection capabilities
 
 ### Real-Time Processing
 
